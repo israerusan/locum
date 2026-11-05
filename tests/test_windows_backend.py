@@ -14,6 +14,8 @@ Windows itself is not available in CI, so these tests cover:
 
 from __future__ import annotations
 
+import importlib
+
 import ctypes
 import subprocess
 import sys
@@ -1461,7 +1463,9 @@ def test_backend_accessibility_disabled(api):
 @pytest.mark.skipif(sys.platform == "win32", reason="comtypes import path differs on Windows")
 def test_uia_unavailable_reports_not_supported(be, monkeypatch):
     monkeypatch.setitem(sys.modules, "comtypes", None)
-    monkeypatch.setattr(winmod, "_uia_module", None)
+    # The cache lives in the uia submodule (patching the package attribute would only
+    # rebind a re-exported copy that the code never reads).
+    monkeypatch.setattr(importlib.import_module("locum.backends.windows.uia"), "_uia_module", None)
     with pytest.raises(NotSupported, match="comtypes"):
         be.accessibility_roots()
     # the failure is remembered

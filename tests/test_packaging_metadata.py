@@ -24,7 +24,8 @@ def test_macos_dependencies_cover_every_pyobjc_framework_the_backend_imports():
     # The macOS backend imports Quartz, ApplicationServices and AppKit; AppKit
     # (clipboard, media keys) ships in pyobjc-framework-Cocoa. Without it the
     # backend silently loses those features.
-    src = (ROOT / "src" / "locum" / "backends" / "macos.py").read_text(encoding="utf-8")
+    pkg = ROOT / "src" / "locum" / "backends" / "macos"  # a package of modules since the split
+    src = "\n".join(p.read_text(encoding="utf-8") for p in sorted(pkg.glob("*.py")))
     assert "import AppKit" in src
     assert {"pyobjc-framework-Quartz", "pyobjc-framework-ApplicationServices",
             "pyobjc-framework-Cocoa"} <= _darwin_packages()
