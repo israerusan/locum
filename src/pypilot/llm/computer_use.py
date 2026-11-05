@@ -26,9 +26,10 @@ from ..errors import FailSafeTriggered, PolicyViolation
 from ..keys import normalize_key
 from ..types import Point, Rect
 from .observe import MAX_LONG_EDGE, MAX_VISUAL_TOKENS, fit_image_size
-from .._nodeinfo import is_password, node_app, target_label, window_at
+from .._nodeinfo import is_password, node_app, owning_window, target_label, window_at
 from .safety import (
-    AuditLog, Policy, check_activation_combo, keys_activate, keys_may_move_focus, split_typed_text, typed_text_activates,
+    AuditLog, Policy, check_activation_combo, is_text_input, keys_activate, keys_may_move_focus, split_typed_text,
+    target_identity, typed_text_activates,
 )
 from .tools import _REDACTED, ToolResult, _default_button, _has_enter, _has_newline, _shortcut_targets
 
@@ -335,8 +336,16 @@ class ComputerUseAdapter:
             apps: List[str] = []
             for i, p in enumerate(points):
                 name, point_apps, node = self._describe_point(p)
-                if activates and node is None and i == len(points) - 1:
-                    ctx["target_unknown"] = True
+                if i == len(points) - 1:
+                    # Nothing hit-testable, or a control with no usable identity (an
+                    # icon-only button: no name, automation id, value or named child here).
+                    if activates and (node is None or not target_identity(node, p, self.desktop.backend)):
+                        ctx["target_unknown"] = True
+                    if node is not None:
+                        ctx["target_node"] = node
+                    title = self._window_title(node, p)
+                    if title:
+                        ctx["target_window"] = title
                 if name:
                     names.append(name)
                 for app in point_apps:
@@ -368,8 +377,9 @@ class ComputerUseAdapter:
             node = self.desktop.backend.focused_element()
         except Exception:
             node = None
+        acts = activates if activating is None else activating
         if node is None:
-            if activates if activating is None else activating:
+            if acts:
                 ctx["target_unknown"] = True
             return ctx
         if is_password(node):
@@ -381,6 +391,11 @@ class ComputerUseAdapter:
         app = node_app(self.desktop.backend, node)
         if app:
             ctx["target_app"] = app
+        ctx["target_node"] = node
+        title = self._window_title(node)
+        if title:
+            ctx["target_window"] = title
+        identified = bool(target_identity(node))
         if activates and enter:
             button = _default_button(node)
             label = ""
@@ -392,9 +407,26 @@ class ComputerUseAdapter:
             if label:
                 name = f"{name} -> {label}" if name else label
                 ctx["default_button"] = label
+                ctx["target_node"] = button  # allow rules judge the button Enter activates
+                identified = True
+        # Input that can press a focused control with no usable identity: unknown target.
+        # Typing (no Enter) into a text field only edits that field.
+        if acts and not identified and not (is_text_input(node) and not enter):
+            ctx["target_unknown"] = True
         if activates and name:
             ctx["target"] = name
         return ctx
+
+    def _window_title(self, node: Any = None, point: Optional[Point] = None) -> str:
+        """Title of the window an action on ``node`` / at ``point`` lands in (``""`` if unknown)."""
+        backend = self.desktop.backend
+        w = window_at(backend, point) if point is not None else None
+        if w is None and node is not None:
+            try:
+                w = owning_window(backend, node)
+            except Exception:
+                w = None
+        return str(w.title or "") if w is not None else ""
 
     def _recheck_focus(self, action: str, params: Dict[str, Any], activates: bool, description: str, *,
                        enter: bool = False, activating: Optional[bool] = None, **extra: Any) -> None:
@@ -662,7 +694,7 @@ class ComputerUseAdapter:
                 for keys in seq:
                     if moved:  # an earlier key may have moved focus: check what this one acts on
                         self._recheck_focus(action, p, keys_activate([keys]), f"press {'+'.join(keys)} (part of {combo!r})",
-                                            enter=_has_enter(keys))
+                                            enter=_has_enter(keys), step_keys="+".join(keys))
                     if len(keys) == 1:
                         d.keyboard.press(keys[0])
                     else:

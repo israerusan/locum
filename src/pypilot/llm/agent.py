@@ -402,7 +402,9 @@ class Agent:
                     # trigger the same confirmation patterns as clicking "Delete" / "Send".
                     # Its string arguments are matched too: ``erp_api(operation="pay")`` is a payment.
                     ctx: Dict[str, Any] = {"description": description, "target": name.replace("_", " ").replace("-", " "),
-                                           "arg_texts": [t.replace("_", " ") for t in _strings(kwargs)]}
+                                           "arg_texts": [t.replace("_", " ") for t in _strings(kwargs)],
+                                           # allow-list mode: only a rule naming this tool authorizes it
+                                           "integration_tool": True}
                     if spec.confirm:
                         ctx["require_confirmation"] = f"tool {name!r} is marked confirm=True"
                     self.policy.check(name, kwargs, context=ctx)
