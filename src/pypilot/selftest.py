@@ -73,6 +73,8 @@ class SelfTest:
             status = "PASS"
         except _Skip as exc:
             status, detail = "SKIP", str(exc)
+        except _Warn as exc:
+            status, detail = "WARN", str(exc)
         except Exception as exc:  # noqa: BLE001 - we report every failure
             from .errors import FailSafeTriggered
 
@@ -181,13 +183,33 @@ class SelfTest:
         self.editor = ed
         return f"editor = {ed.role} {ed.name!r} at {ed.bounds} (fresh, empty); tree saved ({len(tree.splitlines())} lines)"
 
-    def c_type_unicode(self) -> str:
-        """Raw keystroke typing (``Desktop.type``): nothing verifies or repairs it."""
+    def _empty_editor(self) -> Any:
         ed = self._editor()
+        ed.set_text("")  # setup must not depend on the keystroke path under test
+        if self._wait_editor_text("") != "":
+            raise AssertionError(f"could not empty the test editor before typing: {self._editor_text()!r}")
         ed.click()
-        self.d.hotkey("ctrl+a")
-        self.d.press("delete")
         self._settle()
+        return ed
+
+    def c_type_raw(self) -> str:
+        """Raw keystrokes (``verify=False``): informational -- a mismatch is a WARN, not a FAIL.
+
+        Synthesized keystrokes can be dropped or garbled by a busy application
+        (Windows 11 Notepad does this intermittently); that is why the verified
+        paths below exist. This check measures how the OS/app behaves here.
+        """
+        self._empty_editor()
+        self.d.type(UNICODE_TEXT, verify=False)
+        got = self._wait_editor_text(UNICODE_TEXT)
+        if got != UNICODE_TEXT:
+            raise _Warn(f"the app garbled raw keystrokes: typed {UNICODE_TEXT!r}, editor shows {got!r} "
+                        "(Desktop.type/Element.type verify and repair this)")
+        return "raw keystrokes arrived exactly (incl. emoji/CJK)"
+
+    def c_type_unicode(self) -> str:
+        """``Desktop.type`` (default: verifies the focused text field and repairs garbled input)."""
+        self._empty_editor()
         self.d.type(UNICODE_TEXT)
         got = self._wait_editor_text(UNICODE_TEXT)
         if got != UNICODE_TEXT:
@@ -196,12 +218,7 @@ class SelfTest:
 
     def c_type_verified(self) -> str:
         """``Element.type`` reads the field back and repairs dropped/garbled keystrokes."""
-        ed = self._editor()
-        ed.set_text("")  # setup must not depend on the keystroke path under test
-        if self._wait_editor_text("") != "":
-            raise AssertionError(f"could not empty the test editor before typing: {self._editor_text()!r}")
-        ed.click()
-        self._settle()
+        ed = self._empty_editor()
         repaired: List[bool] = []
         orig = ed.set_text
 
@@ -395,7 +412,8 @@ class SelfTest:
             self.run_check("window list", self.c_windows, needs=CAP_WINDOWS)
             if self.run_check("launch editor", self.c_launch_editor, needs=CAP_WINDOWS):
                 self.run_check("accessibility tree + selector", self.c_accessibility, needs=CAP_ACCESSIBILITY)
-                self.run_check("unicode typing (raw keystrokes)", self.c_type_unicode, needs=CAP_KEYBOARD)
+                self.run_check("raw keystrokes (unverified, informational)", self.c_type_raw, needs=CAP_KEYBOARD)
+                self.run_check("unicode typing (Desktop.type)", self.c_type_unicode, needs=CAP_KEYBOARD)
                 self.run_check("unicode typing (Element.type, verified)", self.c_type_verified, needs=CAP_KEYBOARD)
                 self.run_check("hotkeys + clipboard", self.c_clipboard, needs=CAP_CLIPBOARD)
                 self.run_check("symbols via keyboard layout", self.c_symbols, needs=CAP_KEYBOARD)
@@ -427,7 +445,7 @@ class SelfTest:
         return self.checks
 
     def write_report(self) -> None:
-        counts = {s: sum(1 for c in self.checks if c.status == s) for s in ("PASS", "FAIL", "SKIP")}
+        counts = {s: sum(1 for c in self.checks if c.status == s) for s in ("PASS", "WARN", "FAIL", "SKIP")}
         data = {"environment": self.env, "summary": counts, "checks": [c.to_dict() for c in self.checks]}
         with open(self.path("report.json"), "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False, default=str)
@@ -437,7 +455,7 @@ class SelfTest:
             *(f"{k}: {v}" for k, v in self.env.items() if k != "monitors"),
             "monitors: " + "; ".join(json.dumps(m) for m in self.env.get("monitors", [])),
             "",
-            f"PASS {counts['PASS']}  FAIL {counts['FAIL']}  SKIP {counts['SKIP']}",
+            f"PASS {counts['PASS']}  WARN {counts['WARN']}  FAIL {counts['FAIL']}  SKIP {counts['SKIP']}",
             "",
         ]
         for c in self.checks:
@@ -450,6 +468,10 @@ class SelfTest:
 
 class _Skip(Exception):
     pass
+
+
+class _Warn(Exception):
+    """A check that measured something worth knowing but is not a library failure."""
 
 
 def _editor_for_platform(backend: str = "") -> Any:
@@ -512,8 +534,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as exc:  # fail-safe / Ctrl+C: the report is still written
             print(f"stopped: {type(exc).__name__}: {exc}")
     fails = sum(1 for c in st.checks if c.status == "FAIL")
+    warns = sum(1 for c in st.checks if c.status == "WARN")
     print(f"\nreport: {os.path.join(out, 'report.txt')}")
-    print("RESULT:", "ALL PASSED" if fails == 0 else f"{fails} FAILED")
+    result = "ALL PASSED" if fails == 0 else f"{fails} FAILED"
+    print("RESULT:", result + (f" ({warns} warning{'s' if warns != 1 else ''})" if warns else ""))
     return 0 if fails == 0 else 2
 
 

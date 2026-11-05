@@ -212,6 +212,30 @@ def _typed_into(before: str, after: str, text: str) -> bool:
     return False
 
 
+def _inserted_region(before: str, after: str) -> str:
+    """The part of ``after`` that differs from ``before`` (what the app received from the keystrokes)."""
+    p = _common_prefix(before, after)
+    s = _common_suffix(before, after, min(len(before), len(after)) - p)
+    return after[p:len(after) - s]
+
+
+def _is_subsequence(needle: str, hay: str) -> bool:
+    it = iter(hay)
+    return all(ch in it for ch in needle)
+
+
+def _looks_reformatted(before: str, after: str, text: str) -> bool:
+    """Whether every typed character arrived, in order, but the app added or reformatted around them.
+
+    Autocomplete (``goo`` -> ``google.com``), input masks (``5551234`` ->
+    ``(555) 123-4``) and case-forcing fields keep the typed characters as a
+    subsequence of what changed; dropped or garbled keystrokes (``café`` ->
+    ``éééé``) do not. Only the latter is repaired.
+    """
+    region = _inserted_region(before, after)
+    return bool(text) and _is_subsequence(text.casefold(), region.casefold())
+
+
 def _repair_candidates(before: str, after: str, text: str) -> set:
     """What the field should hold if ``text`` was meant to be *inserted* (no selection) but came out garbled.
 
@@ -939,8 +963,10 @@ class Element:
         one place the text can have gone): the field is set to it with
         :meth:`set_text`, which is verified in turn. Otherwise
         :class:`ActionTimeout` is raised naming both values instead of
-        reporting success. Pass ``verify=False`` for fields that reformat
-        their input (masks, autocomplete). Text containing ``\\t``/``\\n``
+        reporting success. Fields that add to or reformat what was typed
+        (autocomplete, input masks, upper-casing) are accepted as long as
+        every typed character arrived in order; only lost or garbled
+        keystrokes are repaired. Text containing ``\\t``/``\\n``
         is not verified unless pasted (``mode="clipboard"``): typed, those
         are Tab/Enter key presses whose effect is up to the app.
         """
@@ -948,15 +974,29 @@ class Element:
         self._check_writable()
         self._ensure_focus()
         kw["mode"] = self._typing_mode(kw.get("mode"))
-        # Typed (not pasted), \t and \n are Tab/Enter *key presses* that may move focus,
-        # submit a form or be swallowed: the field is not expected to hold them, so such
-        # text is not verified (and never "repaired" into literal tabs/newlines).
-        presses_keys = kw["mode"] != "clipboard" and any(c in text for c in "\t\r\n")
-        before = self._value_for_verify() if verify and text and not presses_keys else None
+        before = self._verify_snapshot(text, kw["mode"]) if verify else None
         self.desktop.keyboard.type(text, **kw)
         if before is not None:
             self._verify_typed(before, text)
         return self
+
+    def _verify_snapshot(self, text: str, mode: Optional[str]) -> Optional[str]:
+        """The field's text before typing ``text``, or ``None`` when the result cannot be verified.
+
+        Typed (not pasted), ``\\t`` and ``\\n`` are Tab/Enter *key presses* that
+        may move focus, submit a form or be swallowed: the field is not expected
+        to hold them, so such text is not verified (and never "repaired" into
+        literal tabs/newlines). Disabled or read-only fields are not verified
+        either (keystrokes there may be shortcuts, e.g. type-ahead find).
+        """
+        if not text:
+            return None
+        if mode != "clipboard" and any(c in text for c in "\t\r\n"):
+            return None
+        st = _safe(lambda: self.states, frozenset())
+        if "disabled" in st or "readonly" in st:
+            return None
+        return self._value_for_verify()
 
     #: fields longer than this are not read back by :meth:`type` (cost of the round trip)
     TYPE_VERIFY_MAX_CHARS = 200_000
@@ -988,6 +1028,8 @@ class Element:
         except ActionTimeout:
             pass
         after = _norm_newlines(last[0] or "")
+        if _looks_reformatted(b, after, t):
+            return  # every keystroke arrived; the app completed/masked/re-cased them
         intended = _repair_candidates(b, after, t)
         if len(intended) != 1:
             raise ActionTimeout(

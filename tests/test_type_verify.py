@@ -119,3 +119,90 @@ def test_type_with_tab_or_enter_is_not_verified_or_repaired(env):
     e.type("a\tb")  # Tab is a key press (moves focus); never rewritten into a literal tab
     assert "\t" not in field.value
     assert not any(ev[0] == "a11y_set_value" for ev in be.events)
+
+
+# ------------------------------------------------- reformatting is not "garbling"
+class CompletingBackend(MockBackend):
+    """An address-bar-like field that autocompletes, or a phone mask that formats digits."""
+
+    behaviour = "complete"
+
+    def type_text(self, text: str) -> None:
+        if self.behaviour == "complete" and text == "goo":
+            text = "google.com"
+        elif self.behaviour == "mask" and text == "5551234":
+            text = "(555) 123-4"
+        elif self.behaviour == "upper":
+            text = text.upper()
+        super().type_text(text)
+
+
+@pytest.fixture
+def completing():
+    be = CompletingBackend(width=1280, height=800)
+    d = StubDesktop(be)
+    win = be.add_window("Browser", (100, 100, 600, 400), app="browser.exe")
+    field = win.add_edit("Address", (10, 40, 560, 28), automation_id="url")
+    return d, be, field
+
+
+@pytest.mark.parametrize("behaviour,typed,shown", [
+    ("complete", "goo", "google.com"),
+    ("mask", "5551234", "(555) 123-4"),
+    ("upper", "abc", "ABC"),
+])
+def test_type_accepts_autocomplete_masks_and_case(completing, behaviour, typed, shown):
+    d, be, field = completing
+    be.behaviour = behaviour
+    d.find("#url", timeout=0).type(typed)
+    assert field.value == shown  # left as the app made it, not "repaired" back
+    assert not any(ev[0] == "a11y_set_value" for ev in be.events)
+
+
+def test_looks_reformatted():
+    from pypilot.element import _looks_reformatted
+
+    assert _looks_reformatted("", "google.com", "goo")
+    assert _looks_reformatted("x ", "x (555) 123-4", "5551234")
+    assert not _looks_reformatted("", "éééé", "café")
+    assert not _looks_reformatted("caf", "cafééé", "éé€")  # garbled after existing text
+
+
+# -------------------------------------------------------------- Desktop.type
+@pytest.fixture
+def real():
+    from pypilot import Desktop
+
+    be = GarblingBackend(width=1280, height=800)
+    d = Desktop(be, sleep=lambda s: None, default_timeout=0)
+    win = be.add_window("Editor", (100, 100, 600, 400), app="notepad.exe")
+    field = win.add_edit("Text editor", (10, 40, 560, 300), automation_id="ed")
+    return d, be, field
+
+
+def _focus(d, sel):
+    e = d.find(sel, timeout=0)
+    e.focus()
+    assert e.is_focused
+    return e
+
+
+def test_desktop_type_repairs_the_focused_text_field(real):
+    d, be, field = real
+    _focus(d, "#ed")
+    d.type("café €1.234")
+    assert field.value == "café €1.234"
+
+
+def test_desktop_type_verify_false_is_raw(real):
+    d, be, field = real
+    _focus(d, "#ed")
+    d.type("café", verify=False)
+    assert field.value == "éééé"
+
+
+def test_desktop_type_without_a_focused_text_field_types_unverified(real):
+    d, be, field = real
+    be.garble = False
+    d.type("abc")  # nothing focused: plain keystrokes, no error
+    assert not any(ev[0] == "a11y_set_value" for ev in be.events)

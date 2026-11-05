@@ -36,7 +36,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import failsafe as _failsafe_mod
-from .backends.base import AccessibleNode, Backend
+from .backends.base import CAP_ACCESSIBILITY, AccessibleNode, Backend
 from .element import ELEMENT_STATES, Element
 from .errors import (
     ActionTimeout,
@@ -559,9 +559,30 @@ class Desktop:
         self.mouse.scroll(dy, dx, at=point)
 
     # =============================================================== keyboard
-    def type(self, text: str, *, interval: float = 0.0, mode: Optional[str] = None) -> None:
-        """Type ``text`` into the focused control (``mode=None`` = :attr:`typing_mode`)."""
-        self.keyboard.type(text, interval=interval, mode=mode or self.typing_mode)
+    def type(self, text: str, *, interval: float = 0.0, mode: Optional[str] = None, verify: bool = True) -> None:
+        """Type ``text`` into the focused control (``mode=None`` = :attr:`typing_mode`).
+
+        With ``verify=True`` (default) and an accessibility backend, when the
+        control with keyboard focus is a readable, writable text field it is
+        read before and after typing, exactly like :meth:`Element.type`: some
+        applications drop or garble synthesized keystrokes while busy (seen with
+        Windows 11 Notepad right after launch), and an unambiguous result is
+        repaired. Anything else (no focused element, not a text field,
+        password fields, text with Tab/Enter key presses) is typed unverified,
+        as before. ``verify=False`` always types raw keystrokes.
+        """
+        mode = mode or self.typing_mode
+        el: Optional[Element] = None
+        before: Optional[str] = None
+        if verify and text and self.has(CAP_ACCESSIBILITY):
+            try:
+                el = self.focused()
+                before = el._verify_snapshot(text, mode) if el is not None else None
+            except Exception:
+                el, before = None, None
+        self.keyboard.type(text, interval=interval, mode=mode)
+        if el is not None and before is not None:
+            el._verify_typed(before, text)
 
     def press(self, *keys: Any, presses: int = 1, interval: float = 0.0) -> None:
         """Tap keys in sequence: ``press("tab", "tab", "enter")``; combos like ``"ctrl+a"`` act as hotkeys."""
