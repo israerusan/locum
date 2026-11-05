@@ -721,6 +721,9 @@ class DesktopToolkit:
     monitor at ``x=-1920``, screen point ``(-500, 135)`` is ``(1420, 135)``).
     """
 
+    #: Seconds ``find_elements`` spends building selectors for its listing.
+    SELECTOR_BUDGET = 3.0
+
     def __init__(
         self,
         desktop: "Desktop",
@@ -1686,9 +1689,21 @@ class DesktopToolkit:
         found = self.desktop.find_all(selector)
         obs = self._ensure_observation()
         lines = []
+        # Selectors are shown while they are cheap: each one is proven unique by searching
+        # the accessibility tree, which can take seconds on a busy desktop. Past the budget
+        # the listing goes on without them (the element ids work either way).
+        deadline = time.monotonic() + self.SELECTOR_BUDGET
+        skipped = 0
         for el in found[:limit]:
             entry = obs.add_element(el.node)
-            lines.append(obs.describe_element(entry) + (f"  selector: {entry.selector}" if entry.selector else ""))
+            sel = ""
+            if entry.selector_ready or time.monotonic() < deadline:
+                sel = entry.selector
+            else:
+                skipped += 1
+            lines.append(obs.describe_element(entry) + (f"  selector: {sel}" if sel else ""))
+        if skipped:
+            lines.append(f"(selectors omitted for {skipped} element(s) to stay fast; act on them by element_id)")
         if not found:
             return ToolResult(f"No elements match {selector!r}.")
         more = f"\n... {len(found) - limit} more (raise limit or refine the selector)" if len(found) > limit else ""

@@ -1603,8 +1603,15 @@ def selector_for(
     *,
     root: Optional[AccessibleNode] = None,
     roots: Optional[Sequence[AccessibleNode]] = None,
+    prefix_cache: Optional[List[Any]] = None,
 ) -> str:
     """Generate a robust CSS selector that finds ``node`` again.
+
+    ``prefix_cache`` (a list owned by the caller, e.g. one per observation)
+    remembers each top-level window's prefix and whether it is unique among
+    ``roots``: proving that searches every window, so selectors for many
+    elements of the same window share the cost. Reuse a cache only while the
+    windows have not changed.
 
     Preference order for the target: ``role#automation_id``, then
     ``role "name"``, then role + class + name; the top-level window ancestor
@@ -1646,18 +1653,50 @@ def selector_for(
             return 0
 
     # Prefix identifying the top-level ancestor.
-    top_sel = _compound_for(top, use_id=True)
-    if roots is not None and count(top_sel) > 1:
-        app = _extra_app(top)
-        if app:
-            top_sel += f"[app={quote(app)}]"
-        if count(top_sel) > 1:
-            idx = _index_among(top_sel, scope, top)
-            if idx is not None:
-                top_sel += f":nth({idx})"
+    cached = None
+    if prefix_cache is not None and roots is not None:
+        cached = next((entry for entry in prefix_cache if _same(entry[0], top)), None)
+    if cached is not None:
+        top_sel, top_unique = cached[1], cached[2]
+    else:
+        top_sel, top_unique = _top_prefix(top, roots, scope, count)
+        if prefix_cache is not None and roots is not None:
+            prefix_cache.append((top, top_sel, top_unique))
     if len(chain) == 1:
         return top_sel
+    if top_unique:
+        # The prefix matches exactly one node anywhere in ``roots`` (``top``), so every
+        # match of "<prefix> <rest>" lies inside ``top``: checking the rest against that
+        # one window gives the same answer as searching every window again (which cost
+        # seconds per element on a desktop with thousands of accessible elements).
+        scope = [top]
+    return _selector_below(node, chain, top_sel, scope, unique)
 
+
+def _top_prefix(top: AccessibleNode, roots: Optional[Sequence[AccessibleNode]], scope: Sequence[AccessibleNode],
+                count: Callable[[str], int]) -> Tuple[str, bool]:
+    """``(prefix, unique)`` for the top-level ancestor: unique means it matches only ``top``."""
+    top_sel = _compound_for(top, use_id=True)
+    top_unique = roots is None  # without roots the scope is the node's own window already
+    if roots is not None:
+        n = count(top_sel)
+        top_unique = n == 1
+        if n > 1:
+            app = _extra_app(top)
+            if app:
+                top_sel += f"[app={quote(app)}]"
+            n = count(top_sel)
+            top_unique = n == 1
+            if n > 1:
+                idx = _index_among(top_sel, scope, top)
+                if idx is not None:
+                    top_sel += f":nth({idx})"
+    return top_sel, top_unique
+
+
+def _selector_below(node: AccessibleNode, chain: Sequence[AccessibleNode], top_sel: str,
+                    scope: Sequence[AccessibleNode], unique: Callable[[str], bool]) -> str:
+    """The part of :func:`selector_for` below the top-level prefix (``unique`` searches ``scope``)."""
     candidates = [
         _compound_for(node, use_id=True),
         _compound_for(node, use_id=False),

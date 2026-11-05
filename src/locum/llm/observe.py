@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..backends.base import AccessibleNode
 from ..errors import ElementNotFound, NotSupported
@@ -114,6 +114,13 @@ def _quote(text: str, limit: int = 80) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+class _LazySelector(str):
+    """Marker: pass ``selector=LAZY_SELECTOR`` plus ``_selector_source`` to build it on demand."""
+
+
+LAZY_SELECTOR = _LazySelector("")
+
+
 @dataclass
 class ObservedElement:
     """One numbered element of an :class:`Observation`.
@@ -128,10 +135,36 @@ class ObservedElement:
     value: Optional[str]
     bounds: Rect
     states: frozenset
-    selector: str
+    #: A selector that finds the element again. Computed on first access when the
+    #: element was created lazily (see :data:`LAZY_SELECTOR`): building one proves it
+    #: unique by searching the accessibility trees, which costs seconds per element on
+    #: a desktop with thousands of elements, and most observed elements are never acted on.
+    selector: str = field(repr=False, compare=False)
     node: AccessibleNode = field(repr=False, compare=False)
     window_title: str = ""
     app: str = ""
+    _selector_source: Optional[Callable[[], str]] = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.selector is LAZY_SELECTOR:
+            del self.__dict__["selector"]  # computed by __getattr__ on first access
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for attributes not set on the instance: the lazy selector.
+        if name != "selector":
+            raise AttributeError(name)
+        source = self.__dict__.get("_selector_source")
+        try:
+            value = source() if source is not None else ""
+        except Exception:
+            value = ""
+        self.__dict__["selector"] = value
+        return value
+
+    @property
+    def selector_ready(self) -> bool:
+        """Whether :attr:`selector` is already known (reading it then costs nothing)."""
+        return "selector" in self.__dict__
 
     @property
     def center(self) -> Point:
@@ -247,8 +280,9 @@ class Observation:
             value=_node_value(node),
             bounds=b if b is not None else Rect(0, 0, 0, 0),
             states=frozenset(_safe(lambda: node.states, frozenset()) or ()),
-            selector=selector or _selector(node),
+            selector=selector or LAZY_SELECTOR,
             node=node,
+            _selector_source=None if selector else (lambda n=node: _selector(n)),
         )
         self.elements.append(entry)
         return entry
@@ -351,11 +385,12 @@ def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
         return False
 
 
-def _selector(node: AccessibleNode, roots: Optional[Sequence[AccessibleNode]] = None) -> str:
+def _selector(node: AccessibleNode, roots: Optional[Sequence[AccessibleNode]] = None,
+              prefix_cache: Optional[List[Any]] = None) -> str:
     from ..selectors import describe_node, selector_for
 
     try:
-        return selector_for(node, roots=roots)
+        return selector_for(node, roots=roots, prefix_cache=prefix_cache)
     except Exception:
         return _safe(lambda: describe_node(node, include_bounds=False), "") or ""
 
@@ -452,6 +487,9 @@ def observe(
     titles = {w.handle: w for w in all_windows}
 
     elements: List[ObservedElement] = []
+    # One per observation: elements of the same window share the (expensive) proof that
+    # the window's selector prefix is unique on the desktop.
+    prefix_cache: List[Any] = []
     limit = max(0, int(max_elements))
     for root in roots:
         if len(elements) >= limit:
@@ -490,10 +528,13 @@ def observe(
                     value=_node_value(node),
                     bounds=b,
                     states=frozenset(states),
-                    selector=_selector(node, roots if target_window is None else None) if selectors else "",
+                    selector=LAZY_SELECTOR if selectors else "",
                     node=node,
                     window_title=win_title,
                     app=app,
+                    _selector_source=(lambda n=node, r=(roots if target_window is None else None):
+                                      _selector(n, r, prefix_cache))
+                    if selectors else None,
                 )
             )
 
