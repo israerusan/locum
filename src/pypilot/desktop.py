@@ -21,6 +21,25 @@ template images are interchangeable. Every "wait" goes through
 :mod:`pypilot.wait` with the desktop's injectable ``sleep``/``clock``, which
 keeps tests instant and deterministic.
 
+Waits fail fast on errors that waiting cannot fix. A probe error is retried
+only when :func:`pypilot.errors.is_transient` calls it transient ("not there
+yet": :class:`~pypilot.errors.ElementNotFound`/``WindowNotFound``/``ImageNotFound``,
+an inner :class:`~pypilot.errors.ActionTimeout`, a :class:`~pypilot.errors.BackendError`,
+an ``OSError``, a UI Automation ``COMError`` or another accessibility-bridge
+error); the final :class:`~pypilot.errors.ActionTimeout` names the last such
+error. Everything else -- a ``TypeError``/``AttributeError``/``ValueError`` in a
+predicate, a ``PermissionError`` or :class:`~pypilot.errors.PermissionDenied`,
+:class:`~pypilot.errors.BackendUnavailable`, :class:`~pypilot.errors.NotSupported`,
+a fail-safe stop, a policy refusal, an invalid selector, and any exception type
+not in the transient set (``RuntimeError``, ``KeyError``...) -- is raised
+unchanged on the first probe. This applies to :meth:`Desktop.find`,
+:meth:`~Desktop.wait`, :meth:`~Desktop.window`, :meth:`~Desktop.launch`,
+:meth:`~Desktop.locate` / :meth:`~Desktop.wait_image`, :meth:`~Desktop.find_text`
+and :meth:`Desktop.wait_until`.Earlier development builds retried every exception
+until the timeout, so a typo or a missing permission looked like a slow "not
+found"; pass ``ignore_exceptions=True`` to :meth:`Desktop.wait_until` for the
+old swallow-everything behaviour there.
+
 Creating a ``Desktop`` never touches the display until a method needs it,
 except that ``backend=None`` resolves the process-wide default backend.
 """
@@ -39,15 +58,14 @@ from . import failsafe as _failsafe_mod
 from .backends.base import AccessibleNode, Backend
 from .element import ELEMENT_STATES, Element
 from .errors import (
+    FATAL_ERRORS,
     ActionTimeout,
     BackendError,
     ElementNotFound,
     FailSafeTriggered,
     ImageNotFound,
-    NotSupported,
-    PolicyViolation,
-    SelectorSyntaxError,
     WindowNotFound,
+    is_transient,
 )
 from .failsafe import FailSafe
 from .keyboard import DEFAULT_CLIPBOARD_SETTLE, DEFAULT_CLIPBOARD_TIMEOUT, TYPING_MODES, Keyboard
@@ -68,9 +86,10 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".
 
 _XY_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*$")
 
-# Errors that must never be swallowed by a polling loop: configuration
-# problems and explicit stop requests should surface immediately.
-_FATAL = (NotSupported, FailSafeTriggered, PolicyViolation, SelectorSyntaxError)
+# Errors that must never be swallowed by a polling loop (kept for backward
+# compatibility; the full rule, including unknown exception types, is
+# :func:`pypilot.errors.is_transient`).
+_FATAL = FATAL_ERRORS
 
 # Quoted strings and bare ``[name=Value]`` values inside a selector (for hints).
 _QUOTED_RE = re.compile(r'"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\'')
@@ -228,8 +247,12 @@ class Desktop:
     def wait_until(self, predicate: Callable[[], Any], timeout: Optional[float] = None, interval: float = 0.1, **kw: Any) -> Any:
         """Poll ``predicate`` until truthy (see :func:`pypilot.wait.wait_until`); ``timeout=None`` = :attr:`default_timeout`.
 
-        Returns the first truthy value; raises :class:`ActionTimeout`.
+        Returns the first truthy value; raises :class:`ActionTimeout`. Errors raised
+        by ``predicate`` are retried only when transient (``ignore_exceptions``
+        defaults to ``"transient"``, see :func:`pypilot.errors.is_transient`); pass
+        ``ignore_exceptions=True`` to swallow every :class:`Exception`.
         """
+        kw.setdefault("ignore_exceptions", "transient")
         kw.setdefault("sleep", self.sleep)
         kw.setdefault("clock", self._clock)
         return _wait_until(predicate, self._timeout(timeout), interval, **kw)
@@ -243,20 +266,21 @@ class Desktop:
     ) -> Any:
         """Poll ``probe`` until truthy; transient errors count as "not yet", fatal ones propagate.
 
-        ``fatal`` adds exception types that mean "invalid input" for this probe
-        (e.g. ``ValueError`` for a fully transparent needle image) and must be
-        raised at once instead of being retried until the timeout.
+        An error is retried only if :func:`pypilot.errors.is_transient` says so;
+        any other error is raised unchanged on the first probe. ``fatal`` adds
+        exception types that must be raised at once for this probe even though
+        they would otherwise be transient.
         """
         last: List[BaseException] = []
-        fatal_all = _FATAL + tuple(fatal)
+        fatal_extra = tuple(fatal)
 
         def guarded() -> Any:
             try:
                 return probe()
-            except fatal_all:
-                raise
-            except Exception as exc:  # transient backend / stale tree errors
-                last[:] = [exc]
+            except Exception as exc:
+                if isinstance(exc, fatal_extra) or not is_transient(exc):
+                    raise
+                last[:] = [exc]  # transient backend / stale tree errors
                 return None
 
         try:
@@ -646,6 +670,14 @@ class Desktop:
         """Find ``image`` on screen (template matching; alpha = mask). Polls up to ``timeout`` seconds.
 
         Returns the best :class:`Match` in screen coordinates or ``None``.
+
+        A fatal capture error (:class:`~pypilot.errors.PermissionDenied`, e.g. macOS
+        Screen Recording not granted; :class:`~pypilot.errors.BackendUnavailable`;
+        :class:`~pypilot.errors.NotSupported`; invalid arguments) is raised on the
+        first attempt. A transient one (:class:`~pypilot.errors.BackendError`,
+        ``OSError``: a locked workstation, a disconnected RDP session) is retried
+        and, if the screen still cannot be captured when ``timeout`` expires, raised
+        instead of returning ``None``.
         """
         needle = self._load_needle(image)
         rect = self._region(region)
@@ -663,9 +695,9 @@ class Desktop:
             return m
 
         try:
-            # ValueError/TypeError come from argument validation (transparent needle,
-            # scales <= 0, bad confidence...): retrying cannot fix them.
-            return self._poll(probe, t, f"Image {_describe_image(image)} not found", fatal=(ValueError, TypeError))
+            # Fatal errors (argument validation: transparent needle, scales <= 0, bad
+            # confidence...; missing permission; no backend) escape _poll at once.
+            return self._poll(probe, t, f"Image {_describe_image(image)} not found")
         except ActionTimeout:
             if failed:
                 # The screen could not be captured (locked workstation, RDP session
@@ -718,7 +750,7 @@ class Desktop:
             return found[0] if found else None
 
         try:
-            return self._poll(probe, float(timeout), f"Text {text!r} not found", fatal=(ValueError, TypeError))
+            return self._poll(probe, float(timeout), f"Text {text!r} not found")
         except ActionTimeout:
             return None
 
@@ -918,7 +950,7 @@ class Desktop:
             rect = self._region(root)
             needle = self._load_needle(selector)
             self._poll(lambda: self.screen.locate(needle, region=rect) is None, t,
-                       f"Image {_describe_image(selector)} still on screen after {t:g}s", fatal=(ValueError, TypeError))
+                       f"Image {_describe_image(selector)} still on screen after {t:g}s")
             return None
         sel = parse(selector)
         t = self._timeout(timeout)

@@ -6,6 +6,13 @@ back-off, transient exceptions are tolerated (and attached to the final
 :class:`~pypilot.errors.ActionTimeout` as its ``__cause__``), and both the sleep
 function and the clock are injectable so tests never actually sleep.
 
+``ignore_exceptions="transient"`` (what :class:`~pypilot.desktop.Desktop` waits
+use) retries only errors that :func:`pypilot.errors.is_transient` classifies as
+"not there yet" -- a missing element, a stale accessibility node, a busy
+backend -- and raises everything else (a ``TypeError`` in the predicate, a
+``PermissionError``, an unavailable backend...) on the first check instead of
+hiding it behind a timeout.
+
     >>> from pypilot.wait import wait_until
     >>> wait_until(lambda: 42, timeout=0)
     42
@@ -18,13 +25,16 @@ import math
 import time
 from typing import Any, Callable, Optional, Tuple, Type, TypeVar, Union
 
-from .errors import ActionTimeout, FailSafeTriggered, PolicyViolation
+from .errors import ActionTimeout, FailSafeTriggered, PolicyViolation, is_transient
 
 T = TypeVar("T")
 
 ExceptionTypes = Union[Type[BaseException], Tuple[Type[BaseException], ...]]
 
-__all__ = ["wait_until", "wait_while", "retry", "retry_call", "Deadline", "NEVER_SWALLOWED"]
+#: ``ignore_exceptions`` value that swallows only :func:`pypilot.errors.is_transient` errors.
+TRANSIENT = "transient"
+
+__all__ = ["wait_until", "wait_while", "retry", "retry_call", "Deadline", "NEVER_SWALLOWED", "TRANSIENT"]
 
 #: Stop requests that polling and retrying never treat as transient: an emergency
 #: stop (fail-safe corner, :func:`pypilot.failsafe.abort`, kill hotkey) or a
@@ -49,7 +59,7 @@ def wait_until(
     message: Optional[str] = None,
     backoff: float = 1.0,
     max_interval: float = 1.0,
-    ignore_exceptions: Union[bool, ExceptionTypes] = True,
+    ignore_exceptions: Union[bool, str, ExceptionTypes] = True,
     sleep: Callable[[float], Any] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> T:
@@ -65,7 +75,10 @@ def wait_until(
         max_interval: Upper bound for the (backed-off) interval.
         ignore_exceptions: ``True`` swallows any :class:`Exception` raised by the
             predicate (treated as "not yet"); an exception class/tuple swallows
-            only those; ``False`` propagates everything. The last swallowed
+            only those; ``"transient"`` swallows only errors that
+            :func:`pypilot.errors.is_transient` accepts (fatal ones -- programming
+            errors, permission / configuration errors -- propagate on the first
+            check); ``False`` propagates everything. The last swallowed
             exception becomes the ``__cause__`` of the timeout error.
             :data:`NEVER_SWALLOWED` errors (fail-safe / abort, policy
             violations) always propagate.
@@ -80,7 +93,10 @@ def wait_until(
         raise ValueError("interval must be >= 0")
     if backoff <= 0:
         raise ValueError("backoff must be > 0")
-    if ignore_exceptions is True:
+    only_transient = isinstance(ignore_exceptions, str)
+    if only_transient and ignore_exceptions != TRANSIENT:
+        raise ValueError(f"ignore_exceptions must be a bool, an exception type/tuple or {TRANSIENT!r}, got {ignore_exceptions!r}")
+    if ignore_exceptions is True or only_transient:
         swallow: Tuple[Type[BaseException], ...] = (Exception,)
     elif ignore_exceptions is False or ignore_exceptions is None:
         swallow = ()
@@ -101,6 +117,8 @@ def wait_until(
         except NEVER_SWALLOWED:
             raise
         except swallow as exc:  # type: ignore[misc]
+            if only_transient and not is_transient(exc):
+                raise
             last_exc = exc
         else:
             if result:

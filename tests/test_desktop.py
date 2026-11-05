@@ -385,10 +385,15 @@ def test_find_transient_errors_are_retried(ft, be, app):
     calls = {"n": 0}
     orig = be.accessibility_roots
 
+    class COMError(Exception):  # stands in for comtypes' _ctypes.COMError
+        pass
+
+    COMError.__module__ = "_ctypes"
+
     def flaky():
         calls["n"] += 1
         if calls["n"] < 3:
-            raise RuntimeError("COM hiccup")
+            raise COMError("COM hiccup")
         return orig()
 
     be.accessibility_roots = flaky
