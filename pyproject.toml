@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyoilot"
+version = "0.1.0"
+description = "Cross-platform desktop automation for Python: input, vision, accessibility selectors, RPA workflows, and first-class LLM agent control."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["automation", "rpa", "desktop", "gui", "pyautogui", "llm", "agent", "mcp", "computer-use"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Desktop Environment",
+]
+dependencies = [
+  "pillow>=9.0",
+  "numpy>=1.22",
+  "mss>=9.0",
+  "python-xlib>=0.33; sys_platform == 'linux'",
+  "comtypes>=1.2; sys_platform == 'win32'",
+  "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
+  "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40"]
+ocr = ["pytesseract>=0.3.10"]
+record = ["pynput>=1.7"]
+yaml = ["pyyaml>=6.0"]
+all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0"]
+dev = ["pytest>=7", "pyyaml>=6.0"]
+
+[project.scripts]
+pyoilot = "pyoilot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyoilot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "x11: requires a real X11 display (run under Xvfb)",
+]
