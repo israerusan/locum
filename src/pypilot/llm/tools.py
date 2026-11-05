@@ -53,7 +53,7 @@ from .observe import Observation, ObservedElement, observe
 from .._nodeinfo import ancestors, is_password, node_app, owning_window, target_label, window_at
 from .safety import (
     AuditLog, Policy, check_activation_combo, is_text_input, keys_activate, keys_may_move_focus, split_typed_text,
-    target_identity, typed_text_activates,
+    pressed_control, target_identity, typed_text_activates,
 )
 
 _log = logging.getLogger(__name__)
@@ -1068,7 +1068,7 @@ class DesktopToolkit:
         # The element must be identifiable by itself (name, automation id, value) or by a named
         # child under the click point; the selector text the caller used is not an identity
         # (``pane > button:nth(3)`` names no control).
-        identified = bool(target_identity(el.node, point))
+        identified = bool(target_identity(el.node, point, self.desktop.backend))
         if not identified:
             t = dataclasses.replace(t, unknown=True)
         if point is None:
@@ -1082,7 +1082,12 @@ class DesktopToolkit:
         except Exception:
             return t
         label = self._node_info(hit)[0]
-        if label and not identified:
+        pressed = pressed_control(hit, el.node)
+        if pressed is not el.node:
+            # An actionable child receives the press ("Pay now" in a toolbar): allow rules and
+            # the identity rule judge that control, not the container that was asked for.
+            t = dataclasses.replace(t, node=pressed, unknown=not target_identity(pressed, point, self.desktop.backend))
+        elif label and not identified:
             t = dataclasses.replace(t, unknown=False)
         if not label or label in t.name:
             return t
@@ -1108,7 +1113,7 @@ class DesktopToolkit:
         desc = description + (f" on {node.role} {name!r}" if node is not None and name else "")
         # Nothing hit-testable there, or a control with no usable identity (no name,
         # automation id, text value or named descendant at the point): unknown target.
-        unknown = activates and (node is None or not target_identity(node, point))
+        unknown = activates and (node is None or not target_identity(node, point, self.desktop.backend))
         return _Target(point=point, description=desc, name=name, app=apps[0] if apps else "", apps=apps,
                        unknown=unknown, node=node, window=self._window_title(node, point))
 

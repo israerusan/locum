@@ -42,6 +42,13 @@ Two ways to decide what needs a human:
   screenshot, find, list windows, read text/clipboard, wait) are never gated;
   pointer movement, scrolling and window focus are not consequential. The
   keyword tripwire still applies on top, but it is never the only gate.
+  Rules judge what really receives the input: a click by the control the
+  mouse presses (an actionable child at a container's centre, not the
+  container), Enter in a single-line field by the default button. A rule
+  without ``keys`` authorizes only keys that act on the control it matched
+  (navigation, bare Enter/Space, typing and editing keys in a text field);
+  application shortcuts (Escape, F-keys, ``alt+f4``, ``alt+<access key>``,
+  ``ctrl+s``) need a rule that lists them.
 
 :class:`AuditLog` records every decision and result as JSON lines.
 """
@@ -51,6 +58,7 @@ from __future__ import annotations
 import datetime as _dt
 import fnmatch
 import functools
+import itertools
 import json
 import os
 import re
@@ -282,34 +290,68 @@ def is_text_input(node: Any) -> bool:
     return role in TEXT_INPUT_ROLES or "editable" in states
 
 
-def _named_descendant_at(node: Any, point: Optional[Point], limit: int = 64) -> str:
-    """The name of a descendant of ``node`` whose bounds contain ``point`` (breadth first), or ``""``."""
+def _children_lazy(node: Any, budget: int) -> List[Any]:
+    """At most ``budget`` children of ``node``, fetched lazily (a UIA grid can have thousands)."""
+    if budget <= 0:
+        return []
+    try:
+        return list(itertools.islice(iter(node.children()), budget))
+    except Exception:
+        return []
+
+
+def _named_descendant_at(node: Any, point: Optional[Point], limit: int = 64, backend: Any = None) -> str:
+    """The name of a descendant of ``node`` under ``point``, or ``""``.
+
+    With ``backend``, one hit test (``backend.element_at``) finds the node under
+    the point and its ancestors are walked up to ``node`` (innermost name wins),
+    so a nameless container with thousands of children (a UIA grid or list)
+    costs a handful of accessibility calls. Without one, descendants whose
+    bounds contain the point are searched breadth first, fetching at most
+    ``limit`` nodes in total (children are read lazily where the backend allows).
+    """
     if node is None or point is None:
         return ""
-    from .._nodeinfo import _label_of  # noqa: PLC0415 - avoid an import cycle at module load
+    from .._nodeinfo import _label_of, ancestors  # noqa: PLC0415 - avoid an import cycle at module load
 
-    queue: Deque[Any] = deque(_safe_get(lambda: list(node.children()), []) or [])
-    seen = 0
-    while queue and seen < limit:
+    if backend is not None and callable(getattr(backend, "element_at", None)):
+        hit = _safe_get(lambda: backend.element_at(point.x, point.y))
+        if hit is None:
+            return ""
+        below: List[Any] = []
+        for cur in [hit] + ancestors(hit):
+            if cur is node or _safe_get(lambda: cur.same_as(node), False):
+                for n in below:
+                    label = _label_of(n).strip()
+                    if label:
+                        return label
+                return ""
+            below.append(cur)
+        return ""  # the hit is not inside ``node`` (something covers it)
+
+    queue: Deque[Any] = deque(_children_lazy(node, limit))
+    fetched = len(queue)
+    while queue:
         cur = queue.popleft()
-        seen += 1
         b = _safe_get(lambda: cur.bounds)
         if b is None or not _safe_get(lambda: b.contains(point), False):
             continue
         label = _label_of(cur).strip()
         if label:
             return label
-        queue.extend(_safe_get(lambda: list(cur.children()), []) or [])
+        more = _children_lazy(cur, limit - fetched)
+        fetched += len(more)
+        queue.extend(more)
     return ""
 
 
-def target_identity(node: Any, point: Optional[Point] = None) -> str:
+def target_identity(node: Any, point: Optional[Point] = None, backend: Any = None) -> str:
     """Text that identifies what activating ``node`` acts on, or ``""`` if it has no usable identity.
 
     In order: its policy label (its name or text value, or its enclosing
     actionable control's -- :func:`~pypilot._nodeinfo.target_label`), its
     automation id (``#id``), and the name of a descendant under ``point`` (the
-    click point). An icon-only button that reports none of these cannot be
+    click point; found by hit-testing when ``backend`` is given). An icon-only button that reports none of these cannot be
     judged by any rule that reads labels, so the policy treats an activating
     input on it like one on an unknown target.
     """
@@ -323,7 +365,7 @@ def target_identity(node: Any, point: Optional[Point] = None) -> str:
     aid = str(_safe_get(lambda: node.automation_id, "") or "").strip()
     if aid:
         return f"#{aid}"
-    return _named_descendant_at(node, point)
+    return _named_descendant_at(node, point, backend=backend)
 
 
 def keys_navigate_only(keys: Any) -> bool:
@@ -343,6 +385,83 @@ def keys_navigate_only(keys: Any) -> bool:
         if not mods <= _NAVIGATION_MODIFIERS or not rest <= NAVIGATION_KEYS:
             return False
     return True
+
+
+#: Editing shortcuts that act only on the focused text field (select all, copy, cut, paste, undo, redo).
+_FIELD_EDIT_COMBOS = frozenset(frozenset({m, k}) for m in ("ctrl", "cmd") for k in "acvxyz")
+
+
+def combo_acts_on_target(combo: frozenset, node: Any) -> bool:
+    """Whether the key combination ``combo`` only acts on the control it is judged against.
+
+    Allow-list mode authorizes such keys with a rule that matches the target
+    (the focused control, or for Enter the default button it presses) without
+    naming the keys: navigation (:data:`NAVIGATION_KEYS`, with Shift/Ctrl), a
+    bare Enter or Space, and -- when ``node`` is a text field -- characters
+    (with or without Shift), Backspace/Delete and the editing shortcuts
+    Ctrl/Cmd+A/C/V/X/Y/Z. Anything else (Escape, F-keys, ``alt+f4``,
+    ``alt+<access key>``, ``ctrl+s``, ``ctrl+enter``...) is an application
+    shortcut that may act on another control or the whole window, so it needs
+    a rule that lists it (``keys=...``).
+    """
+    from ..keys import MODIFIERS  # noqa: PLC0415
+
+    combo = frozenset(combo)
+    mods = {k for k in combo if k in MODIFIERS}
+    rest = combo - mods
+    if not rest:
+        return False
+    if mods <= _NAVIGATION_MODIFIERS and rest <= NAVIGATION_KEYS:
+        return True
+    if not mods and rest in (frozenset({"enter"}), frozenset({"space"})):
+        return True
+    if not is_text_input(node):
+        return False
+    if mods <= {"shift"} and len(rest) == 1 and len(next(iter(rest))) == 1:
+        return True
+    if not mods and rest <= {"backspace", "delete"}:
+        return True
+    return combo in _FIELD_EDIT_COMBOS
+
+
+def _pressed_combos(ctx: Dict[str, Any]) -> Optional[List[frozenset]]:
+    """The key combinations a keyboard action presses (``None``: not a keyboard action; ``[]``: unparseable)."""
+    keys = ctx.get("step_keys") or ctx.get("keys")
+    if not keys:
+        return None
+    items = (keys.split() or [keys]) if isinstance(keys, str) else [keys]
+    pressed = _key_items(keys)
+    return pressed if len(pressed) == len(items) else []
+
+
+def pressed_control(hit: Any, container: Any = None) -> Any:
+    """The control that a mouse press at the hit-tested node ``hit`` really activates.
+
+    Walks up from ``hit`` to the nearest actionable node (button, link, menu
+    item... -- see :func:`~pypilot._nodeinfo.target_label`). With
+    ``container`` (the element that was asked for, whose centre is clicked),
+    the walk stops there: a click on a decorative child (an icon or text run in
+    a button) presses the container itself, while a click on an actionable
+    child (a "Pay now" button in a toolbar) presses that child. Returns
+    ``hit`` when nothing on the way is actionable (or ``container`` when
+    ``hit`` is inside it).
+    """
+    if hit is None:
+        return container
+    from .._nodeinfo import _TOP_ROLES, _is_actionable, ancestors  # noqa: PLC0415
+
+    def same(a: Any, b: Any) -> bool:
+        return a is b or bool(_safe_get(lambda: a.same_as(b), False))
+
+    for cur in [hit] + ancestors(hit):
+        if container is not None and same(cur, container):
+            return container
+        role = str(_safe_get(lambda: cur.role, "") or "").lower()
+        if container is None and role in _TOP_ROLES:
+            return hit
+        if _is_actionable(cur):
+            return cur
+    return container if container is not None else hit
 
 
 # ============================================================================ allow rules
@@ -406,7 +525,12 @@ class AllowRule:
     * ``command`` -- glob on the command line of ``launch_app`` (or the program
       it runs: ``"notepad"`` matches ``"notepad.exe C:\\\\a.txt"``).
     * ``keys`` -- key combinations a keyboard action may press
-      (``("ctrl+s",)``); every combination pressed must be listed.
+      (``("ctrl+s",)``); every combination pressed must be listed. A rule
+      without ``keys`` authorizes only keys that act on the control it
+      matched (see :func:`combo_acts_on_target`: navigation, a bare
+      Enter/Space, and typing/editing keys in a text field); an application
+      shortcut such as Escape, F8, ``alt+f4`` or ``alt+<access key>`` needs
+      a rule that lists it, e.g. ``{"selector": "edit#amount", "keys": "f8"}``.
     * ``tools`` -- tool-name globs the rule covers (``("write_clipboard",)``,
       ``("erp_*",)`` for integration tools). Without ``tools`` a rule covers
       desktop actions that have a target; ``launch_app``, ``write_clipboard``
@@ -491,9 +615,16 @@ class AllowRule:
             program = launch_program(command)
             if not (_glob_ci(" ".join(text.split()), self.command) or (program and _app_matches(program, [self.command]))):
                 return False
+        pressed = _pressed_combos(ctx)
         if self.keys:
-            pressed = _key_items(ctx.get("step_keys") or ctx.get("keys") or "")
             if not pressed or any(c not in self._combos for c in pressed):  # type: ignore[attr-defined]
+                return False
+        elif pressed is not None:
+            # A rule that does not list keys authorizes only keys that act on the control it
+            # matched (Enter/Space on it, editing a field it names, navigation); application
+            # shortcuts (alt+f4, F8, Escape, alt+<access key>) need a ``keys=`` rule.
+            node = ctx.get("target_node")
+            if not pressed or not all(combo_acts_on_target(c, node) for c in pressed):
                 return False
         has_points = bool(Policy._points(args, ctx))
         if self.window is not None:
@@ -1363,7 +1494,7 @@ class GuardedDesktop(_GuardedProxy):
         if apps:
             ctx["target_app"] = apps[0]
             ctx["target_apps"] = apps
-        if activates and (node is None or not target_identity(node, point)):
+        if activates and (node is None or not target_identity(node, point, backend)):
             ctx["target_unknown"] = True
         return ctx
 
@@ -1387,16 +1518,23 @@ class GuardedDesktop(_GuardedProxy):
         point = _safe_get(lambda: el._click_point((0, 0), require=False))
         if point is not None:
             ctx["point"] = point
-        identified = bool(target_identity(node, point))
+        identified = bool(target_identity(node, point, backend))
         if activates and point is not None:
             # The mouse lands at the centre, which may be a child control ("Pay now" in a toolbar).
             hit = _safe_get(lambda: backend.element_at(point.x, point.y))
             if hit is not None and not _safe_get(lambda: hit.same_as(node), False) and \
                     any(_safe_get(lambda: a.same_as(node), False) for a in ancestors(hit)):
+                pressed = pressed_control(hit, node)
+                if pressed is not node:
+                    # An actionable child receives the press: allow rules and the identity
+                    # rule judge that control, not the container that was asked for.
+                    ctx["target_node"] = pressed
+                    identified = bool(target_identity(pressed, point, backend))
                 child = _safe_get(lambda: target_label(hit), "") or ""
                 if child and child not in label:
                     label = f"{label} > {child}" if label else child
-                    identified = True
+                    if pressed is node:
+                        identified = True
         if label:
             ctx["target"] = label
         if activates and not identified:
@@ -1958,6 +2096,8 @@ __all__ = [
     "target_identity",
     "launch_program",
     "check_activation_combo",
+    "combo_acts_on_target",
+    "pressed_control",
     "keys_activate",
     "keys_may_move_focus",
     "split_typed_text",

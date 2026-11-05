@@ -141,6 +141,18 @@ def save_error_screenshot(desktop: Any, directory: Union[str, "os.PathLike[str]"
     return str(path)
 
 
+def _wraps_refusal(exc: Optional[BaseException]) -> bool:
+    """Whether ``exc`` wraps a :class:`PolicyViolation` (a flow's ``FlowStepError.original``, or ``raise ... from``)."""
+    seen = 0
+    while exc is not None and seen < 64:
+        if isinstance(exc, PolicyViolation):
+            return True
+        nxt = getattr(exc, "original", None)
+        exc = nxt if isinstance(nxt, BaseException) else exc.__cause__
+        seen += 1
+    return False
+
+
 @dataclass
 class Task:
     """A registered robot task (see :meth:`Robot.task`)."""
@@ -720,7 +732,7 @@ class Robot:
     def _retryable(exc: BaseException) -> bool:
         # A refused/declined action is a decision, not a glitch: retrying would ask the human again.
         return (isinstance(exc, Exception) and not isinstance(exc, (BusinessException, FailSafeTriggered, PolicyViolation))
-                and not _is_deadline(exc))
+                and not _wraps_refusal(exc) and not _is_deadline(exc))
 
     def _handle_retry(self, frame: _Frame, mark: int, attempt: int, attempts: int, exc: BaseException, delay: float) -> None:
         report = self._report()

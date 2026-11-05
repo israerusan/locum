@@ -339,7 +339,7 @@ class ComputerUseAdapter:
                 if i == len(points) - 1:
                     # Nothing hit-testable, or a control with no usable identity (an
                     # icon-only button: no name, automation id, value or named child here).
-                    if activates and (node is None or not target_identity(node, p)):
+                    if activates and (node is None or not target_identity(node, p, self.desktop.backend)):
                         ctx["target_unknown"] = True
                     if node is not None:
                         ctx["target_node"] = node

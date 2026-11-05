@@ -329,13 +329,21 @@ must match:
 
 | Rule | Matches |
 |------|---------|
-| `'button "Save"'` / `"selector=..."` / `AllowRule(selector=...)` | the target element is one the selector finds (ancestry included: `window "Invoice 42" button "Save"`). Coordinates and element ids are hit-tested first, so a click at the Save button's pixels matches too. Enter in a single-line field is judged by the default button it presses, not by the field. |
+| `'button "Save"'` / `"selector=..."` / `AllowRule(selector=...)` | the target element is one the selector finds (ancestry included: `window "Invoice 42" button "Save"`). Coordinates and element ids are hit-tested first, so a click at the Save button's pixels matches too. A click is judged by the control the mouse actually presses: a rule on a toolbar or pane does not cover the "Pay now" button at its centre (a decorative icon inside an allowed button still counts as the button). Enter in a single-line field is judged by the default button it presses, not by the field. Keys: see the note below the table. |
 | `"window=Invoice*"` | glob on the title of the window the action lands in (the target's window, the window under the pointer; for keyboard input the focused control's or the active window) |
 | `"app=excel"` | every application the action touches (like `allowed_apps`) |
 | `"launch=notepad.exe"` | `launch_app` of that command line or program |
-| `"keys=ctrl+s ctrl+p"` | keyboard actions pressing only these combinations |
+| `"keys=ctrl+s ctrl+p"` | keyboard actions pressing only these combinations (combine with a selector or window: `{"selector": "edit#amount", "keys": "f8"}`) |
 | `"tool=write_clipboard"`, `"tool=erp_*"` | any call of those tools (needed for `write_clipboard` and integration tools; a rule without `tool=` never covers them) |
 | `{"selector": 'button "Save"', "window": "Invoice*"}` | both |
+
+A rule that does not list `keys` authorizes only keys that act on the
+control it matched: navigation, a bare Enter or Space, and, in a text field,
+characters, Backspace/Delete and Ctrl/Cmd+A/C/V/X/Y/Z. Application
+shortcuts — Escape, F-keys (F8 = Execute in SAP), `alt+f4`,
+`alt+<access key>`, `ctrl+enter`, `ctrl+s` — act on other controls or the
+whole window, so they need a rule that names them, even while an allowed
+field has focus.
 
 `confirm_patterns`/`confirm_keys` still apply on top, so an allowed
 `button "Submit"` keeps asking until you pass `confirm_patterns=()`.
@@ -351,7 +359,9 @@ An authorized action records the rule in `context["allowed_by"]`.
 invoke/toggle, launch and clipboard write — including actions on elements
 and windows reached through `find()`, `find_all()`, `wait()` and `window()`,
 and the `mouse`/`keyboard` objects — before it is sent. A refused or declined
-action raises `PolicyViolation` and is **never retried**. Without a policy
+action raises `PolicyViolation` and is **never retried** (also when it
+happens inside a `for_each`/`repeat`/`try`/subflow step that has `retries`,
+or inside a Robot task that wraps it in another error). Without a policy
 (the default) RPA is not gated at all, exactly as before.
 
 ```python

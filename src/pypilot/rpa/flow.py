@@ -89,7 +89,9 @@ confirm=..., audit=...)`` runs the flow on a
 typing, ``set_text``, ``invoke``/``toggle``/..., keys, ``launch``,
 ``clipboard_set``, ``activate_window``) is checked against the policy first;
 a refused or declined action fails its step with
-:class:`~pypilot.errors.PolicyViolation` and is never retried. **Without a
+:class:`~pypilot.errors.PolicyViolation` and is never retried (neither the
+step nor an enclosing ``for_each``/``repeat``/``try``/subflow step with
+``retries``). **Without a
 policy, flows are not gated** (the default, as before). A flow document cannot
 declare its own allow rules: authorization comes from the caller.
 """
@@ -192,6 +194,23 @@ class FlowStepError(WorkflowError):
         self.path = path
         self.step_type = step_type
         self.original = original
+
+
+def _is_refusal(exc: Optional[BaseException]) -> bool:
+    """Whether ``exc`` is (or wraps, through nested :class:`FlowStepError` s) a :class:`PolicyViolation`.
+
+    A refusal inside a container step (``for_each``, ``repeat``, ``try``, a group,
+    a called subflow) reaches the container's retry loop wrapped in a
+    :class:`FlowStepError`; it must not be retried either (the human would be
+    asked again on every attempt).
+    """
+    seen = 0
+    while exc is not None and seen < 64:
+        if isinstance(exc, PolicyViolation):
+            return True
+        exc = exc.original if isinstance(exc, FlowStepError) else None
+        seen += 1
+    return False
 
 
 class FlowAssertionError(WorkflowError, AssertionError):
@@ -1315,7 +1334,7 @@ class FlowRunner:
                 raise
             except Exception as exc:
                 last = exc
-                if attempt < attempts and not isinstance(exc, PolicyViolation):  # a refusal is never retried
+                if attempt < attempts and not _is_refusal(exc):  # a refusal is never retried, even nested
                     for s in self.report.steps[mark:]:
                         if s.status == FAILED:
                             s.handled = True
