@@ -32,7 +32,8 @@ An exception raised by the probe is classified by :func:`is_transient`:
   - errors of the accessibility / IPC bridges the backends sit on, matched by
     module so none of them has to be importable: ``COMError`` (comtypes /
     ``_ctypes``, Windows UI Automation), and anything from ``Xlib``, ``gi``
-    (``GLib.Error``), ``pyatspi``, ``dbus`` and ``objc`` (pyobjc) that is not
+    (``GLib.Error``), ``pyatspi``, ``dbus``, ``objc`` (pyobjc) and ``mss``
+    (``ScreenShotError``, a failed screen capture) that is not
     itself a programming error such as a ``TypeError`` subclass.
 
 An exception can override the rule with a boolean ``transient`` attribute --
@@ -174,7 +175,10 @@ TRANSIENT_ERRORS: Tuple[Type[BaseException], ...] = (
 
 # Third-party accessibility / IPC bridges whose errors mean "stale element, busy
 # or vanished UI" (matched by the top-level package of the exception class).
-_TRANSIENT_MODULES = frozenset({"comtypes", "Xlib", "gi", "pyatspi", "dbus", "objc"})
+# ``mss`` raises a bare ``ScreenShotError(Exception)`` for a failed capture (locked
+# workstation, disconnected RDP session); the Windows backend re-raises it as is in
+# explicit ``screenshot_method="mss"`` mode.
+_TRANSIENT_MODULES = frozenset({"comtypes", "Xlib", "gi", "pyatspi", "dbus", "objc", "mss"})
 # ``_ctypes`` also defines programming errors (ctypes.ArgumentError): only COMError.
 _TRANSIENT_NAMES = frozenset({("_ctypes", "COMError")})
 

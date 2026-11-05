@@ -1164,7 +1164,9 @@ class Element:
         or ``callable(element) -> bool``). Returns ``self``; raises :class:`ActionTimeout`.
 
         ``interval`` defaults to the desktop's ``poll_interval``; the desktop's
-        injected ``sleep``/``clock`` are used for waiting."""
+        injected ``sleep``/``clock`` are used for waiting. Only transient errors
+        raised while checking the state are retried (see :mod:`pypilot.errors`):
+        a ``TypeError``/``AttributeError`` in a ``callable`` state raises at once."""
         if interval is None:
             interval = _desktop_interval(self.desktop)
         pred = self._state_predicate(state)
@@ -1176,6 +1178,7 @@ class Element:
             timeout,
             interval,
             message=f"{self!r} did not become {label!r} within {timeout:g}s",
+            ignore_exceptions="transient",
             sleep=_desktop_sleep(self.desktop),
             clock=_desktop_clock(self.desktop),
         )
