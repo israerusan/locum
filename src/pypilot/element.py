@@ -12,10 +12,32 @@ properties, tree navigation, scoped lookups and *robust* actions:
   when possible, verifies the result and falls back to focus + select-all +
   typing.
 
+Keystrokes are only sent once focus is *proven*
+-----------------------------------------------
+``type``, ``press`` and the typing path of ``set_text`` send keystrokes to
+whatever control has keyboard focus, so before sending any they require
+affirmative proof that the keystrokes will reach this element: the element
+reports the ``focused`` state, or the backend's ``focused_element()`` is the
+element, one of its descendants (the inner edit of a combo box) or an ancestor
+that owns its keyboard input (a grid and its cells). A backend that cannot
+tell -- it reports no states and no focused element, or reading them raised --
+is **not** proof: the action raises :class:`~pypilot.errors.ElementNotFound`
+instead of typing into whichever field (or window) already had focus. (Earlier
+builds accepted "cannot tell" as success.)
+
+For backends or apps that genuinely cannot report focus, opt out per call
+with ``require_focus=False`` (``el.type("x", require_focus=False)``,
+``el.press("enter", require_focus=False)``, ``el.set_text("x",
+require_focus=False)``) or for a whole desktop with ``desktop.require_focus =
+False``; the per-call keyword wins over the desktop attribute. Opted out, an
+element that is *known* to lack focus (another control has it) is still
+refused -- only "cannot tell" is let through. :meth:`Element.focus` sends no
+keystrokes and keeps its best-effort behaviour.
+
 The ``desktop`` argument only needs the parts of
 :class:`pypilot.desktop.Desktop` used here: ``backend``, ``mouse``,
-``keyboard``, ``default_timeout`` and optionally ``sleep``, ``typing_mode`` and
-``find``.
+``keyboard``, ``default_timeout`` and optionally ``sleep``, ``typing_mode``,
+``require_focus`` and ``find``.
 """
 
 from __future__ import annotations
@@ -116,6 +138,17 @@ def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
         return fn()
     except Exception:
         return default
+
+
+def _require_focus(desktop: Any, require_focus: Optional[bool]) -> bool:
+    """Effective focus requirement: the per-call keyword, else ``desktop.require_focus``, else True."""
+    if require_focus is not None:
+        return bool(require_focus)
+    try:
+        v = getattr(desktop, "require_focus", True)
+    except Exception:
+        return True
+    return True if v is None else bool(v)
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -777,24 +810,57 @@ class Element:
         st = self.states
         return self.role in ("edit", "combobox", "document", "spinbutton") or "editable" in st
 
+    def _read_states(self) -> Optional[frozenset]:
+        """The node's states, or ``None`` if reading them raised (unknown, not "no states")."""
+        try:
+            st = self._node.states
+            return frozenset(st) if st is not None else frozenset()
+        except Exception:
+            return None
+
     def _has_focus(self) -> Optional[bool]:
         """Whether keystrokes would reach this element (``None`` = the backend cannot tell).
 
-        Focus on a descendant (the inner edit of a combo box) or on an ancestor
-        (a grid that owns its cells' keyboard input) counts; focus on any other
-        control does not.
+        ``True`` is affirmative proof: the element reports ``focused``, or the
+        backend's focused element is the element, a descendant (the inner edit
+        of a combo box) or an ancestor (a grid that owns its cells' keyboard
+        input). ``False`` means it is known not to have focus: another control
+        has it, or the element reports states without ``focused`` while the
+        backend reports no focused element. A backend error while reading the
+        states or the focused element is never turned into evidence either
+        way: without other proof the answer is ``None``.
         """
-        if self.is_focused:
+        states = self._read_states()
+        if states is not None and "focused" in states:
             return True
         try:
             f = self.backend.focused_element()
+            f_known = True
         except Exception:
-            f = None
+            f, f_known = None, False
         if f is not None:
             if _same(f, self._node) or any(_same(a, self._node) for a in self._ancestors(f)):
                 return True
-            return any(_same(a, f) for a in self._ancestors(self._node))
-        return False if self.states else None
+            if any(_same(a, f) for a in self._ancestors(self._node)):
+                return True
+            return False
+        if not f_known or not states:  # a read failed, or nothing was reported at all
+            return None
+        return False
+
+    def _focus_refusal(self, state: Optional[bool]) -> ElementNotFound:
+        if state is None:
+            return ElementNotFound(
+                f"{self!r}: could not confirm that it has keyboard focus (the backend reports neither "
+                "its focus state nor a focused element, or reading them failed); refusing to send "
+                "keystrokes that could land in another control. If this backend/app cannot report "
+                "focus, pass require_focus=False to type()/press()/set_text() or set "
+                "desktop.require_focus = False"
+            )
+        return ElementNotFound(
+            f"{self!r} did not receive keyboard focus (another control has it); refusing to type into "
+            "another control"
+        )
 
     def _check_enabled(self) -> None:
         if "disabled" in self.states:
@@ -810,37 +876,56 @@ class Element:
         if "readonly" in self.states and self.role in ("edit", "spinbutton"):
             raise ElementNotFound(f"{self!r} is read-only; refusing to enter text into it")
 
-    def _focus_by_click(self) -> None:
+    def _focus_by_click(self, require: bool = False) -> None:
         """Click the element to focus it and verify that it really got keyboard focus.
 
         Keystrokes typed after a click that did not focus the element would go
         to whichever control had focus before (another field, another window).
+        With ``require=True`` focus must be proven (``_has_focus() is True``);
+        otherwise only a known *lack* of focus is refused.
         """
         self._check_enabled()
         self.click(native=False)
+        last: List[Optional[bool]] = [None]
+
+        def ok() -> bool:
+            last[0] = self._has_focus()
+            return last[0] is True if require else last[0] is not False
+
         try:
-            wait_until(lambda: self._has_focus() is not False, 1.0, _desktop_interval(self.desktop) or 0.05,
+            wait_until(ok, 1.0, _desktop_interval(self.desktop) or 0.05,
                        sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
         except ActionTimeout:
-            raise ElementNotFound(
-                f"{self!r} did not receive keyboard focus; refusing to type into another control"
-            ) from None
+            raise self._focus_refusal(last[0]) from None
 
-    def _ensure_focus(self) -> None:
-        """Make sure keystrokes go to this element; raise rather than type elsewhere."""
+    def _ensure_focus(self, require_focus: Optional[bool] = None) -> None:
+        """Make sure keystrokes go to this element; raise rather than type elsewhere.
+
+        Focus must be proven (see the module docstring) unless ``require_focus``
+        -- or, when it is ``None``, ``desktop.require_focus`` -- is False.
+        """
         self._guard()
-        if self.is_focused:
+        require = _require_focus(self.desktop, require_focus)
+        if self._has_focus() is True:
             return
         self._check_enabled()
-        if _safe(lambda: self._node.focus(), False) and (self.is_focused or not self.states):
-            return
-        self._focus_by_click()
+        if _safe(lambda: self._node.focus(), False):
+            state = self._has_focus()
+            if state is True:
+                return
+            if state is None:
+                if not require:
+                    return  # opted out: the backend cannot tell, trust the native focus call
+                # A click would not produce proof either (the backend cannot tell) and
+                # may have side effects (pressing a button): refuse now.
+                raise self._focus_refusal(None)
+        self._focus_by_click(require)
 
     def _typing_mode(self, mode: Optional[str]) -> str:
         return mode or getattr(self.desktop, "typing_mode", None) or "auto"
 
     def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: bool = True,
-                 _typing_mode: Optional[str] = None) -> "Element":
+                 require_focus: Optional[bool] = None, _typing_mode: Optional[str] = None) -> "Element":
         """Replace (``clear=True``) or extend the element's text.
 
         ``native="auto"`` uses the accessibility set-value action and verifies
@@ -856,7 +941,10 @@ class Element:
         space, number formatting) -- a read-only field, a refused or truncated
         input -- raises :class:`ActionTimeout` naming both values instead of
         reporting success. Password fields are not read back. Raises
-        :class:`ElementNotFound` for a disabled or read-only edit field.
+        :class:`ElementNotFound` for a disabled or read-only edit field, and
+        on the typing path (the native set-value needs no focus) when keyboard
+        focus cannot be proven -- ``require_focus=False`` opts out, see the
+        module docstring.
         """
         if not isinstance(text, str):
             raise TypeError(f"text must be str, not {type(text).__name__}")
@@ -891,7 +979,7 @@ class Element:
                     "clipboard, which this backend does not support"
                 )
             typing_mode = "clipboard"
-        self._ensure_focus()
+        self._ensure_focus(require_focus)
         if clear:
             kb.hotkey("mod+a")
             kb.press("backspace")
@@ -926,7 +1014,8 @@ class Element:
         except ActionTimeout:
             self._raise_mismatch(target, last[0])
 
-    def type(self, text: str, *, verify: bool = True, **kw: Any) -> "Element":
+    def type(self, text: str, *, verify: bool = True, require_focus: Optional[bool] = None,
+             **kw: Any) -> "Element":
         """Focus the element (if needed) and type ``text`` (keyword args go to ``Keyboard.type``).
 
         With ``verify=True`` (the default) a text field (``edit``/``document``
@@ -943,10 +1032,16 @@ class Element:
         their input (masks, autocomplete). Text containing ``\\t``/``\\n``
         is not verified unless pasted (``mode="clipboard"``): typed, those
         are Tab/Enter key presses whose effect is up to the app.
+
+        Nothing is typed unless keyboard focus is proven: raises
+        :class:`ElementNotFound` otherwise. ``require_focus=False`` (or
+        ``desktop.require_focus = False``) accepts a backend that cannot
+        report focus (a repair's ``set_text`` inherits it); see the module
+        docstring.
         """
         self._guard()
         self._check_writable()
-        self._ensure_focus()
+        self._ensure_focus(require_focus)
         kw["mode"] = self._typing_mode(kw.get("mode"))
         # Typed (not pasted), \t and \n are Tab/Enter *key presses* that may move focus,
         # submit a form or be swallowed: the field is not expected to hold them, so such
@@ -955,7 +1050,7 @@ class Element:
         before = self._value_for_verify() if verify and text and not presses_keys else None
         self.desktop.keyboard.type(text, **kw)
         if before is not None:
-            self._verify_typed(before, text)
+            self._verify_typed(before, text, require_focus)
         return self
 
     #: fields longer than this are not read back by :meth:`type` (cost of the round trip)
@@ -972,7 +1067,7 @@ class Element:
             return None
         return v
 
-    def _verify_typed(self, before: str, text: str) -> None:
+    def _verify_typed(self, before: str, text: str, require_focus: Optional[bool] = None) -> None:
         b, t = _norm_newlines(before), _norm_newlines(text)
         last: List[Optional[str]] = [None]
 
@@ -998,15 +1093,18 @@ class Element:
         # Native set-value first; if the app needs keystrokes, paste rather than retype
         # (the same keystroke path just failed).
         can_paste = bool(_safe(lambda: self.backend.has(CAP_CLIPBOARD), False))
-        self.set_text(intended.pop(), clear=True, verify=True,
+        self.set_text(intended.pop(), clear=True, verify=True, require_focus=require_focus,
                       _typing_mode="clipboard" if can_paste else None)
 
     def clear(self) -> "Element":
         return self.set_text("", clear=True)
 
-    def press(self, *keys: Any, **kw: Any) -> "Element":
-        """Focus the element (if needed) and press keys: ``el.press("ctrl+a", "delete")``."""
-        self._ensure_focus()
+    def press(self, *keys: Any, require_focus: Optional[bool] = None, **kw: Any) -> "Element":
+        """Focus the element (if needed) and press keys: ``el.press("ctrl+a", "delete")``.
+
+        Raises :class:`ElementNotFound` unless keyboard focus is proven
+        (``require_focus=False`` opts out; see the module docstring)."""
+        self._ensure_focus(require_focus)
         self.desktop.keyboard.press(*keys, **kw)
         return self
 
