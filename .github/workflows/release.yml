@@ -72,7 +72,8 @@ jobs:
           LOCUM_BACKEND: mock
         run: |
           python -m venv venv
-          if [ -f venv/Scripts/python.exe ]; then py=venv/Scripts/python.exe; else py=venv/bin/python; fi
+          # Absolute path: the smoke test runs from another directory (not the checkout).
+          if [ -f venv/Scripts/python.exe ]; then py="$PWD/venv/Scripts/python.exe"; else py="$PWD/venv/bin/python"; fi
           "$py" -m pip install dist/*.whl
           cd "$RUNNER_TEMP"
           "$py" -c "import locum, locum.cli, locum.llm, locum.rpa, locum.compat.pyautogui; print(locum.__version__)"
