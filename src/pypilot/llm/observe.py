@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 from ..backends.base import AccessibleNode
 from ..errors import ElementNotFound, NotSupported
 from ..types import Point, Rect, WindowInfo
+from .._nodeinfo import is_password
 
 if TYPE_CHECKING:  # pragma: no cover
     from PIL.Image import Image
@@ -96,6 +97,14 @@ def _safe(fn: Any, default: Any = None) -> Any:
         return fn()
     except Exception:
         return default
+
+
+def _node_value(node: Any) -> Optional[str]:
+    """``node.value``, masked (``"***"``) for password fields: the model and the audit log never see passwords."""
+    value = _safe(lambda: node.value)
+    if value not in (None, "") and is_password(node):
+        return "***"
+    return value
 
 
 def _quote(text: str, limit: int = 80) -> str:
@@ -235,7 +244,7 @@ class Observation:
             id=next_id,
             role=(_safe(lambda: node.role, "") or "unknown").lower(),
             name=_safe(lambda: node.name, "") or "",
-            value=_safe(lambda: node.value),
+            value=_node_value(node),
             bounds=b if b is not None else Rect(0, 0, 0, 0),
             states=frozenset(_safe(lambda: node.states, frozenset()) or ()),
             selector=selector or _selector(node),
@@ -478,7 +487,7 @@ def observe(
                     id=len(elements) + 1,
                     role=(_safe(lambda: node.role, "") or "unknown").lower(),
                     name=_safe(lambda: node.name, "") or "",
-                    value=_safe(lambda: node.value),
+                    value=_node_value(node),
                     bounds=b,
                     states=frozenset(states),
                     selector=_selector(node, roots if target_window is None else None) if selectors else "",

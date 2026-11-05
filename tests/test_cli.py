@@ -632,7 +632,7 @@ def test_llm_agent_example_offline(monkeypatch, capsys, tmp_path):
 def test_sap_example_records_business_exception(monkeypatch, capsys):
     assert _run_example("sap_style_data_entry.py", monkeypatch) == 0
     out = capsys.readouterr().out
-    assert "INV-1003   business_exception" in out
+    assert "Initech | INV-1003       business_exception" in out
     assert "invoices stored by the demo ERP: ['INV-1001', 'INV-1002', 'INV-1004']" in out
 
 

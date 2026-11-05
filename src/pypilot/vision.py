@@ -75,6 +75,14 @@ _FLAT_NEEDLE_STD = 0.5
 # For solid-color needles: score = 1 - rms_distance / _FLAT_SCALE (clipped to 0..1).
 # confidence 0.9 => RMS color error <= 12.8 levels; 0.99 => <= 1.28.
 _FLAT_SCALE = 128.0
+# For solid-color needles with transparent pixels (monochrome icons/glyphs): a
+# haystack pixel within this RMS color distance of the glyph color counts as
+# "glyph colored". At least _GLYPH_MIN_CONTRAST of the needle's transparent area
+# must *not* be glyph colored for a full score (less scales the score down
+# linearly), so the glyph's shape has to be there: a solid area of the glyph
+# color (title bar, toolbar) does not match.
+_GLYPH_TOLERANCE = 32.0
+_GLYPH_MIN_CONTRAST = 0.5
 # Maximum number of candidate peaks fed into non-max suppression per scale.
 _MAX_CANDIDATES = 20000
 
@@ -110,7 +118,8 @@ def _normalize_mode(img: Image.Image) -> Image.Image:
             if hi > 255 or lo < 0:
                 # Rescale wide-range data into 0..255.
                 arr = (arr - lo) * (255.0 / (hi - lo)) if hi > lo else np.zeros_like(arr)
-        return Image.fromarray(np.clip(np.rint(arr), 0, 255).astype(np.uint8), "L")
+        # uint8 HxW is inferred as "L"; the explicit ``mode`` argument is deprecated in Pillow >= 11.3
+        return Image.fromarray(np.ascontiguousarray(np.clip(np.rint(arr), 0, 255).astype(np.uint8)))
     if mode in ("RGBa", "La"):
         return img.convert("RGBA" if mode == "RGBa" else "LA")
     if "A" in mode or "transparency" in img.info:
@@ -141,11 +150,9 @@ def _from_array(arr: np.ndarray) -> Image.Image:
                 a = np.clip(a, 0, 255).astype(np.uint8)
         else:
             a = a.astype(np.uint8)
-    a = np.ascontiguousarray(a)
-    if a.ndim == 2:
-        return Image.fromarray(a, "L")
-    mode = {2: "LA", 3: "RGB", 4: "RGBA"}[a.shape[2]]
-    return Image.fromarray(a, mode)
+    # A contiguous uint8 array of shape HxW / HxWx2 / HxWx3 / HxWx4 is inferred as
+    # L / LA / RGB / RGBA; passing ``mode`` explicitly is deprecated in Pillow >= 11.3.
+    return Image.fromarray(np.ascontiguousarray(a))
 
 
 def load_image(src: ImageSource) -> Image.Image:
@@ -452,6 +459,41 @@ def _flat_needle_score(s1: Sequence[np.ndarray], s2: np.ndarray, tmean: np.ndarr
     return ssd
 
 
+def _apply_shape_contrast(score: np.ndarray, hay: _Haystack, tmean: np.ndarray, mask: np.ndarray) -> None:
+    """Scale a masked solid-color needle's ``score`` (in place) by its shape contrast.
+
+    The opaque pixels of a monochrome glyph carry no shape information on their
+    own: color matching under the mask scores any solid area of the glyph color
+    1.0. The shape lives in the alpha channel, so a window also has to be mostly
+    *not* glyph colored where the needle is transparent: the score is multiplied
+    by ``min(1, contrast / _GLYPH_MIN_CONTRAST)`` where ``contrast`` is
+    ``1 - (transparency-weighted mean "glyph-coloredness" of the window)``.
+    Needles without transparent pixels (uniform alpha) are left alone.
+    """
+    peak = float(mask.max())
+    bg = 1.0 - mask / peak  # transparency weights, 0 for fully opaque pixels
+    bsum = float(bg.sum())
+    if bsum < 0.5:
+        return
+    th, tw = mask.shape
+    # Per-pixel closeness to the glyph color: 1 = same color, 0 = >= tolerance away.
+    dist = np.zeros((hay.h, hay.w), dtype=np.float64)
+    for k in range(hay.c):
+        d = hay.data[k] - float(tmean[k])
+        d *= d
+        dist += d
+    dist /= hay.c
+    np.sqrt(dist, out=dist)
+    close = np.clip(1.0 - dist / _GLYPH_TOLERANCE, 0.0, 1.0)
+    spec = np.fft.rfft2(close, s=hay.fshape)
+    covered = hay.correlate([spec], [bg], th, tw)
+    # contrast factor: 1 - covered, scaled so that _GLYPH_MIN_CONTRAST counts as full
+    covered /= -bsum * _GLYPH_MIN_CONTRAST
+    covered += 1.0 / _GLYPH_MIN_CONTRAST
+    np.clip(covered, 0.0, 1.0, out=covered)
+    score *= covered
+
+
 def _score_map(hay: _Haystack, needle: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
     """Zero-mean NCC score for every valid needle position (values in -1..1).
 
@@ -498,7 +540,9 @@ def _score_map(hay: _Haystack, needle: np.ndarray, mask: Optional[np.ndarray]) -
     s1 = [hay.correlate([spectra[k]], [wspec], th, tw) for k in range(c)]
     s2 = hay.correlate(hay.fft_sq(), [wspec] * c, th, tw)
     if var_t <= (_FLAT_NEEDLE_STD ** 2) * nw * c:
-        return _flat_needle_score(s1, s2, tmean, nw)
+        score = _flat_needle_score(s1, s2, tmean, nw)
+        _apply_shape_contrast(score, hay, tmean, w)
+        return score
     num = hay.correlate(spectra, [dev[:, :, k] * w for k in range(c)], th, tw)
     var_h = _window_variance(s1, s2, nw)
     return _normalize_ncc(num, var_h, var_t, floor)
@@ -581,7 +625,11 @@ def locate(
 
     Args:
         needle: image to look for (anything :func:`load_image` accepts). Its alpha
-            channel, if any, masks out transparent pixels.
+            channel, if any, masks out transparent pixels. For a needle whose
+            opaque pixels are one solid color (a monochrome icon/glyph) the
+            alpha channel *is* the shape: its transparent area must mostly not be
+            that color where it matches, so a solid area of the glyph color
+            (a dark title bar) is not a match.
         haystack: image to search in (e.g. a screenshot).
         confidence: minimum score in ``0..1`` (zero-mean normalized cross-correlation).
         grayscale: compare luminance only (faster, color-blind).
@@ -862,9 +910,34 @@ def _pair_arrays(a: ImageSource, b: ImageSource) -> Optional[Tuple[np.ndarray, n
     return _rgb_array(ia).astype(np.int16), _rgb_array(ib).astype(np.int16)
 
 
-def image_diff(a: ImageSource, b: ImageSource) -> float:
+def _max_tile_mean(m: np.ndarray, tile: int) -> float:
+    """Largest mean of ``m`` (2-D) over ``tile`` x ``tile`` windows on a half-overlapping grid.
+
+    Each window is normalized by the full window area (clipped to the image
+    size), so a window hanging off an edge never weighs a change more, and an
+    image smaller than ``tile`` is one window over everything.
+    """
+    h, w = m.shape
+    th, tw = min(int(tile), h), min(int(tile), w)
+    ch, cw = max(1, th // 2), max(1, tw // 2)  # cells: two per window side
+    ph, pw = -h % ch, -w % cw
+    if ph or pw:
+        m = np.pad(m, ((0, ph), (0, pw)))
+    cells = m.reshape(m.shape[0] // ch, ch, m.shape[1] // cw, cw).sum(axis=(1, 3), dtype=np.float64)
+    ny, nx = (th + ch - 1) // ch, (tw + cw - 1) // cw  # cells per window (1 or 2, 3 if odd)
+    ii = _integral(cells)
+    gy, gx = max(1, cells.shape[0] - ny + 1), max(1, cells.shape[1] - nx + 1)
+    ny, nx = min(ny, cells.shape[0]), min(nx, cells.shape[1])
+    sums = ii[ny : ny + gy, nx : nx + gx] - ii[:gy, nx : nx + gx] - ii[ny : ny + gy, :gx] + ii[:gy, :gx]
+    return float(sums.max() / (th * tw))
+
+
+def image_diff(a: ImageSource, b: ImageSource, *, tile: Optional[int] = None) -> float:
     """Normalized mean absolute RGB difference: ``0.0`` identical .. ``1.0`` opposite.
 
+    With ``tile`` (pixels), the result is the largest mean over ``tile`` x ``tile``
+    blocks instead of over the whole image, so a small local change (a spinner,
+    a message bar) on a big capture is not averaged away.
     Images of different sizes are considered totally different (``1.0``).
     Empty images compare as identical.
     """
@@ -874,14 +947,18 @@ def image_diff(a: ImageSource, b: ImageSource) -> float:
     xa, xb = pair
     if xa.size == 0:
         return 0.0
+    if tile:
+        diff = np.abs(xa - xb).sum(axis=2, dtype=np.int32)
+        return _max_tile_mean(diff, tile) / (255.0 * xa.shape[2])
     return float(np.abs(xa - xb).mean() / 255.0)
 
 
-def changed_fraction(a: ImageSource, b: ImageSource, *, pixel_tolerance: int = 0) -> float:
+def changed_fraction(a: ImageSource, b: ImageSource, *, pixel_tolerance: int = 0, tile: Optional[int] = None) -> float:
     """Fraction (0..1) of pixels whose largest channel difference exceeds ``pixel_tolerance``.
 
     More sensitive than :func:`image_diff` to small, local changes (a checkbox
-    toggling on a full-screen capture). Different sizes -> ``1.0``.
+    toggling on a full-screen capture). With ``tile`` (pixels), the largest
+    fraction over ``tile`` x ``tile`` blocks. Different sizes -> ``1.0``.
     """
     pair = _pair_arrays(a, b)
     if pair is None:
@@ -890,6 +967,8 @@ def changed_fraction(a: ImageSource, b: ImageSource, *, pixel_tolerance: int = 0
     if xa.size == 0:
         return 0.0
     changed = np.abs(xa - xb).max(axis=2) > int(pixel_tolerance)
+    if tile:
+        return _max_tile_mean(changed.astype(np.int32), tile)
     return float(changed.mean())
 
 

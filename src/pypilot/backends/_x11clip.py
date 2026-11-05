@@ -5,8 +5,8 @@ X11 has no clipboard *storage*: the application that "copied" owns the
 long as the data should stay available. :class:`X11Clipboard` therefore uses
 its own display connection and a small daemon thread that serves requests
 while this process owns the selection. Reading converts the selection to
-``UTF8_STRING`` (falling back to ``STRING``) and supports the ``INCR``
-protocol for large transfers.
+``UTF8_STRING`` (falling back to ``STRING``); both reading and serving
+support the ``INCR`` protocol, so large texts transfer in chunks.
 
 Like any X11 client without a clipboard manager, the copied text disappears
 when the process exits.
@@ -17,11 +17,52 @@ from __future__ import annotations
 import select
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..errors import BackendError
 
 _PROP_NAME = "PYPILOT_CLIPBOARD"
+#: Seconds an incremental (INCR) transfer may stall before it is abandoned.
+_INCR_TIMEOUT = 30.0
+
+
+def _open_display(name: str) -> Any:
+    from Xlib import display, error
+
+    try:
+        return display.Display(name)
+    except error.DisplayError as exc:
+        raise BackendError(f"Cannot open X display {name!r} for the clipboard: {exc}") from exc
+
+
+def _abandon(d: Any) -> None:
+    """Drop a connection without talking to the server.
+
+    An interrupt (Ctrl+C) inside a python-xlib round trip leaves the connection
+    believing a reply is still being read: ``close()`` (which flushes) and every
+    later request would block forever.
+    """
+    try:
+        d.display.close_internal("client")
+    except Exception:
+        try:
+            d.display.socket.close()
+        except Exception:
+            pass
+
+
+class _IncrTransfer:
+    """State of one outgoing INCR transfer (ICCCM 2.7.2)."""
+
+    __slots__ = ("requestor", "prop", "ptype", "data", "offset", "deadline")
+
+    def __init__(self, requestor: Any, prop: int, ptype: int, data: bytes) -> None:
+        self.requestor = requestor
+        self.prop = prop
+        self.ptype = ptype
+        self.data = data
+        self.offset = 0
+        self.deadline = time.monotonic() + _INCR_TIMEOUT
 
 
 class X11Clipboard:
@@ -38,6 +79,8 @@ class X11Clipboard:
         self._win: Any = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._incr: Dict[Tuple[int, int], _IncrTransfer] = {}  # (requestor xid, property) -> transfer
+        self._served_at = 0.0  # monotonic time an application last received our text (fully)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -63,9 +106,13 @@ class X11Clipboard:
                         return self._text
                 except Exception:
                     pass
-        from Xlib import X, display
+                except BaseException:
+                    self._drop_owner()
+                    raise
+        from Xlib import X, error
 
-        d = display.Display(self._display_name)
+        d = _open_display(self._display_name)
+        interrupted = False
         try:
             clip = d.intern_atom("CLIPBOARD")
             if d.get_selection_owner(clip) == X.NONE:
@@ -89,8 +136,19 @@ class X11Clipboard:
                 encoding = "utf-8" if target_name == "UTF8_STRING" else "latin-1"
                 return data.decode(encoding, "replace")
             return ""
+        except error.ConnectionClosedError as exc:
+            raise BackendError(f"Lost connection to X display {self._display_name!r}: {exc}") from exc
+        except BaseException as exc:
+            interrupted = not isinstance(exc, Exception)
+            raise
         finally:
-            d.close()
+            if interrupted:
+                _abandon(d)
+            else:
+                try:
+                    d.close()
+                except Exception:
+                    pass
 
     def _read_property(self, d: Any, win: Any, prop: int) -> Optional[bytes]:
         from Xlib import X
@@ -127,40 +185,66 @@ class X11Clipboard:
     # -------------------------------------------------------------------- write
     def set(self, text: str) -> None:
         """Take ownership of ``CLIPBOARD`` and serve ``text`` to any application that pastes."""
-        from Xlib import X, display
+        from Xlib import X, error
 
         with self._lock:
-            if self._d is None:
-                self._d = display.Display(self._display_name)
-                self._win = self._d.screen().root.create_window(-10, -10, 1, 1, 0, X.CopyFromParent)
-                self._stop.clear()
-                self._thread = threading.Thread(target=self._serve, name="pypilot-x11-clipboard", daemon=True)
-                self._thread.start()
-            self._text = text
-            clip = self._d.intern_atom("CLIPBOARD")
-            self._win.set_selection_owner(clip, X.CurrentTime)
-            self._d.flush()
-            if self._d.get_selection_owner(clip) != self._win:
+            try:
+                if self._d is None:
+                    d = _open_display(self._display_name)
+                    # Requests to vanished requestor windows fail asynchronously; ignore them.
+                    d.set_error_handler(lambda *args: None)
+                    self._d = d
+                    self._win = d.screen().root.create_window(-10, -10, 1, 1, 0, X.CopyFromParent)
+                    self._stop.clear()
+                    self._thread = threading.Thread(target=self._serve, name="pypilot-x11-clipboard", daemon=True)
+                    self._thread.start()
+                self._text = text
+                clip = self._d.intern_atom("CLIPBOARD")
+                self._win.set_selection_owner(clip, X.CurrentTime)
+                self._d.flush()
+                owner = self._d.get_selection_owner(clip)
+            except error.ConnectionClosedError as exc:
+                raise BackendError(f"Lost connection to X display {self._display_name!r}: {exc}") from exc
+            except Exception:
+                raise
+            except BaseException:
+                self._drop_owner()  # the next set() opens a fresh connection
+                raise
+            if owner != self._win:
                 raise BackendError("Could not take ownership of the X11 CLIPBOARD selection")
 
     def _serve(self) -> None:
         from Xlib import X
 
         d = self._d
-        while not self._stop.is_set():
+        while not self._stop.is_set() and self._d is d:  # _drop_owner() may have replaced it
             try:
-                select.select([d.fileno()], [], [], 0.2)
+                # A round trip made by set() may already have queued events
+                # without the socket staying readable: only block when idle.
+                if not d.pending_events():
+                    select.select([d.fileno()], [], [], 0.2)
                 with self._lock:
                     while d.pending_events():
                         ev = d.next_event()
                         if ev.type == X.SelectionRequest:
                             self._answer(ev)
+                        elif ev.type == X.PropertyNotify:
+                            self._incr_next(ev)
                         elif ev.type == X.SelectionClear:
-                            self._text = None
+                            # The event may be stale: if set() took the selection
+                            # back meanwhile, the new text must stay.
+                            clip = d.intern_atom("CLIPBOARD")
+                            if ev.atom == clip and d.get_selection_owner(clip) != self._win:
+                                self._text = None
+                    self._expire_incr()
             except Exception:
                 if self._stop.is_set():
                     return
                 time.sleep(0.05)
+
+    def _max_chunk(self) -> int:
+        """Largest property we write in one request (stay well under the maximum request size)."""
+        return max(4096, self._d.display.info.max_request_length * 4 - 1024)
 
     def _answer(self, ev: Any) -> None:
         from Xlib import X, Xatom
@@ -180,11 +264,15 @@ class X11Clipboard:
                     data, ptype = text.encode("latin-1", "replace"), Xatom.STRING
                 else:
                     data, ptype = text.encode("utf-8"), utf8
-                # Stay well under the maximum request size (INCR sending is not implemented).
-                if len(data) > max(4096, d.display.info.max_request_length * 4 - 1024):
-                    prop = X.NONE
+                if len(data) > self._max_chunk():
+                    # Too large for one request: INCR. Announce the size, then send
+                    # a chunk each time the requestor deletes the property.
+                    ev.requestor.change_attributes(event_mask=X.PropertyChangeMask)
+                    ev.requestor.change_property(prop, d.intern_atom("INCR"), 32, [len(data)])
+                    self._incr[(ev.requestor.id, prop)] = _IncrTransfer(ev.requestor, prop, ptype, data)
                 else:
                     ev.requestor.change_property(prop, ptype, 8, data)
+                    self._served_at = time.monotonic()
             else:
                 prop = X.NONE
         except Exception:
@@ -198,7 +286,66 @@ class X11Clipboard:
         except Exception:
             pass
 
+    def _incr_next(self, ev: Any) -> None:
+        """Send the next INCR chunk once the requestor deleted the previous one."""
+        from Xlib import X
+
+        if ev.state != X.PropertyDelete:
+            return
+        key = (ev.window.id, ev.atom)
+        t = self._incr.get(key)
+        if t is None:
+            return
+        chunk = t.data[t.offset : t.offset + self._max_chunk()]
+        try:
+            t.requestor.change_property(t.prop, t.ptype, 8, chunk)
+        except Exception:
+            chunk = b""
+        t.offset += len(chunk)
+        t.deadline = time.monotonic() + _INCR_TIMEOUT
+        if not chunk:  # the zero-length chunk just written ends the transfer
+            self._finish_incr(key)
+            self._served_at = time.monotonic()
+        self._d.flush()
+
+    def _finish_incr(self, key: Tuple[int, int]) -> None:
+        t = self._incr.pop(key, None)
+        if t is not None and not any(k[0] == key[0] for k in self._incr):
+            try:
+                t.requestor.change_attributes(event_mask=0)
+            except Exception:
+                pass
+
+    def _expire_incr(self) -> None:
+        now = time.monotonic()
+        for key in [k for k, t in self._incr.items() if t.deadline < now]:
+            self._finish_incr(key)
+
+    def wait_read(self, since: float, timeout: float) -> bool:
+        """Wait until an application has received our text (a paste) at or after
+        monotonic time ``since``; False after ``timeout`` seconds or when we no longer own it."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                if self._served_at >= since:
+                    return True
+                if self._text is None or self._d is None:
+                    return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
     # -------------------------------------------------------------------- close
+    def _drop_owner(self) -> None:
+        """Abandon the owner connection after an interrupt left it mid-request."""
+        with self._lock:
+            self._stop.set()
+            if self._d is not None:
+                _abandon(self._d)
+            self._d = self._win = self._thread = None
+            self._text = None
+            self._incr.clear()
+
     def close(self) -> None:
         self._stop.set()
         t = self._thread
@@ -212,6 +359,7 @@ class X11Clipboard:
                     pass
             self._d = self._win = self._thread = None
             self._text = None
+            self._incr.clear()
 
 
 def _as_bytes(value: Any) -> bytes:

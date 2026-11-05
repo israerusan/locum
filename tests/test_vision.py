@@ -31,7 +31,7 @@ class TestLoadImage:
         assert vision.load_image(p).mode == "RGB"
         p.info["transparency"] = 0
         assert vision.load_image(p).mode == "RGBA"
-        i16 = Image.fromarray(np.array([[0, 1000], [2000, 4000]], dtype=np.int32), "I")
+        i16 = Image.fromarray(np.array([[0, 1000], [2000, 4000]], dtype=np.int32))
         out = vision.load_image(i16)
         assert out.mode == "L" and np.asarray(out).max() == 255
 
@@ -205,8 +205,10 @@ class TestLocate:
             vision.locate(np.zeros((5, 5, 4), np.uint8), noise(20, 20))
 
     def test_masked_flat_needle(self):
+        # a solid green "button" with a transparent (cut-off) corner
         hay = noise(50, 50, seed=2)
         hay[10:20, 10:20] = (0, 255, 0)
+        hay[10, 10] = (200, 30, 30)
         needle = np.zeros((10, 10, 4), np.uint8)
         needle[..., 1] = 255
         needle[..., 3] = 255
@@ -214,6 +216,33 @@ class TestLocate:
         needle[0, 0, :3] = (9, 9, 9)
         m = vision.locate(needle, hay)
         assert m is not None and m.rect == Rect(10, 10, 10, 10)
+        # inside a larger solid green area the cut-off corner's shape is not there
+        hay[30:45, 30:45] = (0, 255, 0)
+        assert [m.rect for m in vision.locate_all(needle, hay)] == [Rect(10, 10, 10, 10)]
+
+    def test_monochrome_glyph_needs_its_shape(self):
+        # a 16x16 dark "X" glyph with a transparent background (typical icon PNG)
+        glyph = np.zeros((16, 16, 4), np.uint8)
+        glyph[..., :3] = 40
+        for i in range(16):
+            for d in (-1, 0, 1):
+                for j in (i + d, 15 - i + d):
+                    if 0 <= j < 16:
+                        glyph[i, j, 3] = 255
+        icon = glyph[..., 3] > 0
+        for gray in (False, True):
+            hay = np.full((300, 400, 3), 245, np.uint8)
+            hay[0:30, :] = 40  # dark title bar of exactly the glyph color
+            hay[200:216, 300:316][icon] = 40  # the real icon
+            m = vision.locate(glyph, hay, grayscale=gray)
+            assert m is not None and m.rect == Rect(300, 200, 16, 16) and m.confidence == 1.0
+            assert [m.rect for m in vision.locate_all(glyph, hay, grayscale=gray)] == [Rect(300, 200, 16, 16)]
+            # mostly-dark surroundings are not the glyph either
+            hay[100:120, 100:120] = 40
+            hay[100:103, 100:120] = 245
+            assert vision.locate(glyph, hay, region=(90, 90, 40, 40), grayscale=gray) is None
+            # the strip alone: no match at all (used to be confidence 1.0 at (0, 0))
+            assert vision.locate(glyph, hay[:30], grayscale=gray) is None
 
     def test_multiscale(self):
         base = Image.fromarray(noise(12, 12, seed=30)).resize((24, 24), Image.NEAREST)
@@ -437,6 +466,28 @@ def test_image_diff_and_changed_fraction():
     assert vision.changed_fraction(a, b2) == 0.5
     assert vision.image_diff(a, np.zeros((5, 5, 3), np.uint8)) == 1.0
     assert vision.changed_fraction(a, np.zeros((5, 5, 3), np.uint8)) == 1.0
+
+
+def test_tiled_diffs_see_local_changes():
+    a = np.full((1080, 1920, 3), 235, np.uint8)
+    b = a.copy()
+    b[500:532, 940:972] = 0  # a 32x32 spinner frame, straddling block borders
+    assert vision.image_diff(a, b) < 0.001  # averaged away over the full screen
+    assert vision.image_diff(a, b, tile=64) == pytest.approx(0.25 * 235 / 255)
+    assert vision.changed_fraction(a, b) < 0.001
+    assert vision.changed_fraction(a, b, tile=64) == pytest.approx(0.25)
+    # an image smaller than a tile compares as a whole; identical -> 0
+    small = np.zeros((10, 10, 3), np.uint8)
+    small2 = small.copy()
+    small2[0, 0] = 255
+    assert vision.image_diff(small, small2, tile=64) == pytest.approx(0.01)
+    assert vision.changed_fraction(small, small2, tile=64) == pytest.approx(0.01)
+    assert vision.image_diff(a, a, tile=64) == 0.0
+    # a change at the right/bottom edge of an odd-sized image is not amplified
+    c = np.zeros((101, 99, 3), np.uint8)
+    d = c.copy()
+    d[100, 98] = 255
+    assert vision.changed_fraction(c, d, tile=64) == pytest.approx(1 / 4096)
 
 
 # ------------------------------------------------------------------------ annotate

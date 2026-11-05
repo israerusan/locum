@@ -23,8 +23,15 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
-from .backends.base import AccessibleNode
-from .errors import ActionTimeout, ElementNotFound, NotSupported
+from .backends.base import CAP_CLIPBOARD, AccessibleNode
+from .errors import (
+    ActionTimeout,
+    ElementNotFound,
+    FailSafeTriggered,
+    NotSupported,
+    PolicyViolation,
+    SelectorSyntaxError,
+)
 from .types import Point, Rect
 from .wait import wait_until
 
@@ -120,6 +127,57 @@ def _same(a: Any, b: Any) -> bool:
         return False
 
 
+def _parse_number(text: str) -> "set":
+    """Numeric readings of ``text`` (``"1,250.00"``, ``"1.250,00-"``, ``"00123"``); empty if not a number.
+
+    Grouping separators are only accepted in groups of three digits, so
+    ``"1,25"`` reads as 1.25 and never as 125. Currency symbols/codes
+    (``$1,250.00``, ``1.250,00 EUR``) and accounting parentheses are ignored.
+    """
+    import re
+    from decimal import Decimal, InvalidOperation
+
+    t = "".join(text.split()).replace("'", "").replace("\u00a0", "").replace("\u202f", "")
+    t = re.sub(r"^[A-Z]{3}(?=[-+(\d])|(?<=[\d)\-])[A-Z]{3}$", "", t.strip("$€£¥₹"))  # "EUR", "$"
+    sign = 1
+    if t[:1] == "(" and t[-1:] == ")":  # accounting format: (1,250.00)
+        sign, t = -1, t[1:-1]
+    elif t[:1] and t[:1] in "+-":
+        sign, t = (-1 if t[0] == "-" else 1), t[1:]
+    elif t.endswith("-"):  # SAP writes negative amounts as "1.250,00-"
+        sign, t = -1, t[:-1]
+    if not re.fullmatch(r"\d+(?:[.,]\d+)*", t):
+        return set()
+    out = set()
+    for dec, grp in ((".", ","), (",", ".")):
+        whole, _, frac = t.partition(dec)
+        if grp in frac or dec in frac:
+            continue
+        groups = whole.split(grp)
+        if len(groups) > 1 and not (len(groups[0]) <= 3 and all(len(g) == 3 for g in groups[1:])):
+            continue
+        try:
+            out.add(sign * Decimal("".join(groups) + ("." + frac if frac else "")))
+        except InvalidOperation:  # pragma: no cover - the regex only lets digits through
+            continue
+    return out
+
+
+def _same_text(actual: str, expected: str) -> bool:
+    """Whether a field reading ``actual`` holds ``expected`` up to the app's normalisation.
+
+    Fields commonly upper-case, collapse whitespace/line breaks, or reformat
+    numbers (``1250`` -> ``1,250.00``); a truncated, refused or different value
+    does not count.
+    """
+    if actual == expected:
+        return True
+    if " ".join(actual.split()).casefold() == " ".join(expected.split()).casefold():
+        return True
+    a, e = _parse_number(actual), _parse_number(expected)
+    return bool(a and e and a & e)
+
+
 def _desktop_sleep(desktop: Any) -> Callable[[float], Any]:
     fn = getattr(desktop, "sleep", None)
     return fn if callable(fn) else time.sleep
@@ -138,6 +196,39 @@ def _desktop_interval(desktop: Any, default: float = 0.1) -> float:
     except (TypeError, ValueError):
         return default
     return v if v >= 0 else default
+
+
+#: Errors that mean "searching again cannot help" (no accessibility API, invalid
+#: selector, emergency stop, policy refusal): scoped lookups raise them at once,
+#: like :meth:`pypilot.desktop.Desktop.find`, instead of waiting for the timeout.
+_FIND_FATAL = (NotSupported, SelectorSyntaxError, FailSafeTriggered, PolicyViolation)
+
+
+def _poll_find(desktop: Any, probe: Callable[[], Any], timeout: float) -> Any:
+    """Poll ``probe`` until truthy (the waiting behind ``Element.find``/``Window.find``).
+
+    Transient errors (stale nodes, a busy UI) count as "not yet" and become the
+    ``__cause__`` of the final :class:`ActionTimeout`; :data:`_FIND_FATAL`
+    errors propagate immediately.
+    """
+    last: List[BaseException] = []
+
+    def guarded() -> Any:
+        try:
+            return probe()
+        except _FIND_FATAL:
+            raise
+        except Exception as exc:  # transient backend / stale tree errors
+            last[:] = [exc]
+            return None
+
+    try:
+        return wait_until(guarded, timeout, _desktop_interval(desktop), ignore_exceptions=False,
+                          sleep=_desktop_sleep(desktop), clock=_desktop_clock(desktop))
+    except ActionTimeout as exc:
+        if last:
+            raise ActionTimeout(f"{exc}; last error: {type(last[0]).__name__}: {last[0]}") from last[0]
+        raise
 
 
 class Element:
@@ -284,15 +375,10 @@ class Element:
         if timeout is None:
             timeout = float(getattr(self.desktop, "default_timeout", 10.0))
         try:
-            node = wait_until(
-                lambda: sel.find_first([self._node], include_roots=False),
-                timeout,
-                _desktop_interval(self.desktop),
-                sleep=_desktop_sleep(self.desktop),
-                clock=_desktop_clock(self.desktop),
-            )
+            node = _poll_find(self.desktop, lambda: sel.find_first([self._node], include_roots=False), timeout)
         except ActionTimeout as exc:
-            raise ElementNotFound(f"No element matching {str(sel)!r} inside {self!r} within {timeout:g}s") from exc
+            shown = selector if isinstance(selector, str) else str(sel)
+            raise ElementNotFound(f"No element matching {shown!r} inside {self!r} within {timeout:g}s") from exc
         return Element(node, self.desktop, selector if isinstance(selector, str) else str(sel), scope=self)
 
     def find_all(self, selector: Any) -> List["Element"]:
@@ -460,7 +546,8 @@ class Element:
                 return None
             _safe(lambda: self._node.scroll_into_view(), False)
             b = self.bounds
-            if b is None or b.is_empty:
+            if b is None or b.is_empty or not self.is_visible:
+                # Still hidden/offscreen: its (virtual) bounds may lie under another control.
                 raise ElementNotFound(f"{self!r} is not visible on screen; cannot click it with the mouse")
         dx, dy = int(offset[0]), int(offset[1])
         part = self._on_screen(b)
@@ -506,6 +593,35 @@ class Element:
             return False
         return True
 
+    def _mouse_point(self, offset: Tuple[int, int] = (0, 0)) -> Point:
+        """Screen point for a mouse action on this element that really hits it.
+
+        If another element covers the point (typically another window), the
+        element's window is brought to the front and hit-testing is repeated;
+        if it is still covered, :class:`ElementNotFound` is raised instead of
+        letting the click/keystrokes land on whatever is on top.
+        """
+        point = self._click_point(offset, require=True)
+        assert point is not None
+        if not self._occluded(point):
+            return point
+        activated = self._activate_window()
+        point = self._click_point(offset, require=True)
+        assert point is not None
+        if activated:
+            p = point
+            try:  # give the window manager a moment to raise the window
+                wait_until(lambda: not self._occluded(p), 1.0, _desktop_interval(self.desktop) or 0.05,
+                           sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
+            except ActionTimeout:
+                pass
+        if self._occluded(point):
+            raise ElementNotFound(
+                f"{self!r} is covered by another element at ({point.x}, {point.y}) and could not be "
+                "brought to the front; refusing to click the wrong thing"
+            )
+        return point
+
     def _mouse_click(self, point: Point, button: str, clicks: int) -> None:
         self.desktop.mouse.click(point, button=button, clicks=clicks)
 
@@ -522,9 +638,18 @@ class Element:
                 (if the element is covered and cannot be invoked, its window is
                 activated first); ``True`` -- native invoke only (raises
                 :class:`NotSupported`); ``False`` -- mouse only.
+
+        Mouse clicks are hit-tested first: if the element is hidden, or still
+        covered by something else after its window was activated,
+        :class:`ElementNotFound` is raised rather than clicking whatever is
+        drawn at its position. A disabled element is waited for (up to the
+        desktop's ``default_timeout``) to become enabled; if it stays disabled
+        :class:`ElementNotFound` is raised instead of reporting a click that
+        did nothing.
         """
         mode = _native_mode(native)
         self._guard()
+        self._wait_enabled()
         simple = str(button).lower() == "left" and int(clicks) == 1 and tuple(offset) == (0, 0)
         if mode is True:
             if not simple:
@@ -532,32 +657,14 @@ class Element:
             return self.invoke()
         if mode == "auto":
             point = self._click_point(offset, require=False)
-            if point is None:
+            if point is None or self._occluded(point):
+                # Off-screen, hidden or covered: the native action needs no hit-testing.
                 if simple and self._try_invoke():
                     return self
-                point = self._click_point(offset, require=True)
-            elif self._occluded(point):
-                if simple and self._try_invoke():
-                    return self
-                activated = self._activate_window()
-                point = self._click_point(offset, require=True)
-                if activated:
-                    p = point
-                    try:  # give the window manager a moment to raise the window
-                        wait_until(lambda: not self._occluded(p), 1.0, _desktop_interval(self.desktop) or 0.05,
-                                   sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
-                    except ActionTimeout:
-                        pass
-                if self._occluded(point):
-                    # Clicking now would hit whatever covers the element (another window).
-                    raise ElementNotFound(
-                        f"{self!r} is covered by another element at ({point.x}, {point.y}) and could not be "
-                        "invoked natively or brought to the front; refusing to click the wrong thing"
-                    )
-        else:
-            point = self._click_point(offset, require=True)
-        assert point is not None
-        self._mouse_click(point, button, int(clicks))
+            else:
+                self._mouse_click(point, button, int(clicks))
+                return self
+        self._mouse_click(self._mouse_point(offset), button, int(clicks))
         return self
 
     def double_click(self, button: str = "left", *, offset: Tuple[int, int] = (0, 0)) -> "Element":
@@ -567,72 +674,201 @@ class Element:
         return self.click("right", 1, offset=offset, native=False)
 
     def hover(self, *, offset: Tuple[int, int] = (0, 0)) -> "Element":
-        point = self._click_point(offset, require=True)
-        self.desktop.mouse.move(point)
+        self._guard()
+        self.desktop.mouse.move(self._mouse_point(offset))
         return self
 
+    def _wait_enabled(self) -> None:
+        """Wait (up to ``default_timeout``) for a disabled element to become enabled; else raise."""
+        if "disabled" not in self.states:
+            return
+        timeout = float(getattr(self.desktop, "default_timeout", 10.0))
+        try:
+            wait_until(lambda: "disabled" not in self.states, timeout, _desktop_interval(self.desktop) or 0.05,
+                       sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
+        except ActionTimeout:
+            raise ElementNotFound(
+                f"{self!r} is disabled; refusing to click it (the click would do nothing)"
+            ) from None
+
     def invoke(self) -> "Element":
-        """Perform the default action natively (no mouse). Raises :class:`NotSupported` if unavailable."""
+        """Perform the default action natively (no mouse). Raises :class:`NotSupported` if unavailable
+        and :class:`ElementNotFound` if the element stays disabled (see :meth:`click`)."""
+        self._guard()
+        self._wait_enabled()
         if not self._try_invoke():
             raise NotSupported(f"{self!r} does not support native invoke")
         return self
 
     def focus(self) -> "Element":
-        """Give keyboard focus natively; editable elements fall back to a mouse click."""
+        """Give keyboard focus natively; editable elements fall back to a mouse click.
+
+        Raises :class:`ElementNotFound` if the element is disabled or the click
+        did not give it focus (see :meth:`type`)."""
         self._guard()
         if _safe(lambda: self._node.focus(), False):
             return self
         if self._is_text_input():
-            return self.click(native=False)
+            self._focus_by_click()
+            return self
         raise NotSupported(f"{self!r} cannot be focused natively")
 
     def _is_text_input(self) -> bool:
         st = self.states
         return self.role in ("edit", "combobox", "document", "spinbutton") or "editable" in st
 
+    def _has_focus(self) -> Optional[bool]:
+        """Whether keystrokes would reach this element (``None`` = the backend cannot tell).
+
+        Focus on a descendant (the inner edit of a combo box) or on an ancestor
+        (a grid that owns its cells' keyboard input) counts; focus on any other
+        control does not.
+        """
+        if self.is_focused:
+            return True
+        try:
+            f = self.backend.focused_element()
+        except Exception:
+            f = None
+        if f is not None:
+            if _same(f, self._node) or any(_same(a, self._node) for a in self._ancestors(f)):
+                return True
+            return any(_same(a, f) for a in self._ancestors(self._node))
+        return False if self.states else None
+
+    def _check_enabled(self) -> None:
+        if "disabled" in self.states:
+            raise ElementNotFound(f"{self!r} is disabled; refusing to send keystrokes to it")
+
+    def _check_writable(self) -> None:
+        """Refuse to enter text into a disabled or read-only edit field.
+
+        Only edit/spin fields are checked for ``readonly``: a drop-down list
+        combo box reports a read-only value yet selects an item when typed into.
+        """
+        self._check_enabled()
+        if "readonly" in self.states and self.role in ("edit", "spinbutton"):
+            raise ElementNotFound(f"{self!r} is read-only; refusing to enter text into it")
+
+    def _focus_by_click(self) -> None:
+        """Click the element to focus it and verify that it really got keyboard focus.
+
+        Keystrokes typed after a click that did not focus the element would go
+        to whichever control had focus before (another field, another window).
+        """
+        self._check_enabled()
+        self.click(native=False)
+        try:
+            wait_until(lambda: self._has_focus() is not False, 1.0, _desktop_interval(self.desktop) or 0.05,
+                       sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
+        except ActionTimeout:
+            raise ElementNotFound(
+                f"{self!r} did not receive keyboard focus; refusing to type into another control"
+            ) from None
+
     def _ensure_focus(self) -> None:
+        """Make sure keystrokes go to this element; raise rather than type elsewhere."""
         self._guard()
         if self.is_focused:
             return
+        self._check_enabled()
         if _safe(lambda: self._node.focus(), False) and (self.is_focused or not self.states):
             return
-        self.click(native=False)
+        self._focus_by_click()
 
     def _typing_mode(self, mode: Optional[str]) -> str:
         return mode or getattr(self.desktop, "typing_mode", None) or "auto"
 
-    def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True) -> "Element":
+    def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: bool = True) -> "Element":
         """Replace (``clear=True``) or extend the element's text.
 
         ``native="auto"`` uses the accessibility set-value action and verifies
         the result, falling back to focus + ``mod+a`` + typing; ``True`` only
         tries the native path (raises :class:`NotSupported`); ``False`` always types.
+
+        The typing path never turns ``\\n``/``\\t`` into Enter/Tab key presses
+        (which would press a dialog's default button or move to the next field):
+        text containing them is pasted.
+
+        With ``verify=True`` the field is read back afterwards: a value that
+        differs from the target beyond the app's normalisation (case, white
+        space, number formatting) -- a read-only field, a refused or truncated
+        input -- raises :class:`ActionTimeout` naming both values instead of
+        reporting success. Password fields are not read back. Raises
+        :class:`ElementNotFound` for a disabled or read-only edit field.
         """
         if not isinstance(text, str):
             raise TypeError(f"text must be str, not {type(text).__name__}")
         mode = _native_mode(native)
         self._guard()
+        self._check_writable()
         target = text if clear else (self.value or "") + text
+        typed = text
         if mode is not False:
             ok = bool(_safe(lambda: self._node.set_value(target), False))
             if ok:
                 current = self.value
-                if mode is True or current is None or current == target:
+                if current is None or _same_text(current, target) or mode is True:
+                    if verify and current is not None and not _same_text(current, target):
+                        self._raise_mismatch(target, current)  # native only: nothing to fall back to
                     _notify(self, "set_text", text=target)
                     return self
+                # The app accepted the call but reads back something else (it ignored
+                # the value, or the native set did not reach its model): the field may
+                # already contain the appended text, so retype the whole target from
+                # a cleared field instead of appending a second time.
+                clear, typed = True, target
             elif mode is True:
                 raise NotSupported(f"{self!r} does not support setting its value natively")
-        self._ensure_focus()
         kb = self.desktop.keyboard
+        typing_mode = self._typing_mode(None)
+        if any(c in typed for c in "\r\n\t"):
+            # Typed, these would be Enter/Tab key presses: paste them literally instead.
+            if not _safe(lambda: self.backend.has(CAP_CLIPBOARD), False):
+                raise NotSupported(
+                    f"{self!r}: text with line breaks or tabs can only be entered literally via the "
+                    "clipboard, which this backend does not support"
+                )
+            typing_mode = "clipboard"
+        self._ensure_focus()
         if clear:
             kb.hotkey("mod+a")
             kb.press("backspace")
-        if text:
-            kb.type(text, mode=self._typing_mode(None))
+        if typed:
+            kb.type(typed, mode=typing_mode)
+        if verify:
+            self._verify_text(target)
         return self
+
+    def _raise_mismatch(self, target: str, actual: Optional[str]) -> None:
+        raise ActionTimeout(
+            f"{self!r} holds {actual!r} after set_text, expected {target!r} (the field refused, "
+            "truncated or changed the input); pass verify=False if the app legitimately reformats it"
+        )
+
+    def _verify_text(self, target: str) -> None:
+        """Wait briefly for the field to read ``target`` (typed keys may be processed asynchronously)."""
+        from ._nodeinfo import is_password
+
+        if is_password(self._node):
+            return  # masked: the read-back says nothing about what was typed
+        last: List[Optional[str]] = [None]
+
+        def holds() -> bool:
+            v = self.value
+            last[0] = v
+            return v is None or _same_text(v, target)
+
+        try:
+            wait_until(holds, 1.0, _desktop_interval(self.desktop) or 0.05,
+                       sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
+        except ActionTimeout:
+            self._raise_mismatch(target, last[0])
 
     def type(self, text: str, **kw: Any) -> "Element":
         """Focus the element (if needed) and type ``text`` (keyword args go to ``Keyboard.type``)."""
+        self._guard()
+        self._check_writable()
         self._ensure_focus()
         kw["mode"] = self._typing_mode(kw.get("mode"))
         self.desktop.keyboard.type(text, **kw)
@@ -655,17 +891,37 @@ class Element:
             return self
         return self.click()
 
-    def check(self) -> "Element":
-        """Ensure the element is checked."""
-        if not self.is_checked:
+    def _check_state(self) -> str:
+        st = self.states
+        return "checked" if "checked" in st else "mixed" if "mixed" in st else "unchecked"
+
+    def _set_checked(self, want: str) -> "Element":
+        """Toggle until the check state is ``want`` (a tri-state box may need two toggles)."""
+        state = self._check_state()
+        for _ in range(3):
+            if state == want:
+                return self
             self.toggle()
-        return self
+            before = state
+            try:  # the toolkit may update the state asynchronously
+                state = wait_until(lambda: (lambda s: s if s != before else None)(self._check_state()), 1.0,
+                                   _desktop_interval(self.desktop) or 0.05,
+                                   sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
+            except ActionTimeout:
+                break  # toggling had no visible effect (disabled, or the state is not reported)
+        state = self._check_state()
+        if state == want:
+            return self
+        raise ActionTimeout(f"{self!r} did not become {want!r} (state is {state!r})")
+
+    def check(self) -> "Element":
+        """Ensure the element is checked. Raises :class:`ActionTimeout` if it does not become checked."""
+        return self._set_checked("checked")
 
     def uncheck(self) -> "Element":
-        """Ensure the element is not checked."""
-        if self.is_checked:
-            self.toggle()
-        return self
+        """Ensure the element is unchecked (neither checked nor mixed).
+        Raises :class:`ActionTimeout` if it does not become unchecked."""
+        return self._set_checked("unchecked")
 
     def select(self) -> "Element":
         """Select a list/tree/tab item (native select, then invoke, then click)."""
@@ -713,7 +969,8 @@ class Element:
 
     def scroll(self, dy: int, dx: int = 0) -> "Element":
         """Scroll ``dy`` wheel notches (``>0`` = up) with the cursor over the element."""
-        self.desktop.mouse.scroll(dy, dx, at=self._click_point((0, 0), require=True))
+        self._guard()
+        self.desktop.mouse.scroll(dy, dx, at=self._mouse_point())
         return self
 
     def screenshot(self) -> "Image":

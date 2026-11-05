@@ -32,6 +32,10 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = ["Screen"]
 
 _METRICS = ("mean", "pixels")
+# Change metrics are taken per block of this many pixels (largest block wins), so
+# a localized change -- a busy spinner, a new message bar -- is not averaged away
+# over a full-screen capture. Regions smaller than a block are compared as a whole.
+_CHANGE_TILE = 64
 
 
 class Screen:
@@ -204,8 +208,8 @@ class Screen:
     # --------------------------------------------------------------- waiting
     def _difference(self, a: "Image", b: "Image", metric: str, pixel_tolerance: int) -> float:
         if metric == "pixels":
-            return vision.changed_fraction(a, b, pixel_tolerance=pixel_tolerance)
-        return vision.image_diff(a, b)
+            return vision.changed_fraction(a, b, pixel_tolerance=pixel_tolerance, tile=_CHANGE_TILE)
+        return vision.image_diff(a, b, tile=_CHANGE_TILE)
 
     @staticmethod
     def _check_metric(metric: str) -> None:
@@ -228,15 +232,18 @@ class Screen:
         """Wait until the region differs from how it looked when the call started.
 
         Args:
-            region: area to watch (default: whole screen). Prefer a small region:
-                with the default ``"mean"`` metric a tiny change on a full-screen
-                capture may stay below ``threshold``.
+            region: area to watch (default: whole screen). The difference is
+                measured per 64x64 block (half-overlapping) and the most changed
+                block counts, so a local change such as a new message bar is seen
+                even on a full-screen capture; a region still avoids reacting to
+                unrelated changes elsewhere (a clock, a blinking caret).
             timeout: seconds to wait (``0`` = take a single comparison).
             interval: seconds between captures.
             threshold: change is detected when the difference is ``> threshold``.
             metric: ``"mean"`` = :func:`vision.image_diff` (normalized mean absolute
                 difference); ``"pixels"`` = fraction of pixels that changed by more
-                than ``pixel_tolerance`` (:func:`vision.changed_fraction`).
+                than ``pixel_tolerance`` (:func:`vision.changed_fraction`); both
+                per block as described for ``region``.
             sleep / clock: override the instance's sleep/clock for this call.
 
         Returns:
@@ -277,7 +284,11 @@ class Screen:
 
         Each capture is compared to the frame at which the current quiet period
         began (not just the previous frame), so slow continuous drift such as a
-        fade-in is not mistaken for stability.
+        fade-in is not mistaken for stability. As in :meth:`wait_for_change`,
+        the difference is that of the most changed 64x64 block, so a small busy
+        spinner on a full-screen capture keeps the screen "not stable". Pass a
+        ``region`` that excludes things that always move (a clock, a blinking
+        text caret), or they count as changes too.
 
         Returns:
             ``True`` once stable, ``False`` if ``timeout`` elapsed first.

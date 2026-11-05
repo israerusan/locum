@@ -180,6 +180,34 @@ def test_wait_for_change_threshold_and_pixel_metric(be):
         s.wait_for_change(metric="bogus")
 
 
+def test_wait_helpers_see_local_changes_on_full_screen():
+    # defaults on a whole 1920x1080 screen: a small busy spinner is not "stable",
+    # and a 400x40 message bar appearing is a change (used to be averaged away)
+    be = MockBackend(width=1920, height=1080, background=(235, 235, 235))
+    frames = {"n": 0}
+
+    def spin(t):
+        frames["n"] += 1
+        v = 0 if frames["n"] % 2 else 255
+        be.overlays[:] = [(Image.new("RGB", (32, 32), (v, v, v)), Point(940, 500))]
+
+    fc = FakeClock(spin)
+    s = Screen(be, sleep=fc.sleep, clock=fc.clock)
+    assert s.wait_until_stable(timeout=3) is False
+    assert s.wait_until_stable(metric="pixels", timeout=3) is False
+
+    for metric in ("mean", "pixels"):
+        be.overlays.clear()
+
+        def bar(t):
+            be.overlays[:] = [(Image.new("RGB", (400, 40), (30, 30, 30)), Point(760, 520))]
+
+        fc = FakeClock(bar)
+        s = Screen(be, sleep=fc.sleep, clock=fc.clock)
+        assert s.wait_for_change(metric=metric, timeout=5) is True
+        assert fc.t - 100.0 == pytest.approx(0.2)
+
+
 def test_wait_until_stable_after_animation(be):
     frames = {"n": 0}
 

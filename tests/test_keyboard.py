@@ -81,7 +81,8 @@ def test_press_adds_shift_and_combos():
     be, edit, kb = setup()
     kb.press("A", "!")
     assert edit.value == "A!"
-    assert keyev(be)[:4] == [("key_down", "shift"), ("key_down", "a"), ("key_up", "a"), ("key_up", "shift")]
+    # characters go to the backend as-is; it adds Shift/AltGr for the active layout
+    assert keyev(be)[:4] == [("key_down", "A"), ("key_up", "A"), ("key_down", "!"), ("key_up", "!")]
     kb.press("ctrl+a", "backspace")
     assert edit.value == ""
     assert not be.pressed_keys
@@ -208,7 +209,7 @@ def test_type_keys_mode_shift_handling():
     assert edit.value == text
     assert not any(e[0] == "type" for e in be.events)
     downs = [e[1] for e in be.events if e[0] == "key_down"]
-    assert "H" not in downs and "h" in downs and "!" not in downs and "1" in downs
+    assert "H" in downs and "!" in downs and "@" in downs and "shift" not in downs
     assert be.pressed_keys == set()
 
 

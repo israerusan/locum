@@ -74,7 +74,7 @@ def app(be):
 
 def noise(w: int, h: int, seed: int = 1) -> Image.Image:
     rng = np.random.default_rng(seed)
-    return Image.fromarray(rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8), "RGB")
+    return Image.fromarray(rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8))
 
 
 # --------------------------------------------------------------- construction
@@ -603,6 +603,14 @@ def test_find_text_click_text_read_text(d, be, ft):
     assert engine.calls - before > 1  # polled
 
 
+def test_find_text_invalid_regex_fails_fast(d, ft):
+    engine = FakeOCR([OCRWord("Post", Rect(10, 10, 40, 15), 0.9)])
+    for call in (d.find_text, d.click_text):
+        with pytest.raises(ValueError, match="Invalid regex"):
+            call("Post(", regex=True, engine=engine, timeout=5)
+    assert ft.now == 0 and engine.calls == 0  # no polling, no OCR
+
+
 def test_wait_for_change_and_stable(d, be, ft):
     def change():
         if ft.now >= 0.4 and not be.overlays:
@@ -624,7 +632,9 @@ def test_desktop_wait_until_and_sleep(d, ft):
     assert ft.now == pytest.approx(0.5)
     with pytest.raises(ActionTimeout):
         d.wait_until(lambda: False, timeout=0.2)
-    d.sleep(1.5)
-    assert ft.slept[-1] == 1.5
+    before = len(ft.slept)
+    d.sleep(1.5)  # in slices, so an abort() is honoured within ~0.1 s
+    assert sum(ft.slept[before:]) == pytest.approx(1.5) and max(ft.slept[before:]) <= 0.1 + 1e-9
+    n = len(ft.slept)
     d.sleep(0)
-    assert ft.slept[-1] == 1.5
+    assert len(ft.slept) == n

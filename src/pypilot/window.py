@@ -330,7 +330,7 @@ class Window:
         The window root itself can satisfy the first step, so both ``"button"``
         and ``'window "Title" > button'`` work.
         """
-        from .element import Element
+        from .element import Element, _poll_find
         from .selectors import parse
 
         sel = parse(selector)
@@ -341,10 +341,12 @@ class Window:
             return None if root is None else sel.find_first([root])
 
         try:
-            node = wait_until(probe, timeout, _desktop_interval(self.desktop), sleep=_desktop_sleep(self.desktop),
-                              clock=_desktop_clock(self.desktop))
+            # NotSupported (no accessibility API), fail-safe and policy errors propagate at once.
+            node = _poll_find(self.desktop, probe, timeout)
         except ActionTimeout as exc:
-            raise ElementNotFound(f"No element matching {str(sel)!r} in window {self.title!r} within {timeout:g}s") from exc
+            raise ElementNotFound(
+                f"No element matching {_selector_text(selector, sel)!r} in window {self.title!r} within {timeout:g}s"
+            ) from exc
         return Element(node, self.desktop, selector=_selector_text(selector, sel), scope=self)
 
     def find_all(self, selector: Any) -> List["Element"]:

@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, List, Optional, Sequence
 
 from .types import Point, Rect, WindowInfo
 
-__all__ = ["ancestors", "owning_window", "node_app", "window_at", "list_windows_safe", "target_label"]
+__all__ = ["ancestors", "owning_window", "node_app", "window_at", "list_windows_safe", "target_label", "is_password"]
 
 _MAX_DEPTH = 256
 
@@ -175,6 +175,27 @@ def _label_of(node: Any) -> str:
         value = _safe(lambda: node.value)
         name = value if isinstance(value, str) else ""
     return str(name)
+
+
+_PASSWORD_NATIVE_ROLES = frozenset({"password text", "passwordtext", "axsecuretextfield"})
+
+
+def is_password(node: Any) -> bool:
+    """Whether ``node`` is a password field (its text must never be recorded or logged).
+
+    UI Automation reports ``IsPassword`` as the ``"password"`` state; AT-SPI has
+    the ``password text`` role and macOS the ``AXSecureTextField`` subrole.
+    """
+    if node is None:
+        return False
+    states = _safe(lambda: node.states, None) or ()
+    if "password" in states or "protected" in states:
+        return True
+    for attr in ("role", "native_role", "subrole"):
+        value = _safe(lambda: getattr(node, attr, ""), "")
+        if isinstance(value, str) and value.lower() in _PASSWORD_NATIVE_ROLES:
+            return True
+    return False
 
 
 def target_label(node: Any, limit: int = 16) -> str:

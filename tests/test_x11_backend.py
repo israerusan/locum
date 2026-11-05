@@ -977,3 +977,376 @@ def test_native_clipboard_roundtrip_between_connections(xvfb_display):
     finally:
         owner.close()
         reader.close()
+
+
+@pytest.mark.x11
+def test_char_key_down_honours_capslock(be, xc):
+    """key_down of a letter types that letter whatever the CapsLock state (press("A")
+    and type(mode="keys") must not come out case-inverted), but shortcuts keep the
+    key's own level (ctrl+a never gains a Shift)."""
+    win = make_window(xc, (140, 140, 200, 120), event_mask=X.KeyPressMask)
+    try:
+        be.activate_window(win.id)
+        be.key_down("capslock")
+        be.key_up("capslock")
+        assert xc.screen().root.query_pointer().mask & X.LockMask
+        drain(xc, timeout=0.1)
+        a_kc = xc.keysym_to_keycode(ord("a"))
+        for k in ("A", "b"):
+            be.key_down(k)
+            be.key_up(k)
+        be.key_down("ctrl")
+        be.key_down("a")
+        be.key_up("a")
+        be.key_up("ctrl")
+        skip = _shift_codes(xc) | {kc for kc in xc.get_modifier_mapping()[X.ControlMapIndex] if kc}
+        evs = drain(xc, until=lambda e: sum(1 for x in e if x.type == X.KeyPress and x.detail not in skip) >= 3)
+        presses = [e for e in evs if e.type == X.KeyPress and e.detail not in skip]
+        assert len(presses) == 3
+        # CapsLock on: "A" is the plain key, "b" needs Shift to stay lowercase
+        assert presses[0].detail == a_kc and not presses[0].state & X.ShiftMask
+        assert presses[1].state & X.ShiftMask
+        assert presses[2].detail == a_kc and presses[2].state & X.ControlMask and not presses[2].state & X.ShiftMask
+        assert not be._held_keys
+    finally:
+        be.key_down("capslock")
+        be.key_up("capslock")
+        win.destroy()
+        xc.sync()
+    assert not xc.screen().root.query_pointer().mask & X.LockMask
+
+
+# ------------------------------------------------------------- review round 2 regressions
+def _socket_fds():
+    n = 0
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            n += os.readlink(f"/proc/self/fd/{fd}").startswith("socket:")
+        except OSError:
+            pass
+    return n
+
+
+def _start_private_xvfb():
+    """Start a throw-away Xvfb on a free display number; returns (process, display)."""
+    import shutil
+    import subprocess
+
+    xvfb = shutil.which("Xvfb")
+    if not xvfb or not os.path.isdir("/proc/self/fd"):
+        pytest.skip("needs Xvfb")
+    r, w = os.pipe()
+    proc = subprocess.Popen(
+        [xvfb, "-displayfd", str(w), "-screen", "0", "800x600x24", "-nolisten", "tcp"],
+        pass_fds=(w,), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    os.close(w)
+    try:
+        with os.fdopen(r, "rb") as fh:
+            num = fh.readline().strip().decode()
+    except Exception:  # pragma: no cover - environment specific
+        num = ""
+    if not num:
+        proc.kill()
+        pytest.skip("private Xvfb failed to start")
+    return proc, f":{num}"
+
+
+@pytest.fixture
+def private_display():
+    proc, disp = _start_private_xvfb()
+    yield proc, disp
+    if proc.poll() is None:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.x11
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="counts /proc/self/fd sockets")
+def test_screenshots_from_short_lived_threads_do_not_leak_connections(xvfb_display):
+    b = X11Backend(xvfb_display, clipboard_tool="none", accessibility=False)
+    try:
+        b.screenshot(Rect(0, 0, 4, 4))  # this thread's grabber
+        before = _socket_fds()
+        errors = []
+
+        def shot():
+            try:
+                b.screenshot(Rect(0, 0, 4, 4))
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        for _ in range(25):
+            t = threading.Thread(target=shot)
+            t.start()
+            t.join()
+        assert not errors
+        assert _socket_fds() - before <= 1  # each thread's X connection closed when it ended
+        assert not b._mss_broken
+    finally:
+        b.close()
+
+
+@pytest.mark.x11
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="counts /proc/self/fd sockets")
+def test_garbage_collected_backend_releases_connections_and_clipboard_thread(xvfb_display):
+    import gc
+
+    def clip_threads():
+        return sum(1 for t in threading.enumerate() if t.name == "pypilot-x11-clipboard")
+
+    gc.collect()
+    sockets, threads = _socket_fds(), clip_threads()
+    for i in range(5):
+        b = X11Backend(xvfb_display, clipboard_tool="native", accessibility=False)
+        b.screenshot(Rect(0, 0, 4, 4))
+        b.set_clipboard(f"value {i}")
+        del b
+        gc.collect()
+    deadline = time.time() + 3
+    while time.time() < deadline and (clip_threads() > threads or _socket_fds() > sockets):
+        time.sleep(0.05)
+    assert clip_threads() == threads
+    assert _socket_fds() <= sockets
+
+
+@pytest.mark.x11
+def test_native_clipboard_serves_large_text_incrementally(xvfb_display):
+    """Texts larger than one X request are served with the INCR protocol (other
+    applications used to receive nothing while set_clipboard reported success)."""
+    from pypilot.backends._x11clip import X11Clipboard
+
+    owner = X11Backend(xvfb_display, clipboard_tool="native", accessibility=False)
+    reader = X11Clipboard(xvfb_display)
+    try:
+        for n in (300_000, 1_500_000):
+            text = ("0123456789;é€\n" * (n // 14 + 1))[:n]
+            owner.set_clipboard(text)
+            assert reader.get() == text
+        assert not owner._state.clipboard._incr  # finished transfers are forgotten
+    finally:
+        owner.close()
+
+
+@pytest.mark.x11
+def test_native_clipboard_stale_selection_clear_keeps_new_text(xvfb_display):
+    """Another app copies, then we copy again before our serving thread handled the
+    SelectionClear of the first loss: the stale event must not erase the new text."""
+    from pypilot.backends._x11clip import X11Clipboard
+
+    ours, other, reader = X11Clipboard(xvfb_display), X11Clipboard(xvfb_display), X11Clipboard(xvfb_display)
+    try:
+        ours.set("old")
+        with ours._lock:  # keep the serving thread from handling events meanwhile
+            other.set("theirs")  # SelectionClear is now on its way to `ours`
+            ours.set("new")  # its round trip queues the stale SelectionClear
+        time.sleep(0.5)  # serving thread processes the queued event
+        assert reader.get() == "new"
+        assert ours.get() == "new"
+        other.set("theirs again")  # a real loss still clears our copy
+        deadline = time.time() + 2
+        while time.time() < deadline and ours._text is not None:
+            time.sleep(0.02)
+        assert ours._text is None
+        assert ours.get() == "theirs again"
+    finally:
+        for c in (ours, other, reader):
+            c.close()
+
+
+def _lock_xkb_group(display_name, group):
+    import ctypes
+    import ctypes.util
+
+    lib = ctypes.util.find_library("X11")
+    if not lib:
+        pytest.skip("libX11 not found (needed to lock an XKB group)")
+    x = ctypes.CDLL(lib)
+    x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    dpy = x.XOpenDisplay(display_name.encode())
+    if not dpy:
+        pytest.skip("libX11 cannot open the display")
+    try:
+        x.XkbLockGroup(ctypes.c_void_p(dpy), 0x100, group)  # XkbUseCoreKbd
+        x.XSync(ctypes.c_void_p(dpy), 0)
+    finally:
+        x.XCloseDisplay(ctypes.c_void_p(dpy))
+
+
+@pytest.mark.x11
+def test_key_down_uses_the_active_layout_group(private_display):
+    """With two layouts (de,us) and the second one active, press("y") must type "y"
+    (it typed "z"; ctrl+z turned into ctrl+y) -- like type_text already did."""
+    import shutil
+    import subprocess
+
+    _, disp = private_display
+    if not shutil.which("setxkbmap"):
+        pytest.skip("needs setxkbmap")
+    xc = xdisplay.Display(disp)  # connected first: the server resets when its last client leaves
+    if subprocess.run(["setxkbmap", "-display", disp, "-layout", "de,us"], capture_output=True).returncode:
+        xc.close()
+        pytest.skip("setxkbmap -layout de,us failed")
+    b = X11Backend(disp, clipboard_tool="none", accessibility=False)
+    try:
+        mn, mx = xc.display.info.min_keycode, xc.display.info.max_keycode
+        keymap = [list(syms[:4]) for syms in xc.get_keyboard_mapping(mn, mx - mn + 1)]
+        if [ord("y"), ord("Y"), ord("z"), ord("Z")] not in keymap:
+            pytest.skip("unexpected de,us keymap")  # the German y key types z in the us group
+        _lock_xkb_group(disp, 1)
+        win = make_window(xc, (50, 50, 200, 120), event_mask=X.KeyPressMask)
+        b.activate_window(win.id)
+        drain(xc, timeout=0.1)
+        assert (b._root.query_pointer().mask >> 13) & 3 == 1  # XKB group 2 is active
+        for k in ("y", "z", "-", "Y"):
+            b.key_down(k)
+            b.key_up(k)
+        b.key_down("ctrl")
+        b.key_down("z")
+        b.key_up("z")
+        b.key_up("ctrl")
+        skip = _shift_codes(xc) | {kc for kc in xc.get_modifier_mapping()[X.ControlMapIndex] if kc}
+        evs = drain(xc, until=lambda e: sum(1 for x in e if x.type == X.KeyPress and x.detail not in skip) >= 5)
+        typed = []
+        for ev in (e for e in evs if e.type == X.KeyPress and e.detail not in skip):
+            # Group 2 is locked throughout: its keysyms are core columns 2 (plain) and 3 (Shift).
+            syms = list(xc.get_keyboard_mapping(ev.detail, 1)[0]) + [0, 0, 0, 0]
+            shift = bool(ev.state & X.ShiftMask)
+            ks = syms[3] if shift and syms[3] else syms[2] or syms[0]
+            if shift and not syms[3]:
+                ks = ord(chr(ks).upper())
+            typed.append((chr(ks), bool(ev.state & X.ControlMask)))
+        assert typed == [("y", False), ("z", False), ("-", False), ("Y", False), ("z", True)]
+    finally:
+        b.close()
+        xc.close()
+
+
+@pytest.mark.x11
+def test_two_backends_never_share_a_scratch_keycode(xvfb_display, xc):
+    """A second backend on the same display must not re-bind a spare keycode the
+    first one uses, and closing both restores the keymap exactly."""
+    mn, mx = xc.display.info.min_keycode, xc.display.info.max_keycode
+    before = [tuple(s) for s in xc.get_keyboard_mapping(mn, mx - mn + 1)]
+    a = X11Backend(xvfb_display, clipboard_tool="none", accessibility=False)
+    c = X11Backend(xvfb_display, clipboard_tool="none", accessibility=False)
+    try:
+        a._pool()
+        c._pool()  # both computed their spare-keycode pools before either bound one
+        a.type_text("é")
+        c.type_text("ö")
+        assert a._state.keycode_sym and c._state.keycode_sym
+        assert not set(a._state.keycode_sym) & set(c._state.keycode_sym)
+    finally:
+        a.close()
+        c.close()
+    after = [tuple(s) for s in xc.get_keyboard_mapping(mn, mx - mn + 1)]
+    assert after == before
+
+
+@pytest.mark.x11
+def test_window_errors_reported_after_many_earlier_errors(xvfb_display, xc, monkeypatch):
+    """Async X errors used to be found by list length, which stopped growing at 64:
+    after that, failed window operations silently reported success."""
+    b = X11Backend(xvfb_display, clipboard_tool="none", accessibility=False)
+    pixmap = xc.screen().root.create_pixmap(8, 8, xc.screen().root_depth)
+    xc.sync()
+    try:
+        with pytest.raises(WindowNotFound):
+            b.move_window(pixmap.id, (0, 0, 50, 50))  # a pixmap is not a window
+        bogus = b._d.create_resource_object("window", pixmap.id)
+        for _ in range(70):
+            bogus.configure(x=1)  # BadWindow, reported asynchronously
+        b._d.sync()
+        orig = X11Backend._handle
+
+        def handle_then_vanish(self, handle):
+            win = orig(self, handle)
+            xc.create_resource_object("window", win.id).destroy()
+            xc.sync()
+            return win
+
+        monkeypatch.setattr(X11Backend, "_handle", handle_then_vanish)
+        for _ in range(3):
+            win = xc.screen().root.create_window(10, 10, 50, 50, 0, X.CopyFromParent)
+            xc.sync()
+            with pytest.raises(WindowNotFound):
+                b.close_window(win.id)  # no WM, no WM_DELETE_WINDOW -> DestroyWindow fails
+    finally:
+        monkeypatch.undo()
+        pixmap.free()
+        xc.sync()
+        b.close()
+
+
+@pytest.mark.x11
+def test_lost_display_raises_backend_error(private_display):
+    proc, disp = private_display
+    b = X11Backend(disp, clipboard_tool="native", accessibility=False)
+    try:
+        b.set_clipboard("x")
+        b.screenshot()
+        with pytest.raises(ValueError):
+            b.move_window(b._root.id, (10, 10, 70000, 300))  # CARD16 overflow used to raise struct.error
+        with pytest.raises(ValueError):
+            b.move_window(b._root.id, (-40000, 10, 300, 300))
+        proc.kill()
+        proc.wait(timeout=5)
+        time.sleep(0.2)
+        calls = [
+            ("mouse_move", (1, 1)), ("mouse_position", ()), ("type_text", ("a",)), ("key_down", ("a",)),
+            ("screenshot", ()), ("monitors", ()), ("list_windows", ()), ("activate_window", (1,)),
+            ("get_clipboard", ()), ("set_clipboard", ("y",)),
+        ]
+        for name, args in calls:
+            with pytest.raises(BackendError):
+                getattr(b, name)(*args)
+    finally:
+        b.close()
+
+
+@pytest.mark.x11
+def test_bordered_window_rect_round_trips_without_wm(be, xc):
+    """Without a WM the reported rect includes the X border, so moving a window to its
+    own rect is a no-op and maximize -> normal restores the original rect."""
+    scr = xc.screen()
+    win = scr.root.create_window(100, 100, 240, 130, 3, scr.root_depth, X.InputOutput, X.CopyFromParent)
+    win.set_wm_name("pypilot-border-test")
+    win.map()
+    xc.sync()
+    time.sleep(0.1)
+
+    def rect():
+        return next(w.rect for w in be.list_windows() if w.handle == win.id)
+
+    try:
+        r0 = rect()
+        assert r0 == Rect(100, 100, 246, 136)
+        be.move_window(win.id, r0)
+        assert rect() == r0
+        be.set_window_state(win.id, "maximized")
+        assert rect() == be.virtual_screen()
+        be.set_window_state(win.id, "normal")
+        assert rect() == r0
+    finally:
+        win.destroy()
+        xc.sync()
+
+
+@pytest.mark.x11
+def test_key_up_keeps_explicitly_held_shift(be):
+    """The implicit Shift of key_down("A") must not be released by key_up("A") while
+    "shift" itself is held (XTEST releases are not reference counted)."""
+    def shift_down():
+        return bool(be._root.query_pointer().mask & X.ShiftMask)
+
+    be.key_down("A")
+    be.key_down("shift")
+    be.key_up("A")
+    try:
+        assert shift_down() and "shift" in be._held_keys
+    finally:
+        be.key_up("shift")
+    assert not shift_down()
+    assert not be._state.held_keycodes and not be._held_keys

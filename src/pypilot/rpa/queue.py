@@ -19,13 +19,17 @@ status per item exactly like UiPath Orchestrator queues:
   check, like Orchestrator's *Abandoned* status; ``on_abandoned="requeue"``
   puts them back to ``new`` instead, still bounded by ``process(retries=...)``
   because :attr:`QueueItem.attempts` is persisted and enforced across runs.
+  An item whose handler is interrupted (Ctrl+C, kill hotkey, fail-safe) is
+  handled the same way (``failed`` with error type ``Interrupted`` by default).
 * Items loaded from files get a ``reference`` derived from the file's resolved
   path and the row's *content* (``/abs/path/invoices.csv#<hash>``), and
   duplicate references are ignored, so re-running "load CSV then process" is
   idempotent, rows inserted into the file later are picked up, and a different
   file with the same name is not mistaken for the first one. When the data has
   a business key (an invoice number), pass ``reference_field=`` -- it is the
-  only reference that survives edits to a row or moving the file.
+  only reference that survives edits to a row or moving the file. A row whose
+  key is blank, or two different rows of one load with the same key, raise
+  ``ValueError`` (nothing is added): a transaction is never dropped silently.
 
 ::
 
@@ -56,6 +60,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
+from .. import failsafe as _failsafe
 from ..errors import FailSafeTriggered, PypilotError
 
 __all__ = [
@@ -70,6 +75,9 @@ __all__ = [
     "ITEM_STATUSES",
     "ABANDONED_POLICIES",
 ]
+
+#: Attribute :class:`~pypilot.rpa.robot.Robot` sets on the ``ActionTimeout`` of a task's own deadline.
+TASK_DEADLINE_ATTR = "_pypilot_task_deadline"
 
 NEW = "new"
 IN_PROGRESS = "in_progress"
@@ -229,7 +237,8 @@ class WorkQueue:
             effect): ``"fail"`` (default) marks them ``failed`` with error type
             ``Abandoned`` so a human can check and :meth:`retry_items` them;
             ``"requeue"`` puts them back to ``new`` (their attempt still counts
-            towards ``process(retries=...)``).
+            towards ``process(retries=...)``). Also applies to an item whose
+            handler :meth:`process` sees interrupted (error type ``Interrupted``).
     """
 
     def __init__(
@@ -336,21 +345,38 @@ class WorkQueue:
 
         ``reference_field`` takes each item's reference from that payload field;
         otherwise ``reference_prefix`` (if given) yields ``"<prefix>#<index>"``.
+        With ``reference_field``, a missing field raises ``KeyError``, and a blank
+        value, or a value shared by two *different* payloads of this call, raises
+        ``ValueError``; every payload is checked before any is added. An exact
+        duplicate payload (the same row exported twice) and a reference already
+        in the queue (an earlier load) return the existing item, so reloading
+        is idempotent.
         """
         added: List[QueueItem] = []
+        entries: List[tuple] = []
+        first_row: Dict[str, tuple] = {}
+        for idx, payload in enumerate(payloads):
+            if not isinstance(payload, dict):
+                raise TypeError(f"item {idx}: payload must be a dict, not {type(payload).__name__}")
+            ref: Optional[str] = None
+            if reference_field is not None:
+                if reference_field not in payload:
+                    raise KeyError(f"item {idx}: reference field {reference_field!r} missing (fields: {', '.join(map(str, payload))})")
+                value = payload[reference_field]
+                if value is None or str(value).strip() == "":
+                    raise ValueError(f"item {idx}: reference field {reference_field!r} is empty; every item needs its own reference")
+                ref = str(value)
+                if ref in first_row and first_row[ref][1] != payload:
+                    raise ValueError(f"item {idx}: reference {ref!r} (field {reference_field!r}) is also item {first_row[ref][0]}, "
+                                     "with different data; references must be unique")
+                first_row.setdefault(ref, (idx, payload))
+            elif reference_prefix is not None:
+                ref = f"{reference_prefix}#{idx}"
+            entries.append((payload, ref))
         with self._lock:
             saved, self.autosave = self.autosave, False
             try:
-                for idx, payload in enumerate(payloads):
-                    if not isinstance(payload, dict):
-                        raise TypeError(f"item {idx}: payload must be a dict, not {type(payload).__name__}")
-                    ref: Optional[str] = None
-                    if reference_field is not None:
-                        if reference_field not in payload:
-                            raise KeyError(f"item {idx}: reference field {reference_field!r} missing (fields: {', '.join(map(str, payload))})")
-                        ref = str(payload[reference_field])
-                    elif reference_prefix is not None:
-                        ref = f"{reference_prefix}#{idx}"
+                for payload, ref in entries:
                     added.append(self.add(payload, reference=ref, priority=priority))
             finally:
                 self.autosave = saved
@@ -366,18 +392,35 @@ class WorkQueue:
         reference_field: Optional[str] = None,
         priority: int = 0,
         skip_blank: bool = True,
+        strict: bool = True,
     ) -> List[QueueItem]:
-        """Add one item per CSV row (header row = field names). Returns the items (existing ones on resume)."""
+        """Add one item per CSV row (header row = field names). Returns the items (existing ones on resume).
+
+        With ``strict`` (the default) a row with more fields than the header (an
+        unquoted ``1,250.00`` would otherwise queue ``amount="1"``) or fewer (a
+        truncated line) raises ``ValueError`` naming the line, before anything is
+        added; ``strict=False`` drops the extra fields and blanks the missing ones.
+        """
         p = pathlib.Path(path).expanduser()
         with open(p, "r", encoding=encoding, newline="") as fh:
             reader = csv.DictReader(fh, delimiter=delimiter)
             if reader.fieldnames is None:
                 return []
+            width = len(reader.fieldnames)
             rows = []
             for row in reader:
+                extra = row.get(None) or []  # type: ignore[call-overload]
+                missing = [k for k, v in row.items() if k is not None and v is None]
                 clean = {str(k).strip(): (v if v is not None else "") for k, v in row.items() if k is not None}
-                if skip_blank and all(str(v).strip() == "" for v in clean.values()):
+                if skip_blank and all(str(v).strip() == "" for v in list(clean.values()) + list(extra)):
                     continue
+                if strict and (extra or missing):
+                    got = width + len(extra) if extra else width - len(missing)
+                    raise ValueError(
+                        f"{p}:{reader.line_num}: expected {width} field(s) like the header, got {got}"
+                        + (" (quote values that contain the delimiter, e.g. \"1,234.56\")" if extra else "")
+                        + "; nothing was added (pass strict=False to accept such rows)"
+                    )
                 rows.append(clean)
         return self._add_source_rows(p, rows, reference_field, priority)
 
@@ -614,11 +657,21 @@ class WorkQueue:
             limit: Process at most this many items in this call.
             stop_on_failure: Stop after the first item that ends ``failed``.
             on_item: Callback invoked with each item after it reaches a final status.
-            sleep: Sleep function for retry delays (inject ``lambda s: None`` in tests).
+            sleep: Sleep function for retry delays (inject ``lambda s: None`` in tests);
+                :func:`pypilot.failsafe.abort` (the kill hotkey) ends the wait at once.
 
         :class:`~pypilot.errors.FailSafeTriggered` and ``KeyboardInterrupt``
-        stop processing immediately: the current item goes back to ``new`` (it
-        was not its fault), the queue is saved, and the exception propagates.
+        stop processing immediately, the queue is saved and the exception
+        propagates. If the handler was running, its side effect (the payment)
+        may already have happened, so the item is treated like one a crash left
+        ``in_progress``: per ``on_abandoned``, ``failed`` with error type
+        ``Interrupted`` for a human to check (default), or back to ``new``
+        (``"requeue"``; the attempt counts). An interrupt during a retry wait
+        (no attempt running) puts the item back to ``new`` without counting
+        the attempt it was waiting for. When the enclosing robot task runs out of time
+        (its ``timeout``), the current item is marked ``failed`` without retry
+        (it may be half done), processing stops and the timeout propagates; the
+        remaining items stay ``new``.
 
         Returns:
             :meth:`summary` plus ``processed`` (items finished by this call) and
@@ -650,14 +703,14 @@ class WorkQueue:
                 except BusinessException as exc:
                     self.fail(item, exc, business=True)
                     break
-                except (FailSafeTriggered, KeyboardInterrupt):
-                    with self._lock:
-                        # Stopped by the human, not the item's fault: the attempt does not count.
-                        item.attempts = max(0, item.attempts - 1)
-                        self._reset(item, "interrupted", reset_attempts=False)
-                        self._autosave()
+                except (FailSafeTriggered, KeyboardInterrupt) as exc:
+                    self._interrupted_in_handler(item, exc)
                     raise
                 except Exception as exc:
+                    if getattr(exc, TASK_DEADLINE_ATTR, False):
+                        # The robot task's deadline: every later attempt would fail at once. Stop here.
+                        self.fail(item, exc, business=False)
+                        raise
                     if item.attempts >= budget:
                         self.fail(item, exc, business=False)
                         break
@@ -667,7 +720,16 @@ class WorkQueue:
                         item.attempts += 1
                         self._autosave()
                     if delay > 0:
-                        sleep(delay)
+                        try:
+                            if sleep is time.sleep:
+                                # Wakes up at once on abort() (kill hotkey) instead of after the whole delay.
+                                _failsafe.abortable_sleep(delay)
+                            else:
+                                sleep(delay)
+                            _failsafe._raise_if_aborted()
+                        except (FailSafeTriggered, KeyboardInterrupt):
+                            self._interrupted_in_wait(item)  # the attempt it was waiting for never started
+                            raise
                     delay *= float(backoff)
                     continue
                 self.complete(item, result if isinstance(result, dict) else None)
@@ -685,6 +747,32 @@ class WorkQueue:
         stats["processed"] = len(processed)
         stats["processed_ids"] = processed
         return stats
+
+    def _interrupted_in_wait(self, item: QueueItem) -> None:
+        with self._lock:
+            # Stopped by the human between attempts: no attempt was running, so nothing
+            # can be half done. The attempt it was waiting for does not count.
+            item.attempts = max(0, item.attempts - 1)
+            self._reset(item, "interrupted", reset_attempts=False)
+            self._autosave()
+
+    def _interrupted_in_handler(self, item: QueueItem, exc: BaseException) -> None:
+        with self._lock:
+            # Stopped while the handler was running: its side effect (the payment) may
+            # already have happened, exactly like a crash mid-transaction -> on_abandoned.
+            if self.on_abandoned == "requeue":
+                self._reset(item, "interrupted", reset_attempts=False)  # the attempt still counts
+            else:
+                item.status = FAILED
+                item.finished_at = _now()
+                reason = str(exc) or type(exc).__name__
+                item.error = (f"interrupted while processing this item ({reason}); "
+                              "its side effects may already have happened - check, then retry_items() if needed")
+                item.error_type = "Interrupted"
+                item.traceback = None
+                item.history.append({"time": item.finished_at, "event": "interrupted", "attempt": item.attempts,
+                                     "error": item.error})
+            self._autosave()
 
     # -------------------------------------------------------------------- stats
     def summary(self) -> Dict[str, Any]:

@@ -50,7 +50,7 @@ from .errors import (
     WindowNotFound,
 )
 from .failsafe import FailSafe
-from .keyboard import TYPING_MODES, Keyboard
+from .keyboard import DEFAULT_CLIPBOARD_SETTLE, DEFAULT_CLIPBOARD_TIMEOUT, TYPING_MODES, Keyboard
 from .motion import Humanize
 from .mouse import Mouse
 from .screen import Screen
@@ -108,6 +108,11 @@ class Desktop:
         sleep: Sleep function used for every wait/pause (inject ``lambda s: None`` in tests).
         clock: Monotonic clock used by the polling helpers.
         poll_interval: Seconds between polls in :meth:`find`, :meth:`window`, :meth:`locate`...
+        clipboard_settle: Seconds clipboard-mode typing waits after a paste before
+            restoring the clipboard, when the backend cannot tell whether the target
+            app has read it (raise it for slow apps or remote sessions); see :class:`Keyboard`.
+        clipboard_timeout: Seconds to wait for the target app to read a paste on
+            backends that can tell (X11 native clipboard); see :class:`Keyboard`.
 
     Attributes:
         backend, mouse, keyboard, screen, failsafe, default_timeout, humanize, typing_mode.
@@ -125,6 +130,8 @@ class Desktop:
         sleep: Callable[[float], Any] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         poll_interval: float = 0.1,
+        clipboard_settle: float = DEFAULT_CLIPBOARD_SETTLE,
+        clipboard_timeout: float = DEFAULT_CLIPBOARD_TIMEOUT,
     ):
         from .backends import create_backend, get_backend
 
@@ -169,7 +176,8 @@ class Desktop:
 
         self._pause = max(0.0, float(pause))
         self.mouse = Mouse(self.backend, self.failsafe, self._pause, self.humanize, sleep=sleep, clock=clock)
-        self.keyboard = Keyboard(self.backend, self.failsafe, self._pause, sleep=sleep)
+        self.keyboard = Keyboard(self.backend, self.failsafe, self._pause, sleep=sleep,
+                                 clipboard_settle=clipboard_settle, clipboard_timeout=clipboard_timeout)
         self.screen = Screen(self.backend, sleep=sleep, clock=clock)
 
     # ================================================================ plumbing
@@ -194,11 +202,15 @@ class Desktop:
         return self.backend.has(capability)
 
     def sleep(self, seconds: float) -> None:
-        """Sleep ``seconds`` (via the injected sleep function), honouring the global abort flag."""
+        """Sleep ``seconds`` (via the injected sleep function), honouring the global abort flag.
+
+        An :func:`~pypilot.failsafe.abort` (kill hotkey) during the sleep raises
+        :class:`FailSafeTriggered` at once (within ~0.1 s), not after the whole wait.
+        """
         self._check_abort()
         seconds = float(seconds)
         if seconds > 0:
-            self._sleep_fn(seconds)
+            _failsafe_mod.abortable_sleep(seconds, self._sleep_fn)
         self._check_abort()
 
     @staticmethod
@@ -338,6 +350,59 @@ class Desktop:
             return self.find(target)
         return None
 
+    def _check_on_screen(self, point: Point) -> None:
+        """Raise ``ValueError`` if ``point`` lies on no monitor.
+
+        The OS would clamp it to the nearest screen edge and the action would
+        land on whatever is there (a scrollbar, a close button), e.g. a script
+        recorded on two monitors replayed over a one-monitor RDP session.
+        """
+        try:
+            rects = [m.rect for m in self.screen.monitors()] or [self.screen.virtual_rect()]
+        except Exception:
+            return  # cannot tell; let the backend decide
+        if not any(r.contains(point) for r in rects):
+            layout = ", ".join(f"({r.left}, {r.top}, {r.width}x{r.height})" for r in rects)
+            raise ValueError(f"Point ({point.x}, {point.y}) is off-screen (monitors: {layout}); "
+                             "pass allow_offscreen=True to send it anyway")
+
+    def _action_point(self, target: Any, y: Optional[float] = None, offset: Tuple[int, int] = (0, 0),
+                      *, allow_offscreen: bool = False) -> Point:
+        """Where a mouse action on ``target`` must go.
+
+        Elements (and selectors) are hit-tested like :meth:`Element.click`: a
+        covered element's window is brought to the front, and
+        :class:`ElementNotFound` is raised if it stays covered, hidden or
+        off-screen. Other targets resolve through :meth:`resolve_point` and must
+        lie on a monitor unless ``allow_offscreen``.
+        """
+        dx, dy = int(offset[0]), int(offset[1])
+        if y is None:
+            el = self._resolve_element(target)
+            if el is not None:
+                el._guard()
+                return el._mouse_point((dx, dy))
+        point = self.resolve_point(target, y).offset(dx, dy)
+        if not allow_offscreen:
+            self._check_on_screen(point)
+        return point
+
+    def _image_target(self, target: Any, use: str) -> bool:
+        """Whether ``target`` (given to an element lookup) is a template image.
+
+        A string ending in an image extension whose file is missing raises
+        :class:`FileNotFoundError`; with ``use`` empty, an image raises
+        ``TypeError`` (the lookup returns elements only).
+        """
+        if self._is_image(target):
+            if not use:
+                raise TypeError(f"{_describe_image(target)} is an image, not a selector; "
+                                "use locate()/wait_image()/locate_all() to find images")
+            return True
+        if isinstance(target, str):
+            self._check_image_path(target)
+        return False
+
     def _region(self, region: Any) -> Optional[Rect]:
         """Coerce a region argument: Rect-like, :class:`Element` (bounds), :class:`Window` or :class:`Match`."""
         if region is None:
@@ -368,9 +433,16 @@ class Desktop:
         duration: Optional[float] = None,
         humanize: Union[bool, Humanize, None] = None,
         tween: Any = "ease_in_out_quad",
+        offset: Tuple[int, int] = (0, 0),
+        allow_offscreen: bool = False,
     ) -> Point:
-        """Move the cursor to ``target`` (see :meth:`resolve_point`). Returns the destination."""
-        point = self.resolve_point(target, y)
+        """Move the cursor to ``target`` (see :meth:`resolve_point`) + ``offset``. Returns the destination.
+
+        Elements and selectors are hit-tested as in :meth:`click` (never hover
+        whatever covers them); a point on no monitor raises ``ValueError``
+        unless ``allow_offscreen``.
+        """
+        point = self._action_point(target, y, offset, allow_offscreen=allow_offscreen)
         return self.mouse.move(point, duration=duration, tween=tween, humanize=humanize)
 
     def move_rel(self, dx: float, dy: float, **kw: Any) -> Point:
@@ -389,12 +461,15 @@ class Desktop:
         offset: Tuple[int, int] = (0, 0),
         duration: Optional[float] = None,
         humanize: Union[bool, Humanize, None] = None,
+        allow_offscreen: bool = False,
     ) -> Point:
         """Click ``target`` (see :meth:`resolve_point`; ``None`` = where the cursor is).
 
         When the target is an element (or a selector string) and no timing
         options are given, :meth:`Element.click` is used, which falls back to the
         native accessibility *invoke* when the element is covered or off-screen.
+        A point on no monitor raises ``ValueError`` (the OS would click the
+        clamped screen edge) unless ``allow_offscreen``.
 
         Returns the clicked point (the element's center for native invokes).
         """
@@ -406,12 +481,17 @@ class Desktop:
                     el.click(button, clicks, offset=(dx, dy), native="auto")
                     b = el.bounds
                     return b.center.offset(dx, dy) if b is not None else self.position()
-                point = el.center.offset(dx, dy)
+                # Same hit-test as Element.click: never click whatever covers the element.
+                el._guard()
+                el._wait_enabled()
+                point = el._mouse_point((dx, dy))
                 return self.mouse.click(point, button=button, clicks=clicks, interval=interval,
                                         duration=duration, humanize=humanize)
         if target is None and y is None and (dx, dy) == (0, 0):
             return self.mouse.click(None, button=button, clicks=clicks, interval=interval, humanize=humanize)
         point = self.resolve_point(target, y).offset(dx, dy)
+        if not allow_offscreen:
+            self._check_on_screen(point)
         return self.mouse.click(point, button=button, clicks=clicks, interval=interval, duration=duration, humanize=humanize)
 
     def double_click(self, target: Any = None, y: Optional[float] = None, **kw: Any) -> Point:
@@ -451,15 +531,31 @@ class Desktop:
         button: str = "left",
         humanize: Union[bool, Humanize, None] = None,
         hold: float = 0.05,
+        allow_offscreen: bool = False,
     ) -> Point:
-        """Drag from ``start`` (``None`` = current position) to ``end``; both accept any target."""
-        s = None if start is None else self.resolve_point(start)
-        e = self.resolve_point(end)
+        """Drag from ``start`` (``None`` = current position) to ``end``; both accept any target.
+
+        Element/selector ends are hit-tested as in :meth:`click`: the press and
+        the drop never land on a window that covers them (:class:`ElementNotFound`
+        instead). Points on no monitor raise ``ValueError`` unless ``allow_offscreen``.
+        """
+        start_el = None if start is None else self._resolve_element(start)
+        s = None if start is None else self._action_point(start_el or start, allow_offscreen=allow_offscreen)
+        e = self._action_point(end, allow_offscreen=allow_offscreen)
+        # Bringing the drop target's window forward may have covered the start.
+        if start_el is not None and s is not None and start_el._occluded(s):
+            raise ElementNotFound(f"The drag start {start_el!r} is covered once the drop target is in front; "
+                                  "refusing to drag from the wrong thing")
         return self.mouse.drag(s, e, button=button, duration=duration, humanize=humanize, hold=hold)
 
-    def scroll(self, dy: int = 0, dx: int = 0, *, at: Any = None) -> None:
-        """Scroll wheel notches (``dy > 0`` = up, ``dx > 0`` = right), optionally over ``at``."""
-        point = None if at is None else self.resolve_point(at)
+    def scroll(self, dy: int = 0, dx: int = 0, *, at: Any = None, allow_offscreen: bool = False) -> None:
+        """Scroll wheel notches (``dy > 0`` = up, ``dx > 0`` = right), optionally over ``at``.
+
+        An element/selector ``at`` is hit-tested as in :meth:`click` (never scroll
+        a window that covers it); a point on no monitor raises ``ValueError``
+        unless ``allow_offscreen``.
+        """
+        point = None if at is None else self._action_point(at, allow_offscreen=allow_offscreen)
         self.mouse.scroll(dy, dx, at=point)
 
     # =============================================================== keyboard
@@ -555,14 +651,26 @@ class Desktop:
         rect = self._region(region)
         t = float(timeout)
 
+        failed: List[BaseException] = []  # error of the latest capture, if it failed
+
         def probe() -> Optional[Match]:
-            return self.screen.locate(needle, region=rect, confidence=confidence, grayscale=grayscale, scales=tuple(scales))
+            try:
+                m = self.screen.locate(needle, region=rect, confidence=confidence, grayscale=grayscale, scales=tuple(scales))
+            except Exception as exc:
+                failed[:] = [exc]
+                raise
+            failed.clear()
+            return m
 
         try:
             # ValueError/TypeError come from argument validation (transparent needle,
             # scales <= 0, bad confidence...): retrying cannot fix them.
             return self._poll(probe, t, f"Image {_describe_image(image)} not found", fatal=(ValueError, TypeError))
         except ActionTimeout:
+            if failed:
+                # The screen could not be captured (locked workstation, RDP session
+                # disconnected...): that is not "not found", so report the real cause.
+                raise failed[0] from None
             return None
 
     def locate_all(self, image: Any, **kw: Any) -> List[Match]:
@@ -692,12 +800,11 @@ class Desktop:
                     roles[role] = node
             if count > max_nodes:
                 break
-        wanted = [a or b for a, b in _QUOTED_RE.findall(selector_text) if (a or b)]
-        wanted += _BARE_ATTR_RE.findall(selector_text)
-        suggestions: List[str] = []
-        if wanted:
-            names = list(by_name)
-            for w in wanted:
+        names = list(by_name)
+
+        def named(words: List[str]) -> List[str]:
+            out: List[str] = []
+            for w in words:
                 wl = w.lower()
                 close = difflib.get_close_matches(wl, names, n=limit, cutoff=0.6)
                 close += [n for n in names if wl and wl in n and n not in close]
@@ -706,15 +813,35 @@ class Desktop:
                         desc = describe_node(by_name[n], include_bounds=False)
                     except Exception:
                         desc = repr(n)
-                    if desc not in suggestions:
-                        suggestions.append(desc)
+                    if desc not in out:
+                        out.append(desc)
+            return out
+
+        wanted = [a or b for a, b in _QUOTED_RE.findall(selector_text) if (a or b)]
+        wanted += _BARE_ATTR_RE.findall(selector_text)
+        suggestions: List[str] = []
+        tip = ""
+        if wanted:
+            suggestions = named(wanted)
         else:
             m = _LEAD_ROLE_RE.match(selector_text)
-            if m and m.group(1).lower() not in roles:
-                suggestions = [f"role {r!r}" for r in difflib.get_close_matches(m.group(1).lower(), list(roles), n=limit, cutoff=0.5)]
+            lead = m.group(1).lower() if m else ""
+            if lead and lead not in roles:
+                from .backends.base import ROLES
+                from .selectors import ROLE_ALIASES
+
+                if lead not in ROLES and lead not in ROLE_ALIASES:
+                    # A bare word is read as a role: click("Save") looks for role "save".
+                    bare = selector_text.strip()
+                    suggestions = named([bare] + ([m.group(1)] if m.group(1) != bare else []))
+                    if suggestions:
+                        tip = (f" (a bare word is a role; write a name in quotes: '\"{m.group(1)}\"' "
+                               f"or 'button \"{m.group(1)}\"')")
+                if not suggestions:
+                    suggestions = [f"role {r!r}" for r in difflib.get_close_matches(lead, list(roles), n=limit, cutoff=0.5)]
         if not suggestions:
             return ""
-        return "; did you mean: " + ", ".join(suggestions[:limit])
+        return "; did you mean: " + ", ".join(suggestions[:limit]) + tip
 
     def find(self, selector: Any, *, timeout: Optional[float] = None, root: Any = None) -> Element:
         """Find the first element matching ``selector`` (CSS-like, UiPath XML or dict).
@@ -726,6 +853,7 @@ class Desktop:
         """
         from .selectors import parse
 
+        self._image_target(selector, "")
         scope = self._scope(root)
         if scope is not None:
             return scope.find(selector, timeout=timeout)
@@ -735,13 +863,14 @@ class Desktop:
         try:
             node = self._poll(lambda: sel.find_first(self.roots()), t, f"No element matching {text!r}")
         except ActionTimeout as exc:
-            raise ElementNotFound(f"No element matching {str(sel)!r} within {t:g}s{self._hint(text)}") from exc
+            raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}") from exc
         return Element(node, self, text)
 
     def find_all(self, selector: Any, *, root: Any = None) -> List[Element]:
         """All elements matching ``selector`` right now (no waiting), in document order."""
         from .selectors import parse
 
+        self._image_target(selector, "")
         scope = self._scope(root)
         if scope is not None:
             return scope.find_all(selector)
@@ -750,23 +879,47 @@ class Desktop:
         return [Element(n, self, text, index=i) for i, n in enumerate(sel.find_all(self.roots()))]
 
     def exists(self, selector: Any, *, timeout: float = 0.0, root: Any = None) -> bool:
-        """Whether an element matching ``selector`` appears within ``timeout`` seconds."""
+        """Whether an element matching ``selector`` appears within ``timeout`` seconds.
+
+        ``selector`` may also be a template image (an existing image file, a
+        ``pathlib.Path``, bytes, PIL/numpy image or data URL): it is then looked
+        for on screen (inside ``root``'s bounds if given), as with :meth:`locate`.
+        """
+        if self._image_target(selector, "exists"):
+            return self.locate(selector, region=root, timeout=timeout) is not None
         try:
             self.find(selector, timeout=timeout, root=root)
             return True
         except ElementNotFound:
             return False
 
-    def wait(self, selector: Any, *, state: Any = "visible", timeout: Optional[float] = None, root: Any = None) -> Optional[Element]:
+    def wait(self, selector: Any, *, state: Any = "visible", timeout: Optional[float] = None, root: Any = None) -> Any:
         """Wait for an element matching ``selector`` to reach ``state``.
 
         ``state`` is one of :data:`pypilot.element.ELEMENT_STATES` or a callable
         ``(Element) -> bool``. ``"gone"`` waits until nothing matches and returns
         ``None``. Raises :class:`ElementNotFound` if nothing ever matched, or
         :class:`ActionTimeout` if matches never reached the state.
+
+        For a template image (see :meth:`exists`), ``"visible"``/``"exists"``
+        return its :class:`Match` (as :meth:`wait_image`, raising
+        :class:`ImageNotFound`) and ``"gone"`` waits until it is no longer on
+        screen (:class:`ActionTimeout` otherwise); other states are rejected.
         """
         from .selectors import parse
 
+        if self._image_target(selector, "wait"):
+            mode = state.lower() if isinstance(state, str) else None
+            if mode in ("visible", "exists"):
+                return self.wait_image(selector, timeout=timeout, region=root)
+            if mode != "gone":
+                raise ValueError(f"state {state!r} does not apply to an image; use 'visible', 'exists' or 'gone'")
+            t = self._timeout(timeout)
+            rect = self._region(root)
+            needle = self._load_needle(selector)
+            self._poll(lambda: self.screen.locate(needle, region=rect) is None, t,
+                       f"Image {_describe_image(selector)} still on screen after {t:g}s", fatal=(ValueError, TypeError))
+            return None
         sel = parse(selector)
         t = self._timeout(timeout)
         text = self._selector_text(selector, sel)
@@ -799,7 +952,7 @@ class Desktop:
             return self._poll(probe, t, f"Element {text!r} did not become {label!r} within {t:g}s")
         except ActionTimeout as exc:
             if not seen[0]:
-                raise ElementNotFound(f"No element matching {str(sel)!r} within {t:g}s{self._hint(text)}") from exc
+                raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}") from exc
             raise
 
     def element_at(self, x: Any, y: Optional[float] = None) -> Optional[Element]:
@@ -889,16 +1042,64 @@ class Desktop:
         info = self.backend.active_window()
         return None if info is None else Window(info, self)
 
-    def launch(self, command: Any, *, wait_window: Any = None, timeout: Optional[float] = None, **kw: Any) -> Any:
+    def launch(
+        self,
+        command: Any,
+        *,
+        wait_window: Any = None,
+        timeout: Optional[float] = None,
+        new_window: bool = True,
+        **kw: Any,
+    ) -> Any:
         """Start an application (``kw`` go to the backend, e.g. ``subprocess.Popen`` options).
 
         With ``wait_window`` (a title query as in :meth:`window`), waits for that window
         and returns it as a :class:`Window`; otherwise returns the process handle.
+
+        By default (``new_window=True``) only a window that appeared after the launch
+        counts, so an already-open window with a matching title (another Excel
+        workbook...) is never returned instead of the new one; a window of the
+        launched process wins. If no new window appears within ``timeout`` and the
+        launched process has exited (it handed over to an already-running instance
+        that just showed its existing window), the best pre-existing match is
+        returned. ``new_window=False`` accepts any matching window at once.
         """
+        before: Optional[List[Any]] = None
+        if wait_window is not None and new_window:
+            try:
+                before = [w.handle for w in self.backend.list_windows()]
+            except Exception:
+                before = None  # cannot tell old from new windows: accept any match
         proc = self.backend.launch(command, **kw)
         if wait_window is None:
             return proc
-        return self.window(wait_window, timeout=timeout)
+        if before is None:
+            return self.window(wait_window, timeout=timeout)
+        old = before
+        t = self._timeout(timeout)
+        pid = getattr(proc, "pid", None)
+
+        def probe() -> Optional[Window]:
+            fresh = [w for w in self.windows(wait_window) if w.handle not in old]
+            if not fresh:
+                return None
+            if pid is not None:
+                fresh = [w for w in fresh if w.pid == pid] or fresh
+            return sorted(fresh, key=lambda w: self._rank(w, wait_window))[0]
+
+        try:
+            return self._poll(probe, t, "window not found")
+        except ActionTimeout:
+            try:  # subprocess.Popen.poll(): None while the process runs
+                running = callable(getattr(proc, "poll", None)) and proc.poll() is None
+            except Exception:
+                running = False
+            if running:
+                raise WindowNotFound(
+                    f"No new window matching {wait_window!r} appeared within {t:g}s after launching {command!r} "
+                    "(windows that were already open are ignored; pass new_window=False to accept them)"
+                ) from None
+            return self.window(wait_window, timeout=0)
 
     # =============================================================== clipboard
     def clipboard_get(self) -> str:
@@ -913,14 +1114,19 @@ class Desktop:
 
     # ================================================================== lifecycle
     def close(self) -> None:
-        """Release every key this desktop holds and close the backend if this desktop created it."""
+        """Release every key and mouse button this desktop (and its backend) holds and close the backend if this desktop created it."""
         if self._closed:
             return
         self._closed = True
-        try:
-            self.keyboard.release_all()
-        except Exception:
-            pass
+        for release in (self.keyboard.release_all, self.mouse.release_all, getattr(self.backend, "release_all", None)):
+            # The backend's own bookkeeping also covers a press an interrupt cut off
+            # before Keyboard/Mouse could record it.
+            if release is None:
+                continue
+            try:
+                release()
+            except Exception:
+                pass
         if self._owns_backend:
             try:
                 self.backend.close()

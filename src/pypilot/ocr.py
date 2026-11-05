@@ -485,12 +485,43 @@ def read_text(image: Any, *, engine: Any = None) -> str:
     return "\n".join(" ".join(w.text for w in ln) for ln in _group_lines(read_words(image, engine=engine)))
 
 
+_EDGE_PUNCT = ".,:;!?\"'`()[]{}<>|*~_-…“”‘’"
+# Tokens with a digit are amounts, dates, IDs: signs ("-1,500.00", SAP's trailing
+# "1,500.00-", "+5"), accounting parentheses ("(250.00)") and a leading decimal
+# point (".50") change their meaning, so those are kept; quotes, brackets, grid
+# lines read as "|", ALV total markers ("*") and trailing sentence punctuation
+# are still dropped.
+_NUM_LEAD_PUNCT = "\"'`“”‘’[]{}<>|*~_"
+_NUM_TRAIL_PUNCT = ".,:;!?\"'`…“”‘’[]{}<>|*~_"
+
+
 def _norm_token(token: str, case_sensitive: bool) -> str:
-    """Normalize a token for comparison: NFKC, strip edge punctuation, casefold."""
+    """Normalize a token for comparison: NFKC, strip edge punctuation, casefold.
+
+    Numeric tokens (containing a digit) keep their sign characters, parentheses and
+    a leading decimal point.
+    """
     t = unicodedata.normalize("NFKC", token).strip()
-    stripped = t.strip(".,:;!?\"'`()[]{}<>|*~_-…“”‘’")
+    if any(c.isdigit() for c in t):
+        stripped = t.lstrip(_NUM_LEAD_PUNCT).rstrip(_NUM_TRAIL_PUNCT)
+    else:
+        stripped = t.strip(_EDGE_PUNCT)
     t = stripped or t
     return t if case_sensitive else t.casefold()
+
+
+# Max horizontal gap between consecutive words, in average character widths, for
+# them to form a phrase (a column/cell boundary in a grid is wider) or to be joined
+# into one split word ("Log in" read for "Login").
+_PHRASE_GAP = 3.0
+_JOIN_GAP = 1.5
+
+
+def _gap_chars(a: OCRWord, b: OCRWord) -> float:
+    """Horizontal gap between words ``a`` and ``b`` (``b`` right of ``a``) in character widths."""
+    chars = max(1, len(a.text.strip())) + max(1, len(b.text.strip()))
+    char_w = max(1.0, (a.rect.width + b.rect.width) / chars)
+    return max(0, b.rect.left - a.rect.right) / char_w
 
 
 def _union_rect(words: Sequence[OCRWord]) -> Rect:
@@ -516,13 +547,21 @@ def find_text(
     Args:
         image: picture to search (anything :func:`pypilot.vision.load_image` accepts).
         query: a word or phrase (whitespace separated words must be adjacent on
-            the same line), or a regular expression if ``regex=True`` (searched in
-            each line's text; the matching words' boxes are united).
+            the same line, at most about three character widths apart, so words
+            from different grid columns never form a phrase), or a regular
+            expression if ``regex=True`` (searched in each line's text; the
+            matching words' boxes are united). An invalid regex raises
+            :class:`ValueError` before OCR runs.
         engine: ``None`` (auto), engine name, or engine object.
         regex: treat ``query`` as a regex.
         case_sensitive: compare case-sensitively (default: casefolded).
         fuzzy: ``1.0`` = exact token match (edge punctuation ignored, so
-            ``"Save"`` matches ``"Save:"``); ``< 1`` = accept phrases whose
+            ``"Save"`` matches ``"Save:"``; in tokens with a digit only trailing
+            sentence punctuation and quotes are, so ``"-1,500.00"``,
+            ``"1,500.00-"`` and ``"(250.00)"`` never equal ``"1,500.00"`` or
+            ``"250.00"``). A word OCR split in two (``"Log in"`` for ``"Login"``)
+            also matches exactly when the gap is at most ~1.5 character widths,
+            ranked after genuine exact matches. ``< 1`` = accept phrases whose
             :class:`difflib.SequenceMatcher` ratio is ``>= fuzzy`` (OCR typos,
             merged/split words).
         offset: added to every rect (screen position of image pixel (0, 0)).
@@ -531,21 +570,30 @@ def find_text(
     Returns:
         Matches (``text`` = the recognized text, ``confidence`` = similarity x
         mean OCR confidence, ``extra`` = ``{"similarity", "ocr_confidence",
-        "line"}``), best similarity first, then reading order.
+        "line"}``), best similarity first (exact matches before joined split
+        words), then reading order.
     """
     if not isinstance(query, str) or not query.strip():
         raise ValueError("find_text() needs a non-empty query string")
     if not (0.0 < fuzzy <= 1.0):
         raise ValueError("fuzzy must be in (0, 1]")
+    pattern = None
+    if regex:
+        # Validate before running OCR. re.error is not a ValueError, and callers such
+        # as Desktop.find_text treat only ValueError/TypeError as fatal: a typo in
+        # the pattern must not look like "text not on screen" after the full timeout.
+        try:
+            pattern = re.compile(query, 0 if case_sensitive else re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex {query!r}: {exc}") from exc
     if words is None:
         words = read_words(image, engine=engine)
     lines = _group_lines(words)
     ox, oy = int(offset[0]), int(offset[1])
-    found: List[Tuple[float, int, int, int, List[OCRWord], str]] = []  # (similarity, line, i, j, words, text)
+    # (similarity, kind, line, words, text); kind 0 = exact, 1 = joined split word
+    found: List[Tuple[float, int, int, List[OCRWord], str]] = []
 
-    if regex:
-        flags = 0 if case_sensitive else re.IGNORECASE
-        pattern = re.compile(query, flags)
+    if pattern is not None:
         for li, ln in enumerate(lines):
             spans = []
             parts = []
@@ -560,7 +608,7 @@ def find_text(
                     continue
                 idx = [k for k, (a, b) in enumerate(spans) if a < m.end() and b > m.start()]
                 if idx:
-                    found.append((1.0, li, idx[0], idx[-1] + 1, [ln[k] for k in idx], m.group(0)))
+                    found.append((1.0, 0, li, [ln[k] for k in idx], m.group(0)))
     else:
         q_tokens = [_norm_token(t, case_sensitive) for t in query.split()]
         q_tokens = [t for t in q_tokens if t]
@@ -572,15 +620,21 @@ def find_text(
         sizes = range(max(1, n - 1), n + 2)
         for li, ln in enumerate(lines):
             norm = [_norm_token(w.text, case_sensitive) for w in ln]
-            cands: List[Tuple[float, int, int]] = []
+            # gap[k] = horizontal gap between ln[k] and ln[k+1] in character widths
+            gap = [_gap_chars(ln[k], ln[k + 1]) for k in range(len(ln) - 1)]
+            cands: List[Tuple[float, int, int, int]] = []
             for size in sizes:
                 for i in range(0, len(ln) - size + 1):
+                    widest = max(gap[i : i + size - 1], default=0.0)
+                    if widest > _PHRASE_GAP:
+                        continue  # words from different columns/cells are no phrase
                     toks = norm[i : i + size]
                     joined = " ".join(toks)
+                    kind = 0
                     if size == n and joined == q_joined:
                         sim = 1.0
-                    elif "".join(toks) == q_compact:
-                        sim = 1.0  # "Log in" vs "Login"
+                    elif "".join(toks) == q_compact and widest <= _JOIN_GAP:
+                        sim, kind = 1.0, 1  # "Log in" vs "Login"
                     elif fuzzy < 1.0:
                         sim = max(
                             difflib.SequenceMatcher(None, joined, q_joined).ratio(),
@@ -590,20 +644,21 @@ def find_text(
                             continue
                     else:
                         continue
-                    cands.append((sim, i, i + size))
+                    cands.append((sim, kind, i, i + size))
             # keep the best non-overlapping spans on this line
-            cands.sort(key=lambda c: (-c[0], abs((c[2] - c[1]) - n), c[1]))
+            cands.sort(key=lambda c: (-c[0], c[1], abs((c[3] - c[2]) - n), c[2]))
             taken: List[Tuple[int, int]] = []
-            for sim, i, j in cands:
+            for sim, kind, i, j in cands:
                 if any(i < b and a < j for a, b in taken):
                     continue
                 taken.append((i, j))
                 sel = ln[i:j]
-                found.append((sim, li, i, j, sel, " ".join(w.text for w in sel)))
+                found.append((sim, kind, li, sel, " ".join(w.text for w in sel)))
 
-    found.sort(key=lambda f: (-round(f[0], 6), f[1], f[4][0].rect.left))
+    # best similarity first; an exact match outranks a joined split word; then reading order
+    found.sort(key=lambda f: (-round(f[0], 6), f[1], f[2], f[3][0].rect.left))
     matches = []
-    for sim, li, _i, _j, sel, text in found:
+    for sim, _kind, _li, sel, text in found:
         ocr_conf = sum(w.confidence for w in sel) / len(sel)
         matches.append(
             Match(

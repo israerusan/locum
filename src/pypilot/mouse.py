@@ -54,6 +54,7 @@ class Mouse:
         self.rate = int(rate)
         self._sleep = sleep
         self._clock = clock
+        self._pressed: list = []  # buttons held down by down() (press order)
 
     # ------------------------------------------------------------------ helpers
     def _check(self, ignore: Optional[Point] = None) -> None:
@@ -148,13 +149,58 @@ class Mouse:
         """Press (and hold) a mouse button at the current position."""
         btn = MouseButton.coerce(button)
         self._check()
-        self.backend.mouse_down(btn)
+        # Recorded before the backend call, so an interrupt inside it (after the press
+        # reached the OS) still leaves release_all() knowing about the button.
+        added = btn not in self._pressed
+        if added:
+            self._pressed.append(btn)
+        try:
+            self.backend.mouse_down(btn)
+        except Exception:
+            if added:  # an ordinary error: the press was not made
+                self._pressed.remove(btn)
+            raise
         self._pause()
 
     def up(self, button: Union[str, MouseButton] = "left") -> None:
         """Release a mouse button. Never blocked by the fail-safe (releasing is always safe)."""
-        self.backend.mouse_up(MouseButton.coerce(button))
+        btn = MouseButton.coerce(button)
+        self.backend.mouse_up(btn)
+        if btn in self._pressed:
+            self._pressed.remove(btn)
         self._pause()
+
+    def _safe_up(self, btn: MouseButton) -> None:
+        """Release ``btn`` on an error path without masking the original exception."""
+        try:
+            self.backend.mouse_up(btn)
+        except Exception:
+            pass
+
+    @property
+    def pressed(self) -> list:
+        """Buttons currently held down by :meth:`down` on this instance (press order)."""
+        return list(self._pressed)
+
+    def release_all(self) -> list:
+        """Release every button held down by :meth:`down` (e.g. after an error mid-selection).
+
+        Keeps going on errors and raises the first one at the end; returns the released buttons.
+        """
+        released: list = []
+        first: Optional[BaseException] = None
+        for btn in reversed(list(self._pressed)):
+            try:
+                self.backend.mouse_up(btn)
+            except Exception as exc:
+                if first is None:
+                    first = exc
+                continue
+            self._pressed.remove(btn)
+            released.append(btn)
+        if first is not None:
+            raise first
+        return released
 
     def click(
         self,
@@ -187,12 +233,17 @@ class Mouse:
             if i and interval > 0:
                 self._sleep(interval)
             self._check(ignore=target)
-            self.backend.mouse_down(btn)
+            down = False
             try:
+                self.backend.mouse_down(btn)
+                down = True
                 if h is not None:
                     self._sleep(h.rng.uniform(0.03, 0.08) / h.speed)
-            finally:
-                self.backend.mouse_up(btn)
+            except BaseException as exc:
+                if down or not isinstance(exc, Exception):  # an interrupt may land after the press was sent
+                    self._safe_up(btn)
+                raise
+            self.backend.mouse_up(btn)
         self._pause()
         return target
 
@@ -241,15 +292,20 @@ class Mouse:
         else:
             self._check()
         target = self._point(end)
-        self.backend.mouse_down(btn)
+        down = False
         try:
+            self.backend.mouse_down(btn)
+            down = True
             if hold > 0:
                 self._sleep(hold)
             self._travel(target, duration, tween, h if h is not None else False)
             if hold > 0:
                 self._sleep(hold)
-        finally:
-            self.backend.mouse_up(btn)
+        except BaseException as exc:
+            if down or not isinstance(exc, Exception):  # an interrupt may land after the press was sent
+                self._safe_up(btn)
+            raise
+        self.backend.mouse_up(btn)
         self._pause()
         return target
 

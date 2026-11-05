@@ -46,9 +46,12 @@ raises :class:`~pypilot.errors.BackendUnavailable` when not running on Windows.
 from __future__ import annotations
 
 import ctypes
+import os
+import shutil
 import sys
 import threading
 import time
+import weakref
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..errors import BackendError, BackendUnavailable, NotSupported, WindowNotFound
@@ -178,6 +181,26 @@ class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", DWORD * 3)]
 
 
+class SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", DWORD),
+        ("fMask", DWORD),  # ULONG: 32-bit on Windows
+        ("hwnd", HWND),
+        ("lpVerb", LPCWSTR),
+        ("lpFile", LPCWSTR),
+        ("lpParameters", LPCWSTR),
+        ("lpDirectory", LPCWSTR),
+        ("nShow", INT),
+        ("hInstApp", HINSTANCE),
+        ("lpIDList", LPVOID),
+        ("lpClass", LPCWSTR),
+        ("hkeyClass", HANDLE),
+        ("dwHotKey", DWORD),
+        ("hIconOrMonitor", HANDLE),
+        ("hProcess", HANDLE),
+    ]
+
+
 # =========================================================================== constants
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
@@ -206,6 +229,7 @@ KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_SCANCODE = 0x0008
 
 MAPVK_VK_TO_VSC = 0
+MAPVK_VK_TO_CHAR = 2
 MAPVK_VK_TO_VSC_EX = 4
 
 #: Marker placed in ``dwExtraInfo`` of every event pypilot injects ("PYOL").
@@ -224,6 +248,8 @@ MDT_EFFECTIVE_DPI = 0
 LOGPIXELSX = 88
 
 GWL_EXSTYLE = -20
+GWL_STYLE = -16
+WS_POPUP = 0x80000000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 
@@ -243,8 +269,34 @@ DWMWA_CLOAKED = 14
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 CF_UNICODETEXT = 13
+#: Registered clipboard formats that keep text out of Windows Clipboard History
+#: (Win+V), cloud clipboard sync and clipboard monitors ("Clipboard Formats",
+#: Microsoft docs). Each is set alongside the text with a DWORD 0 payload.
+CLIPBOARD_EXCLUSION_FORMATS = (
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+)
+#: Clipboard formats whose data is a GDI/metafile handle or owner-drawn, not a global
+#: memory block: :meth:`WindowsBackend.save_clipboard` cannot copy them (CF_BITMAP is
+#: re-synthesized by Windows from the saved CF_DIB). 0x200-0x3FF: private/GDI objects.
+CLIPBOARD_HANDLE_FORMATS = frozenset({2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E})
+#: Formats larger than this are not kept by a clipboard snapshot.
+CLIPBOARD_SNAPSHOT_MAX = 64 * 1024 * 1024
 GMEM_MOVEABLE = 0x0002
 HWND_MESSAGE = -3
+
+
+class ClipboardSnapshot:
+    """Every copyable format of the clipboard, as ``[(format id, bytes)]`` (see :meth:`WindowsBackend.save_clipboard`)."""
+
+    __slots__ = ("items",)
+
+    def __init__(self, items: List[Tuple[int, bytes]]):
+        self.items = list(items)
+
+    def __repr__(self) -> str:
+        return f"<ClipboardSnapshot formats={[f for f, _ in self.items]}>"
 
 SRCCOPY = 0x00CC0020
 CAPTUREBLT = 0x40000000
@@ -460,6 +512,7 @@ UIA_CONTROL_TYPES: Dict[int, Tuple[str, str]] = {
     50040: ("AppBar", "toolbar"),
 }
 UIA_ButtonControlTypeId = 50000
+UIA_MenuControlTypeId = 50009
 UIA_WindowControlTypeId = 50032
 UIA_PaneControlTypeId = 50033
 
@@ -580,6 +633,8 @@ class _Win32:
 
         shcore = opt_dll("shcore")
         dwmapi = opt_dll("dwmapi")
+        shell32 = opt_dll("shell32")
+        ole32 = opt_dll("ole32")
         WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE")
         self.WNDENUMPROC = WINFUNCTYPE(BOOL, HWND, LPARAM)
         self.MONITORENUMPROC = WINFUNCTYPE(BOOL, HMONITOR, HDC, ctypes.POINTER(RECT), LPARAM)
@@ -593,6 +648,8 @@ class _Win32:
             (u, "GetSystemMetrics", INT, [INT]),
             (u, "MapVirtualKeyW", UINT, [UINT, UINT]),
             (u, "VkKeyScanExW", SHORT, [WCHAR, HKL]),
+            (u, "MapVirtualKeyExW", UINT, [UINT, UINT, HKL]),
+            (u, "GetKeyState", SHORT, [INT]),
             (u, "GetKeyboardLayout", HKL, [DWORD]),
             # user32 -- monitors
             (u, "EnumDisplayMonitors", BOOL, [HDC, P(RECT), self.MONITORENUMPROC, LPARAM]),
@@ -623,6 +680,8 @@ class _Win32:
             (u, "GetClipboardData", HANDLE, [UINT]),
             (u, "SetClipboardData", HANDLE, [UINT, HANDLE]),
             (u, "IsClipboardFormatAvailable", BOOL, [UINT]),
+            (u, "RegisterClipboardFormatW", UINT, [LPCWSTR]),
+            (u, "EnumClipboardFormats", UINT, [UINT]),
             (u, "CreateWindowExW", HWND,
              [DWORD, LPCWSTR, LPCWSTR, DWORD, INT, INT, INT, INT, HWND, HMENU, HINSTANCE, LPVOID]),
             (u, "DestroyWindow", BOOL, [HWND]),
@@ -659,6 +718,13 @@ class _Win32:
             (shcore, "GetDpiForMonitor", HRESULT, [HMONITOR, INT, P(UINT), P(UINT)]),
             (shcore, "SetProcessDpiAwareness", HRESULT, [INT]),
             (dwmapi, "DwmGetWindowAttribute", HRESULT, [HWND, DWORD, LPVOID, DWORD]),
+            # launching like Start > Run (App Paths, documents, URLs)
+            (shell32, "ShellExecuteExW", BOOL, [P(SHELLEXECUTEINFOW)]),
+            (kernel32, "GetProcessId", DWORD, [HANDLE]),
+            (kernel32, "WaitForSingleObject", DWORD, [HANDLE, DWORD]),
+            (kernel32, "GetExitCodeProcess", BOOL, [HANDLE, P(DWORD)]),
+            (ole32, "CoInitializeEx", HRESULT, [LPVOID, DWORD]),
+            (ole32, "CoUninitialize", None, []),
         ]
         for dll, name, res, args in optional:
             setattr(self, name, _proto(dll, name, res, args, required=False))
@@ -1128,6 +1194,11 @@ class UIANode(AccessibleNode):
                 st.add("expanded")
             elif es == ExpandCollapseState_Collapsed:
                 st.add("collapsed")
+        if self.control_type == UIA_ButtonControlTypeId:
+            # STATE_SYSTEM_DEFAULT: the dialog/form button that Enter in a text field presses.
+            lp = self._pattern(UIA_LegacyIAccessiblePatternId)
+            if lp is not None and _safe(lambda: int(lp.CurrentState) & 0x100, 0):
+                st.add("default")
         vp = self._pattern(UIA_ValuePatternId)
         if vp is not None:
             if _safe(lambda: vp.CurrentIsReadOnly, False):
@@ -1410,6 +1481,106 @@ def unicode_inputs(text: str) -> List[INPUT]:
     return out
 
 
+# ShellExecuteEx flags
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+SEE_MASK_NOASYNC = 0x00000100
+SEE_MASK_FLAG_NO_UI = 0x00000400
+SW_SHOWNORMAL = 1
+WAIT_OBJECT_0 = 0
+STILL_ACTIVE = 259
+_PROGRAM_EXTS = (".exe", ".com", ".bat", ".cmd")
+
+
+def shell_launch_target(command: str) -> Optional[Tuple[str, str]]:
+    """``(file, parameters)`` when ``command`` must be started with ``ShellExecuteEx``, else None.
+
+    ``CreateProcess`` (``subprocess.Popen``) only finds programs on ``PATH``, in
+    System32 and the current folder. Start > Run also uses the *App Paths*
+    registry (``excel``, ``winword``, ``outlook`` are registered there, not on
+    ``PATH``) and file associations (``Q3.xlsx``, ``https://...``). A command
+    whose program is an existing ``.exe``/``.bat`` path, or is found on
+    ``PATH``, keeps using ``Popen`` (exact process, exact arguments).
+    """
+    cmd = command.strip()
+    if not cmd:
+        return None
+    if os.path.isfile(cmd):  # an unquoted path, possibly with spaces
+        return None if cmd.lower().endswith(_PROGRAM_EXTS) else (cmd, "")
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        if end < 0:
+            return None
+        file, params = cmd[1:end], cmd[end + 1:].strip()
+    else:
+        parts = cmd.split(None, 1)
+        file, params = parts[0], (parts[1] if len(parts) > 1 else "")
+    if not file:
+        return None
+    if os.path.isfile(file):
+        return None if file.lower().endswith(_PROGRAM_EXTS) else (file, params)
+    if shutil.which(file) is not None:
+        return None
+    return file, params
+
+
+class ShellProcess:
+    """What :meth:`WindowsBackend.launch` returns for a ``ShellExecuteEx`` launch.
+
+    A small ``subprocess.Popen``-like object: ``args``, ``pid`` (None when the
+    request was handed to an already-running instance, e.g. a second workbook
+    opened in the running Excel), ``returncode``, ``poll()`` and ``wait()``.
+    """
+
+    def __init__(self, api: Any, args: str, handle: Any) -> None:
+        self._api = api
+        self.args = args
+        self._handle = handle or None
+        self.pid: Optional[int] = None
+        self.returncode: Optional[int] = None
+        if self._handle is not None:
+            try:
+                self.pid = int(api.GetProcessId(self._handle)) or None
+            except Exception:
+                self.pid = None
+        else:
+            self.returncode = 0  # no process of our own: the shell (or a running instance) handled it
+
+    def poll(self) -> Optional[int]:
+        return self.wait(0)
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[int]:
+        if self.returncode is not None or self._handle is None:
+            return self.returncode
+        ms = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
+        if int(self._api.WaitForSingleObject(self._handle, ms)) != WAIT_OBJECT_0:
+            if timeout:
+                import subprocess
+
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return None
+        code = DWORD(0)
+        if self._api.GetExitCodeProcess(self._handle, ctypes.byref(code)) and code.value != STILL_ACTIVE:
+            self.returncode = int(code.value)
+        else:
+            self.returncode = 0
+        self._close()
+        return self.returncode
+
+    def _close(self) -> None:
+        h, self._handle = self._handle, None
+        if h is not None:
+            try:
+                self._api.CloseHandle(h)
+            except Exception:
+                pass
+
+    def __del__(self) -> None:  # pragma: no cover - finalizer
+        self._close()
+
+    def __repr__(self) -> str:
+        return f"<ShellProcess {self.args!r} pid={self.pid} returncode={self.returncode}>"
+
+
 class _Held:
     """A key pressed through :meth:`WindowsBackend.key_down` (for symmetric release)."""
 
@@ -1418,6 +1589,22 @@ class _Held:
     def __init__(self, events: List[INPUT], release: List[INPUT]) -> None:
         self.events = events
         self.release = release
+
+
+class _MssHolder:
+    """Thread-local owner of one mss grabber; its finalizer closes the grabber."""
+
+    __slots__ = ("sct", "__weakref__")
+
+    def __init__(self, sct: Any) -> None:
+        self.sct = sct
+
+
+def _close_quietly(obj: Any) -> None:
+    try:
+        obj.close()
+    except Exception:
+        pass
 
 
 class WindowsBackend(Backend):
@@ -1433,6 +1620,9 @@ class WindowsBackend(Backend):
         uia_timeout_ms: UIA connection timeout for unresponsive apps (None = system default).
         clipboard_retries: attempts to open a clipboard held by another process.
         clipboard_retry_delay: seconds between those attempts.
+        clipboard_history: let text written by :meth:`set_clipboard` enter Windows
+            Clipboard History / cloud clipboard (default False: it is excluded, so
+            pasted passwords and bank data are not kept there).
         respect_swapped_buttons: when the user swapped mouse buttons, map
             ``"left"`` to the *primary* button (as users expect).
         sleep: sleep function used only for clipboard retries.
@@ -1453,6 +1643,7 @@ class WindowsBackend(Backend):
         uia_timeout_ms: Optional[int] = 5000,
         clipboard_retries: int = 20,
         clipboard_retry_delay: float = 0.01,
+        clipboard_history: bool = False,
         respect_swapped_buttons: bool = True,
         sleep: Callable[[float], None] = time.sleep,
         _api: Any = None,
@@ -1473,7 +1664,8 @@ class WindowsBackend(Backend):
         self._screenshot_method = screenshot_method
         self._mss_broken = screenshot_method == "gdi"
         self._mss_local = threading.local()
-        self._mss_all: List[Any] = []
+        self._mss_lock = threading.Lock()
+        self._mss_closers: List[Any] = []  # weakref.finalize objects closing per-thread mss grabbers
         self._accessibility = bool(accessibility)
         self._uia_view = uia_view
         self._uia_timeout = uia_timeout_ms
@@ -1481,6 +1673,9 @@ class WindowsBackend(Backend):
         self._uia_error: Optional[str] = None
         self._clip_retries = max(1, int(clipboard_retries))
         self._clip_delay = float(clipboard_retry_delay)
+        self._clip_history = bool(clipboard_history)
+        self._clip_exclusions: Optional[List[int]] = None
+        self._pid_names: Dict[int, str] = {}
         self._respect_swap = respect_swapped_buttons
         self._sleep = sleep
         self._lock = threading.RLock()
@@ -1508,12 +1703,10 @@ class WindowsBackend(Backend):
             self.release_all()
         except Exception:
             pass
-        for sct in self._mss_all:
-            try:
-                sct.close()
-            except Exception:
-                pass
-        self._mss_all.clear()
+        with self._mss_lock:
+            closers, self._mss_closers = self._mss_closers, []
+        for closer in closers:
+            closer()  # closes that thread's grabber now (no-op if its thread already ended)
         self._closed = True
 
     def __enter__(self) -> "WindowsBackend":
@@ -1602,12 +1795,15 @@ class WindowsBackend(Backend):
         self._check()
         logical = MouseButton.coerce(button)
         with self._lock:
-            ev = self._buttons_down.pop(logical, None)
+            ev = self._buttons_down.get(logical)
             if ev is None:
                 phys = self._physical_button(logical)
                 _down, up, data = _BUTTON_FLAGS[phys]
                 ev = mouse_input(0, 0, data, up)
             self._send([ev])
+            # Forgotten only once released: if Windows rejected the release (secure
+            # desktop, locked workstation) release_all()/close() can retry it.
+            self._buttons_down.pop(logical, None)
 
     def scroll(self, dx: int = 0, dy: int = 0) -> None:
         """Wheel notches: ``dy > 0`` scrolls up, ``dx > 0`` scrolls right (one event per notch)."""
@@ -1655,12 +1851,17 @@ class WindowsBackend(Backend):
     def _char_plan(self, ch: str) -> Tuple[List[INPUT], List[INPUT]]:
         """(press events, release events) for a single character."""
         if len(ch) == 1 and ord(ch) < 0x10000:
+            hkl = self._layout()
             try:
-                scanned = decode_vk_scan(self._api.VkKeyScanExW(ch, self._layout()))
+                scanned = decode_vk_scan(self._api.VkKeyScanExW(ch, hkl))
             except Exception:
                 scanned = None
+            if scanned is not None and self._is_dead_key(scanned[0], hkl):
+                scanned = None  # the key would start a composition instead of typing ``ch``
             if scanned is not None:
                 vk, state = scanned
+                if state in (0, 1) and self._caps_flips(ch):
+                    state ^= 1  # CapsLock is on: Shift now gives the other case
                 press: List[INPUT] = []
                 release: List[INPUT] = []
                 for bit, mod in _SHIFT_STATE_MODIFIERS:
@@ -1676,6 +1877,32 @@ class WindowsBackend(Backend):
         press = [key_input(0, unit, KEYEVENTF_UNICODE) for unit in units]
         release = [key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP) for unit in units]
         return press, release
+
+    def _is_dead_key(self, vk: int, hkl: Any) -> bool:
+        """Whether ``vk`` is a dead (diacritic) key on layout ``hkl`` (circumflex and
+        grave on German/French, quote/tilde on US-International). Such characters are
+        typed as Unicode packets instead (unless Ctrl/Alt/Win is held, where the
+        key itself is wanted for a shortcut)."""
+        if any(self._modifier_held(m) for m in ("ctrl", "alt", "cmd")):
+            return False
+        try:
+            # MAPVK_VK_TO_CHAR sets the top bit for dead keys.
+            return bool(int(self._api.MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, hkl)) & 0x80000000)
+        except Exception:
+            return False
+
+    def _caps_flips(self, ch: str) -> bool:
+        """Whether CapsLock is on and would change the case of letter ``ch`` typed as text
+        (not while Ctrl/Alt/Win is held: shortcuts keep the key's own Shift state)."""
+        lo, up = ch.lower(), ch.upper()
+        if lo == up or len(lo) != 1 or len(up) != 1:
+            return False
+        if any(self._modifier_held(m) for m in ("ctrl", "alt", "cmd")):
+            return False
+        try:
+            return bool(self._api.GetKeyState(0x14) & 1)  # VK_CAPITAL toggled
+        except Exception:
+            return False
 
     def _modifier_held(self, mod: str) -> bool:
         return mod in self._held or f"{mod}_r" in self._held
@@ -1704,20 +1931,35 @@ class WindowsBackend(Backend):
         self._check()
         with self._lock:
             name, _press, release = self._plan(key)
-            held = self._held.pop(name, None)
+            held = self._held.get(name)
             self._send(held.release if held is not None else release)
+            self._held.pop(name, None)  # only once released (see mouse_up)
 
     def release_all(self) -> None:
         """Release every key and mouse button pressed through this backend (reverse order)."""
         with self._lock:
-            events: List[INPUT] = []
-            for name in reversed(list(self._held)):
-                events += self._held[name].release
-            events += list(self._buttons_down.values())
-            self._held.clear()
-            self._buttons_down.clear()
-            if events and not self._closed:
-                self._send(events)
+            if self._closed:
+                self._held.clear()
+                self._buttons_down.clear()
+                return
+            # Each key/button is released and forgotten separately: one whose release
+            # Windows rejects (secure desktop, locked workstation) stays recorded so
+            # a later call can retry it; the first error is raised at the end.
+            first: Optional[BaseException] = None
+            pending: List[Tuple[Dict[Any, Any], Any, List[INPUT]]] = [
+                (self._held, name, self._held[name].release) for name in reversed(list(self._held))
+            ]
+            pending += [(self._buttons_down, b, [ev]) for b, ev in list(self._buttons_down.items())]
+            for table, k, events in pending:
+                try:
+                    self._send(events)
+                except BackendError as exc:
+                    if first is None:
+                        first = exc
+                    continue
+                table.pop(k, None)
+            if first is not None:
+                raise first
 
     def type_text(self, text: str) -> None:
         """Type ``text`` layout-independently (``KEYEVENTF_UNICODE``); newlines/tabs as Enter/Tab keys."""
@@ -1796,15 +2038,24 @@ class WindowsBackend(Backend):
         return [Monitor(i, r, s, prim, name) for i, (r, prim, name, s) in enumerate(found)]
 
     def _mss(self) -> Any:
-        sct = getattr(self._mss_local, "sct", None)
-        if sct is None:
+        """This thread's mss grabber (it holds GDI device contexts and a bitmap).
+
+        It lives in a thread-local slot whose finalizer closes it as soon as the
+        thread exits, so thread-per-job services never pile up GDI handles (capped
+        per process); :meth:`close` closes the ones of threads still running.
+        """
+        holder = getattr(self._mss_local, "holder", None)
+        if holder is None:
             import mss
 
             factory = getattr(mss, "MSS", None) or mss.mss
             sct = factory()
-            self._mss_local.sct = sct
-            self._mss_all.append(sct)
-        return sct
+            holder = _MssHolder(sct)
+            with self._mss_lock:
+                self._mss_closers = [c for c in self._mss_closers if c.alive]
+                self._mss_closers.append(weakref.finalize(holder, _close_quietly, sct))
+            self._mss_local.holder = holder
+        return holder.sct
 
     def _grab_mss(self, r: Rect) -> Any:
         from PIL import Image
@@ -1994,9 +2245,8 @@ class WindowsBackend(Backend):
             class_name=self._class(hwnd),
         )
 
-    def list_windows(self) -> List[WindowInfo]:
-        """Visible, titled, non-tool, non-cloaked top-level windows, front-most first."""
-        self._check()
+    def _toplevel_hwnds(self) -> List[int]:
+        """Every top-level window, front-most first (``EnumWindows`` order)."""
         a = self._api
         hwnds: List[int] = []
 
@@ -2008,8 +2258,10 @@ class WindowsBackend(Backend):
         proc = a.WNDENUMPROC(cb)
         if not a.EnumWindows(proc, 0):
             raise self._error("EnumWindows")
-        fg = a.GetForegroundWindow()
-        names: Dict[int, str] = {}
+        return hwnds
+
+    def _windows_from(self, hwnds: Sequence[int], names: Dict[int, str]) -> List[WindowInfo]:
+        fg = self._api.GetForegroundWindow()
         out: List[WindowInfo] = []
         for hwnd in hwnds:
             try:
@@ -2018,6 +2270,11 @@ class WindowsBackend(Backend):
             except BackendError:
                 continue  # window vanished while enumerating
         return out
+
+    def list_windows(self) -> List[WindowInfo]:
+        """Visible, titled, non-tool, non-cloaked top-level windows, front-most first."""
+        self._check()
+        return self._windows_from(self._toplevel_hwnds(), {})
 
     def active_window(self) -> Optional[WindowInfo]:
         self._check()
@@ -2104,8 +2361,7 @@ class WindowsBackend(Backend):
         r = Rect.coerce(rect)
         if r.width <= 0 or r.height <= 0:
             raise ValueError(f"Window size must be positive, got {r}")
-        if a.IsIconic(hwnd) or a.IsZoomed(hwnd):
-            a.ShowWindow(hwnd, SW_RESTORE)
+        self._restore_normal(hwnd)
         outer = self._outer_rect(hwnd)
         frame = self._frame_rect(hwnd)
         dl = max(0, frame.left - outer.left)
@@ -2136,7 +2392,23 @@ class WindowsBackend(Backend):
         if key not in self._SHOW_STATES:
             raise ValueError(f"Unknown window state {state!r}; use minimized, maximized or normal")
         hwnd = self._hwnd(handle)
-        self._api.ShowWindow(hwnd, self._SHOW_STATES[key])  # returns previous visibility, not success
+        cmd = self._SHOW_STATES[key]
+        if cmd == SW_RESTORE:
+            self._restore_normal(hwnd, always=True)  # SW_RESTORE also shows a hidden window
+        else:
+            self._api.ShowWindow(hwnd, cmd)  # returns previous visibility, not success
+
+    def _restore_normal(self, hwnd: int, always: bool = False) -> None:
+        """Bring ``hwnd`` to the normal (neither minimized nor maximized) state.
+
+        A window minimized while maximized (WPF_RESTORETOMAXIMIZED) comes back
+        *maximized* from the first SW_RESTORE; a second one un-maximizes it.
+        """
+        a = self._api
+        for i in range(2):
+            if not (a.IsIconic(hwnd) or a.IsZoomed(hwnd)) and not (always and i == 0):
+                return
+            a.ShowWindow(hwnd, SW_RESTORE)
 
     def close_window(self, handle: Any) -> None:
         """Ask the window to close (``WM_CLOSE``; the application may prompt to save)."""
@@ -2144,6 +2416,50 @@ class WindowsBackend(Backend):
         hwnd = self._hwnd(handle)
         if not self._api.PostMessageW(hwnd, WM_CLOSE, 0, 0):
             raise self._error("PostMessageW(WM_CLOSE)")
+
+    def launch(self, command: Any, **kwargs: Any) -> Any:
+        """Start an application, a document or a URL the way Start > Run does.
+
+        A command string whose program is a bare name not on ``PATH`` (``excel``,
+        ``winword`` -- found through the *App Paths* registry), a document
+        (``C:\\Reports\\Q3.xlsx``) or a URL is opened with ``ShellExecuteExW``
+        and returns a :class:`ShellProcess`. Explicit program paths, commands
+        found on ``PATH``, argument lists and ``subprocess.Popen`` keyword options
+        (other than ``cwd``) use ``subprocess.Popen``.
+        """
+        target = shell_launch_target(command) if isinstance(command, str) and set(kwargs) <= {"cwd"} else None
+        shell = getattr(self._api, "ShellExecuteExW", None)
+        if target is None or shell is None:
+            return super().launch(command, **kwargs)
+        file, params = target
+        info = SHELLEXECUTEINFOW()
+        info.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI
+        info.lpVerb = None  # the default verb ("open" for documents)
+        info.lpFile = file
+        info.lpParameters = params or None
+        cwd = kwargs.get("cwd")
+        info.lpDirectory = os.fspath(cwd) if cwd is not None else None
+        info.nShow = SW_SHOWNORMAL
+        co_init = getattr(self._api, "CoInitializeEx", None)
+        hr = None
+        if co_init is not None:  # shell extensions may need COM (STA, no OLE1 DDE)
+            try:
+                hr = int(co_init(None, 0x2 | 0x4))
+            except Exception:
+                hr = None
+        try:
+            ok = shell(ctypes.byref(info))
+            err = self._api.get_last_error() if not ok else 0
+        finally:
+            if hr is not None and hr >= 0 and getattr(self._api, "CoUninitialize", None) is not None:
+                self._api.CoUninitialize()
+        if not ok:
+            msg = f"Cannot launch {command!r}: {self._api.format_error(err)}"
+            if err in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND, like Popen
+                raise FileNotFoundError(2, msg, file)
+            raise OSError(err, msg)
+        return ShellProcess(self._api, command, info.hProcess)
 
     # ================================================================ clipboard
     def _open_clipboard(self, owner: Any = None) -> None:
@@ -2181,24 +2497,130 @@ class WindowsBackend(Backend):
         nul = text.find("\x00")
         return text if nul < 0 else text[:nul]
 
+    def save_clipboard(self) -> Any:
+        """Snapshot every format on the clipboard (text, an image, a file list, an Excel range...).
+
+        Clipboard-mode typing restores the user's clipboard from this with
+        :meth:`restore_clipboard`; saving only its text would replace a copied
+        image or Excel range with plain or empty text. Formats that are not
+        global memory blocks (:data:`CLIPBOARD_HANDLE_FORMATS`) or larger than
+        :data:`CLIPBOARD_SNAPSHOT_MAX` are skipped.
+        """
+        enum = getattr(self._api, "EnumClipboardFormats", None)
+        if enum is None:
+            return self.get_clipboard()
+        self._check()
+        a = self._api
+        items: List[Tuple[int, bytes]] = []
+        with self._lock:
+            self._open_clipboard(None)
+            try:
+                fmt = 0
+                while True:
+                    fmt = int(enum(fmt) or 0)
+                    if not fmt:
+                        break
+                    if fmt in CLIPBOARD_HANDLE_FORMATS or 0x200 <= fmt <= 0x3FF:
+                        continue
+                    h = a.GetClipboardData(fmt)
+                    if not h:
+                        continue
+                    size = int(a.GlobalSize(h) or 0)
+                    if size > CLIPBOARD_SNAPSHOT_MAX:
+                        continue
+                    ptr = a.GlobalLock(h)
+                    if not ptr:
+                        continue
+                    try:
+                        items.append((fmt, ctypes.string_at(ptr, size) if size > 0 else b""))
+                    finally:
+                        a.GlobalUnlock(h)
+            finally:
+                a.CloseClipboard()
+        return ClipboardSnapshot(items)
+
+    def restore_clipboard(self, saved: Any) -> None:
+        """Put back a :meth:`save_clipboard` snapshot (an empty one empties the clipboard)."""
+        if not isinstance(saved, ClipboardSnapshot):
+            self.set_clipboard(saved if saved is not None else "")
+            return
+        self._check()
+        a = self._api
+        with self._lock:
+            owner = a.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
+            try:
+                self._open_clipboard(owner)
+                try:
+                    if not a.EmptyClipboard():
+                        raise self._error("EmptyClipboard")
+                    for fmt, data in saved.items:
+                        try:
+                            hmem = self._global_bytes(data or b"\x00")
+                        except BackendError:
+                            continue
+                        try:
+                            ok = a.SetClipboardData(fmt, hmem)
+                        except Exception:
+                            ok = None
+                        if not ok:
+                            a.GlobalFree(hmem)
+                finally:
+                    a.CloseClipboard()
+            finally:
+                if owner:
+                    a.DestroyWindow(owner)
+
+    def _global_bytes(self, data: bytes) -> Any:
+        """A GMEM_MOVEABLE global memory block holding ``data`` (caller frees it unless the clipboard owns it)."""
+        a = self._api
+        hmem = a.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not hmem:
+            raise self._error("GlobalAlloc")
+        try:
+            ptr = a.GlobalLock(hmem)
+            if not ptr:
+                raise self._error("GlobalLock")
+            try:
+                ctypes.memmove(ptr, data, len(data))
+            finally:
+                a.GlobalUnlock(hmem)
+        except BaseException:
+            a.GlobalFree(hmem)
+            raise
+        return hmem
+
+    def _clipboard_exclusion_formats(self) -> List[int]:
+        """Registered ids of :data:`CLIPBOARD_EXCLUSION_FORMATS` (empty when unavailable)."""
+        if self._clip_exclusions is None:
+            ids: List[int] = []
+            register = getattr(self._api, "RegisterClipboardFormatW", None)
+            if register is not None:
+                for fmt in CLIPBOARD_EXCLUSION_FORMATS:
+                    try:
+                        fid = int(register(fmt) or 0)
+                    except Exception:
+                        fid = 0
+                    if fid:
+                        ids.append(fid)
+            self._clip_exclusions = ids
+        return self._clip_exclusions
+
     def set_clipboard(self, text: str) -> None:
-        """Replace the clipboard with ``text`` (``CF_UNICODETEXT``)."""
+        """Replace the clipboard with ``text`` (``CF_UNICODETEXT``).
+
+        Unless the backend was created with ``clipboard_history=True``, the text
+        is marked as excluded from Windows Clipboard History (Win+V), cloud
+        clipboard sync and clipboard monitors, so passwords or bank data typed
+        through clipboard paste do not linger there.
+        """
         self._check()
         a = self._api
         data = (str(text) + "\x00").encode("utf-16-le", "surrogatepass")
         with self._lock:
-            hmem = a.GlobalAlloc(GMEM_MOVEABLE, len(data))
-            if not hmem:
-                raise self._error("GlobalAlloc")
+            exclusions = [] if self._clip_history else self._clipboard_exclusion_formats()
+            hmem = self._global_bytes(data)
             owned_by_system = False
             try:
-                ptr = a.GlobalLock(hmem)
-                if not ptr:
-                    raise self._error("GlobalLock")
-                try:
-                    ctypes.memmove(ptr, data, len(data))
-                finally:
-                    a.GlobalUnlock(hmem)
                 # A (message-only) owner window: EmptyClipboard with a NULL owner can
                 # make SetClipboardData fail on some systems.
                 owner = a.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
@@ -2210,6 +2632,8 @@ class WindowsBackend(Backend):
                         if not a.SetClipboardData(CF_UNICODETEXT, hmem):
                             raise self._error("SetClipboardData")
                         owned_by_system = True
+                        for fmt in exclusions:
+                            self._set_dword_format(fmt, 0)
                     finally:
                         a.CloseClipboard()
                 finally:
@@ -2218,6 +2642,19 @@ class WindowsBackend(Backend):
             finally:
                 if not owned_by_system:
                     a.GlobalFree(hmem)
+
+    def _set_dword_format(self, fmt: int, value: int) -> None:
+        """Best effort: put a DWORD under clipboard format ``fmt`` (clipboard already open)."""
+        try:
+            h = self._global_bytes(int(value).to_bytes(4, "little"))
+        except BackendError:
+            return
+        try:
+            ok = self._api.SetClipboardData(fmt, h)
+        except Exception:
+            ok = None
+        if not ok:
+            self._api.GlobalFree(h)
 
     # ============================================================ accessibility
     def _uia_available(self) -> bool:
@@ -2253,8 +2690,14 @@ class WindowsBackend(Backend):
         return ctx
 
     def _app_for_pid(self, pid: int) -> str:
-        """Cached :meth:`_process_name` (nodes ask once per element; pids rarely change)."""
-        cache = self.__dict__.setdefault("_pid_names", {})
+        """:meth:`_process_name`, cached per tree snapshot.
+
+        Nodes ask once per element, so names are cached -- but only until the
+        next :meth:`accessibility_roots` / :meth:`element_at` /
+        :meth:`focused_element` call: Windows recycles PIDs quickly, and a
+        lifetime cache would report an exited process's name for a new one.
+        """
+        cache = self._pid_names
         name = cache.get(pid)
         if name is None:
             name = self._process_name(int(pid))
@@ -2263,21 +2706,58 @@ class WindowsBackend(Backend):
             cache[pid] = name
         return name
 
+    def _popup_candidate(self, hwnd: int) -> Optional[bool]:
+        """For a top-level window :meth:`list_windows` skips: True for a visible Win32
+        pop-up menu (``#32768``), None for another visible ``WS_POPUP`` window (a menu
+        only if its UIA element says so, as WinForms/WPF/Office context menus do),
+        False otherwise."""
+        a = self._api
+        if not a.IsWindowVisible(hwnd):
+            return False
+        if self._class(hwnd) == "#32768":
+            menu: Optional[bool] = True
+        elif int(a.GetWindowLongPtrW(hwnd, GWL_STYLE)) & WS_POPUP:
+            menu = None
+        else:
+            return False
+        return False if self._is_cloaked(hwnd) else menu
+
     def accessibility_roots(self) -> List[AccessibleNode]:
-        """One UIA root per window from :meth:`list_windows` (same Z-order, ``handle`` = HWND)."""
+        """One UIA root per window from :meth:`list_windows`, plus open pop-up menus
+        (context menus, menu-bar drop-downs), in Z-order; ``handle`` = HWND.
+
+        UIA parents pop-up menus to the desktop rather than to the window that
+        opened them, so without these roots an open menu's items could not be found.
+        """
         self._check()
         ctx = self.uia
+        names: Dict[int, str] = {}
+        self._pid_names = names  # fresh per snapshot: PIDs are recycled
+        hwnds = self._toplevel_hwnds()
+        listed = {int(w.handle) for w in self._windows_from(hwnds, names)}
         roots: List[AccessibleNode] = []
-        for w in self.list_windows():
-            el = ctx.element_from_handle(int(w.handle))
+        for hwnd in hwnds:
+            if hwnd in listed:
+                el = ctx.element_from_handle(hwnd)
+            else:
+                try:
+                    menu = self._popup_candidate(hwnd)
+                except Exception:
+                    continue  # window vanished while enumerating
+                if menu is False:
+                    continue
+                el = ctx.element_from_handle(hwnd)
+                if menu is None and _safe(lambda: int(el.CurrentControlType), 0) != UIA_MenuControlTypeId:
+                    continue
             if el is not None:
-                roots.append(UIANode(el, ctx, None, handle=int(w.handle), top_level=True))
+                roots.append(UIANode(el, ctx, None, handle=hwnd, top_level=True))
         return roots
 
     def element_at(self, x: int, y: int) -> Optional[AccessibleNode]:
         """Deepest UIA element at screen point ``(x, y)`` (``IUIAutomation::ElementFromPoint``)."""
         self._check()
         ctx = self.uia
+        self._pid_names = {}
         el = ctx.element_from_point(x, y)
         return UIANode(el, ctx) if el is not None else None
 
@@ -2285,6 +2765,7 @@ class WindowsBackend(Backend):
         """The element with keyboard focus (``IUIAutomation::GetFocusedElement``)."""
         self._check()
         ctx = self.uia
+        self._pid_names = {}
         el = ctx.focused()
         return UIANode(el, ctx) if el is not None else None
 

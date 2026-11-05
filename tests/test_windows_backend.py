@@ -275,7 +275,7 @@ def _deref(arg: Any) -> Any:
 
 class FakeWin:
     def __init__(self, hwnd, title, frame, *, pid=100, cls="Notepad", visible=True, exstyle=0, cloaked=0,
-                 iconic=False, zoomed=False, border=(7, 0, 7, 7), exe="C:\\Windows\\notepad.exe"):
+                 iconic=False, zoomed=False, border=(7, 0, 7, 7), exe="C:\\Windows\\notepad.exe", style=0):
         self.hwnd = hwnd
         self.title = title
         self.frame = frame
@@ -284,6 +284,8 @@ class FakeWin:
         self.cls = cls
         self.visible = visible
         self.exstyle = exstyle
+        self.style = style
+        self.restore_max = False  # WPF_RESTORETOMAXIMIZED: minimized while maximized
         self.cloaked = cloaked
         self.iconic = iconic
         self.zoomed = zoomed
@@ -321,6 +323,10 @@ class FakeApi:
         self.clip_busy = 0
         self.clip_open = False
         self.clip_data: Optional[bytes] = None
+        self.clip_extra: Dict[int, bytes] = {}
+        self.registered: Dict[str, int] = {}
+        self.caps_lock = False
+        self.dead_vks: set = set()
         self.mem: Dict[int, Any] = {}
         self.freed: List[int] = []
         self.monitors = [
@@ -400,6 +406,13 @@ class FakeApi:
     def GetKeyboardLayout(self, tid):
         return 0x04090409
 
+    def MapVirtualKeyExW(self, vk, mode, hkl):
+        assert mode == winmod.MAPVK_VK_TO_CHAR and hkl == 0x04090409
+        return (0x80000000 | 0x5E) if vk in self.dead_vks else vk
+
+    def GetKeyState(self, vk):
+        return int(vk == 0x14 and self.caps_lock)
+
     # --------------------------------------------------------------- monitors
     def EnumDisplayMonitors(self, hdc, clip, proc, lparam):
         for h, *_ in self.monitors:
@@ -463,8 +476,9 @@ class FakeApi:
         return int(self.wins[hwnd].zoomed)
 
     def GetWindowLongPtrW(self, hwnd, idx):
-        assert idx == winmod.GWL_EXSTYLE
-        return self.wins[hwnd].exstyle
+        assert idx in (winmod.GWL_EXSTYLE, -16)  # GWL_STYLE
+        w = self.wins[hwnd]
+        return w.exstyle if idx == winmod.GWL_EXSTYLE else w.style
 
     def GetWindowTextLengthW(self, hwnd):
         return len(self.wins[hwnd].title)
@@ -553,11 +567,15 @@ class FakeApi:
         self.calls.append(("ShowWindow", hwnd, cmd))
         w = self.wins[hwnd]
         if cmd == winmod.SW_RESTORE:
-            w.iconic = w.zoomed = False
+            if w.iconic:  # back to the pre-minimize state (maximized if it was)
+                w.iconic, w.zoomed = False, w.restore_max
+            else:
+                w.zoomed = False
         elif cmd == winmod.SW_MINIMIZE:
-            w.iconic = True
+            w.restore_max = w.zoomed or (w.iconic and w.restore_max)
+            w.iconic, w.zoomed = True, False
         elif cmd == winmod.SW_MAXIMIZE:
-            w.zoomed = True
+            w.iconic, w.zoomed = False, True
         return 1
 
     def MoveWindow(self, hwnd, x, y, w, h, repaint):
@@ -596,6 +614,7 @@ class FakeApi:
     def EmptyClipboard(self):
         assert self.clip_open
         self.clip_data = None
+        self.clip_extra.clear()
         return 1
 
     def IsClipboardFormatAvailable(self, fmt):
@@ -606,9 +625,17 @@ class FakeApi:
         return self._alloc(self.clip_data) if self.clip_data is not None else None
 
     def SetClipboardData(self, fmt, h):
-        assert self.clip_open and fmt == winmod.CF_UNICODETEXT
-        self.clip_data = ctypes.string_at(h, len(self.mem[h]))
+        assert self.clip_open
+        data = ctypes.string_at(h, len(self.mem[h]))
+        if fmt == winmod.CF_UNICODETEXT:
+            self.clip_data = data
+        else:
+            assert fmt in self.registered.values()
+            self.clip_extra[fmt] = data
         return h
+
+    def RegisterClipboardFormatW(self, name):
+        return self.registered.setdefault(name, 0xC000 + len(self.registered))
 
     def GlobalAlloc(self, flags, size):
         assert flags == winmod.GMEM_MOVEABLE
@@ -1468,3 +1495,209 @@ def test_uia_nodes_expose_app_for_selectors(be, api):
     opened = [c for c in api.calls if c[0] == "CloseHandle"]
     roots[0].attributes(), roots[0].attributes()
     assert [c for c in api.calls if c[0] == "CloseHandle"] == opened
+
+
+def test_char_keys_honour_capslock(be, api):
+    """With CapsLock on, Shift gives the other case: key_down("A") must not add Shift
+    and key_down("a") must, so press()/keys-mode typing is not case-inverted."""
+    api.GetKeyState = lambda vk: 1 if vk == 0x14 else 0  # VK_CAPITAL toggled
+    be.key_down("A")
+    be.key_up("A")
+    assert [(k[1], bool(k[3] & KEYEVENTF_KEYUP)) for k in keys_of(api)] == [(0x41, False), (0x41, True)]
+    api.inputs.clear()
+    be.key_down("a")
+    be.key_up("a")
+    assert [(k[1], bool(k[3] & KEYEVENTF_KEYUP)) for k in keys_of(api)] == [
+        (0xA0, False), (0x41, False), (0x41, True), (0xA0, True),
+    ]
+    api.inputs.clear()
+    # shortcuts keep the key's own shift state (ctrl+a, not ctrl+shift+a)
+    be.key_down("ctrl")
+    be.key_down("a")
+    be.key_up("a")
+    be.key_up("ctrl")
+    assert [(k[1], bool(k[3] & KEYEVENTF_KEYUP)) for k in keys_of(api)] == [
+        (0xA2, False), (0x41, False), (0x41, True), (0xA2, True),
+    ]
+    api.inputs.clear()
+    be.key_down("!")  # not a letter: CapsLock does not apply
+    be.key_up("!")
+    assert [k[1] for k in keys_of(api)] == [0xA0, 0x31, 0x31, 0xA0]
+
+
+def test_keyboard_layout_chars_reach_backend_unchanged(be, api):
+    """Keyboard.press/type(mode="keys") must not rewrite "@" into US "shift+2": on a
+    German layout "@" is AltGr+Q and Shift+2 types '"' (regression)."""
+    from pypilot.keyboard import Keyboard
+
+    api.layout_table = {"@": 0x651, '"': 0x132, "2": 0x32, "q": 0x51, "Q": 0x151, "#": 0xBF}
+    altgr_q = [(0xA2, False), (0xA4, False), (0x51, False), (0x51, True), (0xA4, True), (0xA2, True)]
+    kb = Keyboard(be, sleep=lambda s: None)
+    for action in (lambda: kb.press("@"), lambda: kb.type("@", mode="keys")):
+        api.inputs.clear()
+        action()
+        assert [(k[1], bool(k[3] & KEYEVENTF_KEYUP)) for k in keys_of(api)] == altgr_q
+    api.inputs.clear()
+    kb.type("#", mode="keys")  # unshifted VK_OEM_2 on de-DE, not US Shift+3
+    assert [(k[1], bool(k[3] & KEYEVENTF_KEYUP)) for k in keys_of(api)] == [(0xBF, False), (0xBF, True)]
+    assert not kb.pressed and not be._held
+
+
+def test_dead_key_characters_fall_back_to_unicode(be, api):
+    """'^' is a dead key on German/French layouts: pressing its VK would start a
+    composition instead of typing it, so it is sent as a Unicode packet."""
+    api.layout_table["^"] = 0xDC  # VK_OEM_5, dead on de-DE
+    api.dead_vks = {0xDC}
+    be.key_down("^")
+    be.key_up("^")
+    assert keys_of(api) == [("key", 0, ord("^"), KEYEVENTF_UNICODE),
+                            ("key", 0, ord("^"), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]
+    api.inputs.clear()
+    be.key_down("a")  # live keys are unaffected
+    be.key_up("a")
+    assert [k[1] for k in keys_of(api)] == [0x41, 0x41]
+    api.inputs.clear()
+    # in a shortcut the key itself is wanted (ctrl+^), not a Unicode packet
+    be.key_down("ctrl")
+    be.key_down("^")
+    be.key_up("^")
+    be.key_up("ctrl")
+    assert [k[1] for k in keys_of(api)] == [0xA2, 0xDC, 0xDC, 0xA2]
+
+
+def test_popup_menus_are_accessibility_roots(be, api):
+    """Context menus / menu-bar drop-downs are untitled tool windows that UIA parents
+    to the desktop: they must still be searchable roots (front-most first)."""
+    from pypilot.desktop import Desktop
+
+    excel = api.add(FakeWin(0x100, "Book1 - Excel", Rect(0, 0, 1200, 800), pid=50, exe="C:\\Office\\EXCEL.EXE",
+                            cls="XLMAIN"))
+    popup_style = winmod.WS_POPUP
+    tool = winmod.WS_EX_TOOLWINDOW | 0x101
+    api.add(FakeWin(0x300, "", Rect(300, 300, 200, 250), pid=50, cls="#32768", exstyle=tool, style=popup_style,
+                    exe=excel.exe), front=True)
+    api.add(FakeWin(0x310, "", Rect(0, 0, 10, 10), pid=50, cls="#32768", exstyle=tool, visible=False))  # closed
+    api.add(FakeWin(0x320, "", Rect(0, 0, 90, 20), pid=50, cls="tooltips_class32", exstyle=tool,
+                    style=popup_style), front=True)
+    api.add(FakeWin(0x330, "", Rect(500, 100, 150, 90), pid=60, cls="WindowsForms10.Window.808.app.0",
+                    exstyle=tool, style=popup_style, exe="C:\\Apps\\erp.exe"))
+    api.fg = 0x100
+    copy = FakeElement(50011, "Copy", rect=(310, 310, 490, 330), pid=50)
+    post = FakeElement(50011, "Post", rect=(510, 110, 640, 130), pid=60)
+    elements = {
+        0x100: FakeElement(50032, "Book1 - Excel", rid=(1,), pid=50, hwnd=0x100),
+        0x300: FakeElement(50009, "Context", rect=(300, 300, 500, 550), pid=50, hwnd=0x300, children=[copy]),
+        0x310: FakeElement(50009, "Hidden", pid=50, hwnd=0x310),
+        0x320: FakeElement(50022, "Tip", pid=50, hwnd=0x320),
+        0x330: FakeElement(50009, "Grid menu", pid=60, hwnd=0x330, children=[post]),
+    }
+
+    class Ctx(FakeCtx):
+        def element_from_handle(self, hwnd):
+            return elements.get(hwnd)
+
+    be._uia_ctx = Ctx()
+    roots = be.accessibility_roots()
+    assert [(r.name, r.handle) for r in roots] == [("Context", 0x300), ("Book1 - Excel", 0x100),
+                                                   ("Grid menu", 0x330)]
+    assert [w.handle for w in be.list_windows()] == [0x100]  # window listing is unchanged
+    d = Desktop(backend=be)
+    assert d.find('menuitem[name="Copy"]', timeout=0).name == "Copy"
+    assert d.find("menuitem[name=Post]", timeout=0).name == "Post"
+
+
+def test_app_names_follow_pid_reuse(be, api):
+    """Windows recycles PIDs: [app=...] must name the process that owns the PID now,
+    as list_windows() does, not a cached exited one (regression)."""
+    from pypilot.selectors import parse
+
+    def setup(title, exe):
+        api.wins.clear()
+        api.z.clear()
+        api.add(FakeWin(0x100, title, Rect(0, 0, 800, 600), pid=4321, exe=exe))
+        elements = {0x100: FakeElement(50032, title, rid=(0x100,), pid=4321)}
+
+        class Ctx(FakeCtx):
+            def element_from_handle(self, hwnd):
+                return elements.get(hwnd)
+
+        be._uia_ctx = Ctx()
+
+    setup("Payments - SAP", "C:\\SAP\\saplogon.exe")
+    assert [r.name for r in parse("window[app=saplogon.exe]").find_all(be.accessibility_roots())] == ["Payments - SAP"]
+    setup("Untitled - Notepad", "C:\\Windows\\notepad.exe")  # SAP exited; its PID was reused
+    roots = be.accessibility_roots()
+    assert parse("window[app=saplogon.exe]").find_all(roots) == []
+    assert [r.name for r in parse("window[app=notepad.exe]").find_all(roots)] == ["Untitled - Notepad"]
+
+
+def test_set_clipboard_is_excluded_from_clipboard_history(be, api):
+    """Pasted passwords / bank data must not be kept in Win+V history or synced to
+    the cloud clipboard: the documented exclusion formats are set with the text."""
+    be.set_clipboard("P@ssw0rd!")
+    assert be.get_clipboard() == "P@ssw0rd!"
+    names = winmod.CLIPBOARD_EXCLUSION_FORMATS
+    assert set(api.registered) == set(names)
+    assert api.clip_extra == {api.registered[n]: b"\x00\x00\x00\x00" for n in names}
+    assert api.freed == []
+    be.set_clipboard("again")  # format ids are registered once
+    assert len(api.registered) == 3 and len(api.clip_extra) == 3
+    # opt-out keeps the classic behaviour
+    keep = WindowsBackend(_api=api, dpi_aware=False, clipboard_history=True, sleep=lambda s: None)
+    keep.set_clipboard("report total 1,234.00")
+    assert api.clip_extra == {} and keep.get_clipboard() == "report total 1,234.00"
+
+
+def test_restore_un_maximizes_a_window_minimized_while_maximized(be, api):
+    """SW_RESTORE brings a window minimized from maximized back *maximized*
+    (WPF_RESTORETOMAXIMIZED); 'normal' and move_window must end un-maximized."""
+    _desktop(api)
+    xl = api.wins[0x700]
+    be.set_window_state(0x700, "minimized")
+    assert xl.iconic and not xl.zoomed
+    be.set_window_state(0x700, "normal")
+    assert not xl.iconic and not xl.zoomed
+    be.set_window_state(0x700, "maximized")
+    be.set_window_state(0x700, "minimized")
+    be.move_window(0x700, Rect(10, 20, 300, 200))
+    assert not xl.iconic and not xl.zoomed
+    assert be.window_info(0x700).rect == Rect(10, 20, 300, 200)
+    # activation keeps the user's maximized layout
+    be.set_window_state(0x700, "maximized")
+    be.set_window_state(0x700, "minimized")
+    be.activate_window(0x700)
+    assert not xl.iconic and xl.zoomed
+
+
+def test_failed_release_stays_tracked_for_retry(be, api):
+    """A key/button whose release Windows rejected (UAC secure desktop, locked
+    workstation) is still down: it must stay tracked so release_all() retries it."""
+    be.key_down("ctrl")
+    be.key_down("a")
+    be.mouse_down("left")
+    api.send_limit = 0
+    with pytest.raises(BackendError):
+        be.key_up("ctrl")
+    with pytest.raises(BackendError):
+        be.mouse_up("left")
+    with pytest.raises(BackendError):
+        be.release_all()
+    assert list(be._held) == ["ctrl", "a"] and list(be._buttons_down) == [MouseButton.LEFT]
+    api.send_limit, api.last_error = None, 0  # input possible again
+    api.inputs.clear()
+    be.release_all()
+    assert [(e[1], e[3]) if e[0] == "key" else e[4] for e in api.inputs] == [
+        (0x41, KEYEVENTF_KEYUP), (0xA2, KEYEVENTF_KEYUP), MOUSEEVENTF_LEFTUP,
+    ]
+    assert not be._held and not be._buttons_down
+    # Keyboard keeps its own record too, so its release_all() can retry
+    from pypilot.keyboard import Keyboard
+
+    kb = Keyboard(be, sleep=lambda s: None)
+    kb.down("shift")
+    api.send_limit = 0
+    with pytest.raises(BackendError):
+        kb.up("shift")
+    assert kb.pressed == ["shift"] and "shift" in be._held
+    api.send_limit, api.last_error = None, 0
+    assert kb.release_all() == ["shift"] and not be._held

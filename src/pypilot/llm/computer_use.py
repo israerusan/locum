@@ -18,6 +18,7 @@ screen pixels before acting.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -25,9 +26,11 @@ from ..errors import FailSafeTriggered, PolicyViolation
 from ..keys import normalize_key
 from ..types import Point, Rect
 from .observe import MAX_LONG_EDGE, MAX_VISUAL_TOKENS, fit_image_size
-from .._nodeinfo import node_app, target_label, window_at
-from .safety import AuditLog, Policy, keys_activate
-from .tools import ToolResult
+from .._nodeinfo import is_password, node_app, target_label, window_at
+from .safety import (
+    AuditLog, Policy, check_activation_combo, keys_activate, keys_may_move_focus, split_typed_text, typed_text_activates,
+)
+from .tools import _REDACTED, ToolResult, _default_button, _has_enter, _has_newline, _shortcut_targets
 
 if TYPE_CHECKING:  # pragma: no cover
     from PIL.Image import Image
@@ -176,6 +179,8 @@ class ComputerUseAdapter:
         self.zoom_enabled = bool(zoom)
         self.max_visual_tokens = int(max_visual_tokens)
         self.screenshot_after_action = bool(screenshot_after_action)
+        self._local = threading.local()  # per-call state: typed into a password field (audit redaction)
+        self._held_buttons: List[str] = []  # pressed by left_mouse_down, not yet released
 
     # ---------------------------------------------------------------- geometry
     def screen_region(self) -> Rect:
@@ -265,6 +270,7 @@ class ComputerUseAdapter:
         started = time.monotonic()
         status = "ok"
         result: Optional[ToolResult] = None
+        self._local.secret = False
         try:
             if action not in ACTIONS:
                 result = ToolResult.error(f"Unknown computer action {action!r}. Supported: {', '.join(ACTIONS)}")
@@ -278,7 +284,7 @@ class ComputerUseAdapter:
             raise
         except PolicyViolation as exc:
             status = "blocked"
-            result = ToolResult.error(f"Blocked by policy: {exc}")
+            result = ToolResult.error(f"Blocked by policy: {exc}", data={"blocked": True})
         except Exception as exc:
             result = ToolResult.error(f"{type(exc).__name__}: {exc}")
         if result.is_error and status == "ok":
@@ -289,6 +295,9 @@ class ComputerUseAdapter:
         return result
 
     def _audit(self, action: Any, params: Dict[str, Any], status: str, result: Optional[ToolResult], error: Optional[str], started: float) -> None:
+        if getattr(self._local, "secret", False) and "text" in params:
+            params = dict(params, text=_REDACTED)  # typed into a password field
+        self._local.secret = False
         event: Dict[str, Any] = {
             "event": "computer_action",
             "tool": action,
@@ -304,7 +313,13 @@ class ComputerUseAdapter:
         self.audit.record(event)
 
     # -------------------------------------------------------------- dispatch
-    def _context(self, points: Sequence[Point] = (), **extra: Any) -> Dict[str, Any]:
+    def _context(self, points: Sequence[Point] = (), *, activates: bool = False, **extra: Any) -> Dict[str, Any]:
+        """Policy context for an action at ``points`` (the last one is where it lands).
+
+        ``activates``: the action can press what is under the last point (a left
+        click); if nothing can be hit-tested there, the target is marked unknown
+        (``Policy(unknown_target=...)``).
+        """
         ctx: Dict[str, Any] = {}
         try:
             aw = self.desktop.backend.active_window()
@@ -318,8 +333,10 @@ class ComputerUseAdapter:
             ctx["points"] = list(points)
             names = []
             apps: List[str] = []
-            for p in points:
-                name, point_apps = self._describe_point(p)
+            for i, p in enumerate(points):
+                name, point_apps, node = self._describe_point(p)
+                if activates and node is None and i == len(points) - 1:
+                    ctx["target_unknown"] = True
                 if name:
                     names.append(name)
                 for app in point_apps:
@@ -333,12 +350,18 @@ class ComputerUseAdapter:
         ctx.update({k: v for k, v in extra.items() if v is not None})
         return ctx
 
-    def _keyboard_context(self, activates: bool, **extra: Any) -> Dict[str, Any]:
+    def _keyboard_context(self, activates: bool, *, enter: bool = False, activating: Optional[bool] = None,
+                          **extra: Any) -> Dict[str, Any]:
         """Context for keyboard actions: the focused element is the target.
 
         Its application is always reported; its name is added when the input can
         activate it (Enter/Space, typed text), so confirmation patterns apply to
-        "Tab to the button, press Return" exactly as to clicking it.
+        "Tab to the button, press Return" exactly as to clicking it. ``enter``:
+        the input includes Enter, which in a single-line field presses the
+        form's default button -- its label is added too ("Amount -> Pay now").
+        ``activating`` (default ``activates``): the input can press the focused
+        control; if the focus cannot be read, the target is marked unknown
+        (``Policy(unknown_target=...)``) rather than letting it through unchecked.
         """
         ctx = self._context(**extra)
         try:
@@ -346,7 +369,11 @@ class ComputerUseAdapter:
         except Exception:
             node = None
         if node is None:
+            if activates if activating is None else activating:
+                ctx["target_unknown"] = True
             return ctx
+        if is_password(node):
+            self._local.secret = True
         try:
             name = target_label(node)
         except Exception:
@@ -354,12 +381,38 @@ class ComputerUseAdapter:
         app = node_app(self.desktop.backend, node)
         if app:
             ctx["target_app"] = app
+        if activates and enter:
+            button = _default_button(node)
+            label = ""
+            if button is not None:
+                try:
+                    label = target_label(button)
+                except Exception:
+                    label = ""
+            if label:
+                name = f"{name} -> {label}" if name else label
+                ctx["default_button"] = label
         if activates and name:
             ctx["target"] = name
         return ctx
 
-    def _describe_point(self, p: Point) -> Tuple[str, List[str]]:
-        """``(label, apps)`` of what is at screen point ``p``.
+    def _recheck_focus(self, action: str, params: Dict[str, Any], activates: bool, description: str, *,
+                       enter: bool = False, activating: Optional[bool] = None, **extra: Any) -> None:
+        """Re-run the policy for the next part of a keyboard action after focus may have moved.
+
+        ``"Tab Return"`` or typed ``"1000\t\n"`` checked only against the control
+        focused *before* the action would press Enter on whatever the Tab reached
+        (a "Pay" button) unchecked. Not counted against the action budget.
+        """
+        ctx = self._keyboard_context(activates, enter=enter, activating=activating, **extra)
+        ctx["description"] = description
+        try:
+            self.policy.check(action, params, context=ctx, count=False)
+        except PolicyViolation as exc:
+            raise PolicyViolation(f"{exc} (the input before it in this action was already sent)") from None
+
+    def _describe_point(self, p: Point) -> Tuple[str, List[str], Any]:
+        """``(label, apps, node)`` of what is at screen point ``p`` (``node``: the hit-tested node or ``None``).
 
         ``label`` is the hit-tested node's name plus its enclosing actionable
         control's (an unnamed icon inside a "Pay" button reads as "Pay").
@@ -385,10 +438,12 @@ class ComputerUseAdapter:
         w = window_at(backend, p)
         if w is not None and w.app and w.app not in apps:
             apps.append(w.app)
-        return name, apps
+        return name, apps, node
 
     def _guard(self, action: str, params: Dict[str, Any], ctx: Dict[str, Any], description: str) -> Optional[ToolResult]:
         """Policy check; returns the dry-run result when acting is disabled."""
+        if ctx.get("default_button"):
+            description += f" (Enter activates the default button {ctx['default_button']!r})"
         ctx.setdefault("description", description)
         self.policy.check(action, params, context=ctx)
         if self.policy.dry_run and action not in READ_ONLY_ACTIONS:
@@ -483,7 +538,7 @@ class ComputerUseAdapter:
             target = point if point is not None else d.position()
             where = f"({p['coordinate'][0]}, {p['coordinate'][1]})" if point is not None else "the current position"
             desc = action.replace("_", " ") + f" at {where}" + (f" holding {'+'.join(mods)}" if mods else "")
-            dry = self._guard(action, p, self._context([target]), desc)
+            dry = self._guard(action, p, self._context([target], activates=button == "left"), desc)
             if dry is not None:
                 return dry
             with d.hold(*mods) if mods else _null():
@@ -491,6 +546,8 @@ class ComputerUseAdapter:
                     d.mouse.click(point, button=button, clicks=clicks)
                 else:
                     d.mouse.click(None, button=button, clicks=clicks)
+            if button in self._held_buttons:
+                self._held_buttons.remove(button)  # the click released it
             return self._done()
 
         if action == "left_click_drag":
@@ -505,6 +562,8 @@ class ComputerUseAdapter:
                 return dry
             with d.hold(*mods) if mods else _null():
                 d.mouse.drag(start, end, duration=0.3)
+            if "left" in self._held_buttons:
+                self._held_buttons.remove("left")  # the drag ends with a release
             return self._done()
 
         if action == "mouse_move":
@@ -521,15 +580,20 @@ class ComputerUseAdapter:
             point = self._coord(p["coordinate"]) if p.get("coordinate") is not None else None
             target = point if point is not None else d.position()
             verb = "press" if action == "left_mouse_down" else "release"
-            dry = self._guard(action, p, self._context([target]), f"{verb} the left mouse button")
+            dry = self._guard(action, p, self._context([target], activates=action == "left_mouse_down"),
+                              f"{verb} the left mouse button")
             if dry is not None:
                 return dry
             if point is not None:
                 d.mouse.move(point)
             if action == "left_mouse_down":
                 d.mouse_down("left")
+                if "left" not in self._held_buttons:
+                    self._held_buttons.append("left")
             else:
                 d.mouse_up("left")
+                if "left" in self._held_buttons:
+                    self._held_buttons.remove("left")
             return self._done()
 
         if action == "scroll":
@@ -558,11 +622,19 @@ class ComputerUseAdapter:
             text = p.get("text")
             if not isinstance(text, str):
                 raise ValueError("'text' (the text to type) is required")
-            shown = text if len(text) <= 60 else text[:57] + "..."
-            dry = self._guard(action, p, self._keyboard_context(True), f"type {shown!r}")
+            pieces = split_typed_text(text)
+            first = pieces[0] if pieces else ""
+            ctx = self._keyboard_context(True, enter=_has_newline(first), activating=typed_text_activates(first))
+            secret = bool(getattr(self._local, "secret", False))
+            shown = _REDACTED if secret else text if len(text) <= 60 else text[:57] + "..."
+            dry = self._guard(action, p, ctx, f"type {shown!r}")
             if dry is not None:
                 return dry
-            d.type(text)
+            for i, piece in enumerate(pieces):
+                if i:  # a Tab/newline was typed: the rest may go to another control
+                    self._recheck_focus(action, p, True, f"type {_REDACTED if secret else piece!r} (part of {shown!r})",
+                                        enter=_has_newline(piece), activating=typed_text_activates(piece))
+                d.type(piece)
             return self._done()
 
         if action == "key":
@@ -574,17 +646,28 @@ class ComputerUseAdapter:
                 raise ValueError(f"'repeat' must be an integer, got {repeat!r}") from None
             if not 1 <= repeat <= 100:
                 raise ValueError("'repeat' must be between 1 and 100")
+            for keys in seq:
+                check_activation_combo(keys)
             combo = p.get("text")
             activates = keys_activate(seq)
-            dry = self._guard(action, p, self._keyboard_context(activates, keys=combo), f"press {combo}" + (f" x{repeat}" if repeat > 1 else ""))
+            pressed = _shortcut_targets(d, seq)
+            ctx = self._keyboard_context(activates, enter=any(_has_enter(keys) for keys in seq),
+                                         keys=" ".join("+".join(keys) for keys in seq), shortcut_targets=pressed or None)
+            dry = self._guard(action, p, ctx, f"press {combo}" + (f" x{repeat}" if repeat > 1 else "")
+                              + (f" (presses {', '.join(map(repr, pressed))})" if pressed else ""))
             if dry is not None:
                 return dry
+            moved = False
             for _ in range(repeat):
                 for keys in seq:
+                    if moved:  # an earlier key may have moved focus: check what this one acts on
+                        self._recheck_focus(action, p, keys_activate([keys]), f"press {'+'.join(keys)} (part of {combo!r})",
+                                            enter=_has_enter(keys))
                     if len(keys) == 1:
                         d.keyboard.press(keys[0])
                     else:
                         d.keyboard.hotkey(*keys)
+                    moved = moved or keys_may_move_focus(keys)
             return self._done()
 
         if action == "hold_key":
@@ -592,8 +675,10 @@ class ComputerUseAdapter:
             if not isinstance(text, str) or not text:
                 raise ValueError("'text' (the key(s) to hold) is required")
             keys = parse_key_combo(text)
+            check_activation_combo(keys)
             dur = self._duration(p)
-            dry = self._guard(action, p, self._keyboard_context(keys_activate([keys]), keys=text), f"hold {text} for {dur:g}s")
+            dry = self._guard(action, p, self._keyboard_context(keys_activate([keys]), enter=_has_enter(keys), keys=text),
+                              f"hold {text} for {dur:g}s")
             if dry is not None:
                 return dry
             with d.hold(*keys):
@@ -601,6 +686,24 @@ class ComputerUseAdapter:
             return self._done()
 
         raise ValueError(f"Unsupported action {action!r}")  # pragma: no cover - ACTIONS is exhaustive
+
+    def release_all(self) -> List[str]:
+        """Release the mouse buttons pressed with ``left_mouse_down`` and not released since.
+
+        Call it when a session ends (the :class:`~pypilot.llm.agent.Agent` does,
+        however its run ends) so a dangling ``left_mouse_down`` cannot turn the
+        user's next mouse move into a drag. Releasing is never blocked by the
+        fail-safe; every button is attempted and the released ones are returned.
+        """
+        released: List[str] = []
+        for button in list(self._held_buttons):
+            try:
+                self.desktop.mouse_up(button)
+            except Exception:
+                continue
+            self._held_buttons.remove(button)
+            released.append(button)
+        return released
 
     # ------------------------------------------------------------------ batch
     @staticmethod

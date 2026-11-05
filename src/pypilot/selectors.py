@@ -189,10 +189,12 @@ _OPS = ("=", "!=", "*=", "^=", "$=", "~=", "%=")
 _STATE_PSEUDOS = frozenset(
     {
         "enabled", "disabled", "visible", "hidden", "focused", "checked", "unchecked", "selected",
-        "editable", "readonly", "expanded", "collapsed", "focusable", "active", "root",
+        "editable", "readonly", "expanded", "collapsed", "focusable", "active", "root", "mixed",
     }
 )
-_PSEUDO_ALIASES = {"contains": "has-text", "offscreen": "hidden", "invisible": "hidden"}
+_PSEUDO_ALIASES = {
+    "contains": "has-text", "offscreen": "hidden", "invisible": "hidden", "indeterminate": "mixed",
+}
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-]*$")
 _GLOB_CHARS = re.compile(r"[*?]")
 
@@ -238,8 +240,12 @@ def _norm_role(role: str) -> str:
     return ROLE_ALIASES.get(r, r)
 
 
+def _app_base(app: str) -> str:
+    return app.strip().replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def _norm_app(app: str) -> str:
-    a = app.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
+    a = _app_base(app).lower()
     return a[:-4] if a.endswith(".exe") else a
 
 
@@ -410,17 +416,20 @@ class _AttrCond(_Cond):
         self.ci = ci
         self.form = form  # attr | id | class | shorthand | bare
         self._rx: Optional["re.Pattern[str]"] = None
+        # Process names are matched case-insensitively whatever the operator
+        # (Windows file names are; ``[app="EXCEL.EXE"]`` == ``[app=excel]``).
+        self._fold = ci or key == "app"
         if op == "~=":
-            self._rx = re.compile(value or "", re.I if ci else 0)
+            self._rx = re.compile(value or "", re.I if self._fold else 0)
         elif op == "%=":
             v = value or ""
             if key == "app":
                 v = _norm_app(v)
-            self._rx = re.compile(_glob_to_regex(v), re.S | (re.I if ci or key == "app" else 0))
+            self._rx = re.compile(_glob_to_regex(v), re.S | (re.I if self._fold else 0))
         cmp = value if value is not None else ""
         if key == "app" and op in ("=", "!="):
             cmp = _norm_app(cmp)
-        self._cmp = cmp.casefold() if ci else cmp
+        self._cmp = cmp.casefold() if self._fold else cmp
 
     def _one(self, actual: Optional[str]) -> bool:
         op = self.op
@@ -429,12 +438,21 @@ class _AttrCond(_Cond):
         if op is None:
             return actual != ""
         if self.key == "app":
-            actual = _norm_app(actual)
+            norm = _norm_app(actual)
+            if op in ("=", "!=", "%="):
+                return self._cmp_one(norm)
+            # Substring/prefix/suffix/regex tests see both the real file name
+            # ("saplogon.exe", so $=".exe" works) and the normalised one ("saplogon").
+            return self._cmp_one(_app_base(actual)) or self._cmp_one(norm)
+        return self._cmp_one(actual)
+
+    def _cmp_one(self, actual: str) -> bool:
+        op = self.op
         if self._rx is not None:
             if op == "~=":
                 return self._rx.search(actual) is not None
             return self._rx.fullmatch(actual) is not None
-        a = actual.casefold() if self.ci else actual
+        a = actual.casefold() if self._fold else actual
         v = self._cmp
         if op == "=" or op == "!=":
             return a == v
@@ -485,7 +503,10 @@ class _StateCond(_Cond):
             return entry.parent is None
         st = entry.prop("states")
         if n == "unchecked":
-            return "checked" not in st
+            # A tri-state box in the indeterminate state is neither checked nor unchecked.
+            return "checked" not in st and "mixed" not in st and "indeterminate" not in st
+        if n == "mixed":
+            return "mixed" in st or "indeterminate" in st
         if n == "editable":
             return "editable" in st and "readonly" not in st
         if n == "collapsed":
@@ -1283,7 +1304,9 @@ def _parse_uipath(text: str) -> Selector:
             attrs.append((am.group(1).lower(), _xml_unescape(val), am.start(1)))
             pos = am.end()
         comp = _Compound()
-        top = tag in ("wnd", "html", "app")
+        # Only the first <wnd>/<html>/<app> is a top-level window; a later
+        # <wnd> is a child window (child HWND) of the previous one.
+        top = tag in ("wnd", "html", "app") and not steps
         if top:
             comp.conds.append(_StateCond("root"))
         nth: Optional[int] = None
@@ -1335,7 +1358,19 @@ _DICT_STATE_KEYS = {
     "selected": ("selected", None),
     "editable": ("editable", None),
     "expanded": ("expanded", "collapsed"),
+    "mixed": ("mixed", None),
 }
+_DICT_BOOL_STRINGS = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
+
+
+def _dict_bool(key: str, val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and val in (0, 1):
+        return bool(val)
+    if isinstance(val, str) and val.strip().lower() in _DICT_BOOL_STRINGS:
+        return _DICT_BOOL_STRINGS[val.strip().lower()]
+    raise SelectorSyntaxError(f"Dict selector state key {key!r} needs true/false, got {val!r}")
 
 
 def _dict_compound(d: Dict[str, Any]) -> _Compound:
@@ -1365,9 +1400,9 @@ def _dict_compound(d: Dict[str, Any]) -> _Compound:
                     raise SelectorSyntaxError(f"Unknown state {s!r} in dict selector")
                 comp.conds.append(_StateCond(s))
             continue
-        if key in _DICT_STATE_KEYS and isinstance(val, bool):
+        if key in _DICT_STATE_KEYS:
             pos_name, neg_name = _DICT_STATE_KEYS[key]
-            if val:
+            if _dict_bool(key, val):
                 comp.conds.append(_StateCond(pos_name))
             elif neg_name is not None:
                 comp.conds.append(_StateCond(neg_name))
@@ -1387,12 +1422,14 @@ def _dict_compound(d: Dict[str, Any]) -> _Compound:
             op = "~="
             ci = ci or bool(val.flags & re.I)
             val = val.pattern
-        if ckey == "role" and op in ("=", "!=") and comp.role is None and op == "=" and not ci:
+        if ckey == "role" and op == "=" and comp.role is None and not ci and val is not None:
             comp.role = _norm_role(str(val))
             continue
         sval = _str_or_none(val)
         if sval is None:
             raise SelectorSyntaxError(f"Dict selector key {key!r} has value None")
+        if ckey == "role" and op in ("=", "!="):
+            sval = _norm_role(sval)  # like CSS [role!="push button"]
         try:
             comp.conds.append(_AttrCond(ckey, op, sval, ci))
         except re.error as exc:
@@ -1436,6 +1473,8 @@ def _parse_dict(d: Dict[str, Any]) -> Selector:
         raise SelectorSyntaxError("Empty dict selector")
     if "any" in d and len(d) == 1:
         options = d["any"]
+        if not isinstance(options, (list, tuple)):
+            raise SelectorSyntaxError(f"'any' needs a list of selectors, got {type(options).__name__}")
         branches: List[_Branch] = []
         for o in options:
             branches.extend(parse(o).branches)
@@ -1517,13 +1556,34 @@ def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
         return False
 
 
-def _chain(node: AccessibleNode, root: Optional[AccessibleNode]) -> List[AccessibleNode]:
-    """``[top, ..., node]`` following ``parent`` links (stopping at ``root``)."""
+#: Ancestors above the search roots: AT-SPI and AX parent a window to its
+#: application (and AT-SPI the application to the desktop), but backends never
+#: return these from ``accessibility_roots()``, so a selector must not start there.
+_ABOVE_ROOT_ROLES = frozenset({"application", "desktop"})
+
+
+def _chain(
+    node: AccessibleNode,
+    root: Optional[AccessibleNode],
+    roots: Optional[Sequence[AccessibleNode]] = None,
+) -> List[AccessibleNode]:
+    """``[top, ..., node]`` following ``parent`` links.
+
+    Stops at ``root``, or else at the first ancestor that is one of ``roots``.
+    Without an explicit ``root``, when no ancestor is one of ``roots``, leading
+    application/desktop ancestors are dropped so the chain starts where a
+    search over the backend's roots does.
+    """
     chain = [node]
     seen = 0
     cur = node
+    hit = False
     while seen < 256:
         if root is not None and _same(cur, root):
+            hit = True
+            break
+        if root is None and roots is not None and any(_same(cur, r) for r in roots):
+            hit = True
             break
         p = _safe(lambda: cur.parent)
         if p is None:
@@ -1532,6 +1592,9 @@ def _chain(node: AccessibleNode, root: Optional[AccessibleNode]) -> List[Accessi
         cur = p
         seen += 1
     chain.reverse()
+    if not hit and root is None:
+        while len(chain) > 1 and (_safe(lambda: chain[0].role, "") or "").lower() in _ABOVE_ROOT_ROLES:
+            chain.pop(0)
     return chain
 
 
@@ -1552,11 +1615,17 @@ def selector_for(
 
     Args:
         node: The node (must expose ``parent`` links for an ancestor prefix).
-        root: Scope the selector is relative to (default: the top-most ancestor).
-        roots: All search roots (e.g. ``backend.accessibility_roots()``); used to
-            disambiguate windows sharing a title. Defaults to ``[top]``.
+        root: Scope the selector is relative to (default: the top-most ancestor,
+            or the ancestor that is one of ``roots``; application/desktop
+            ancestors above the windows are never used).
+        roots: All search roots (e.g. ``desktop.roots()`` /
+            ``backend.accessibility_roots()``); used to disambiguate windows
+            sharing a title. Pass them whenever the selector will be used with
+            ``Desktop.find``: without ``roots`` uniqueness is only checked inside
+            the node's own top-level window, so two windows with the same title
+            (e.g. two SAP sessions) can yield a selector that finds the other one.
     """
-    chain = _chain(node, root)
+    chain = _chain(node, root, roots)
     top = chain[0]
     scope = list(roots) if roots is not None else [top]
 
@@ -1648,7 +1717,7 @@ def _index_among(sel_text: str, scope: Sequence[AccessibleNode], node: Accessibl
 
 # =========================================================================== tree_text
 
-_SHOWN_STATES = ("focused", "disabled", "checked", "selected", "expanded", "collapsed", "readonly", "offscreen", "invisible", "active")
+_SHOWN_STATES = ("focused", "disabled", "checked", "mixed", "selected", "expanded", "collapsed", "readonly", "offscreen", "invisible", "active")
 
 
 def _short(text: str, limit: int = 80) -> str:

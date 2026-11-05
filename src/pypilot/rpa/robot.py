@@ -23,7 +23,9 @@ Features:
 
 * **Tasks** (``@robot.task``) with retries + exponential backoff, a
   cooperative ``timeout`` and ``continue_on_error``. A task function may take
-  no argument or one (the robot).
+  no argument or one (the robot). A task that overruns its ``timeout`` fails
+  and is **not** retried (its actions may already have happened), and a
+  step's ``continue_on_error`` / retries never swallow that deadline.
 * **Steps** as context managers (``with robot.step("name"):``) that nest and
   are timed individually. A step with retries is written as a loop of
   attempts, or wraps a callable::
@@ -39,9 +41,12 @@ Features:
 * **Structured logging**: :meth:`Robot.log` writes JSON-able records to the
   report and to the standard :mod:`logging` logger ``pypilot.robot.<name>``
   (record attribute ``pypilot`` carries the fields).
-* :class:`~pypilot.rpa.queue.BusinessException` and
-  :class:`~pypilot.errors.FailSafeTriggered` are never retried; a fail-safe
-  aborts the whole run.
+* :class:`~pypilot.rpa.queue.BusinessException`,
+  :class:`~pypilot.errors.FailSafeTriggered` and a task's own timeout are
+  never retried; a fail-safe aborts the whole run.
+* Steps (or :meth:`Robot.screenshot`) used outside :meth:`Robot.run` start an
+  implicit run; the next :meth:`Robot.run` (or :meth:`Robot.start`) adopts it,
+  and :meth:`Robot.finish` ends it.
 """
 
 from __future__ import annotations
@@ -58,7 +63,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Union
 
+from .. import failsafe as _failsafe
 from ..errors import ActionTimeout, FailSafeTriggered
+from .queue import TASK_DEADLINE_ATTR as _DEADLINE_ATTR
 from .queue import BusinessException
 from .report import FAILED, PASSED, SKIPPED, RunReport, StepResult
 
@@ -77,6 +84,17 @@ _LEVELS = {
 }
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SHOT_ATTR = "_pypilot_screenshot"
+
+
+def _deadline_error(message: str) -> ActionTimeout:
+    """An :class:`ActionTimeout` for a task's own deadline (never retried, never swallowed by a step)."""
+    exc = ActionTimeout(message)
+    setattr(exc, _DEADLINE_ATTR, True)
+    return exc
+
+
+def _is_deadline(exc: Optional[BaseException]) -> bool:
+    return exc is not None and bool(getattr(exc, _DEADLINE_ATTR, False))
 
 
 def _slug(text: str, limit: int = 48) -> str:
@@ -136,6 +154,7 @@ class _Frame:
     timeout: Optional[float] = None
     label: str = ""
     children_start: int = 0
+    closed: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -151,18 +170,28 @@ class Attempt:
         self.number = number
         self.error: Optional[BaseException] = None
         self.entered = False
+        self.exited = False
 
     def __enter__(self) -> "Attempt":
         self.entered = True
-        self.step.robot.check_timeout()
+        try:
+            self.step.robot.check_timeout()
+        except BaseException as exc:  # the task's deadline passed: the step fails here, not later
+            self.exited = True
+            self.error = exc
+            self.step._abort(exc)
+            raise
         return self
 
     def __exit__(self, exc_type: Any, exc: Optional[BaseException], tb: Any) -> bool:
+        self.exited = True
         if exc is None:
             return False
-        if not isinstance(exc, Exception):  # KeyboardInterrupt, SystemExit, GeneratorExit
-            return False
         self.error = exc
+        if not isinstance(exc, Exception):  # KeyboardInterrupt, SystemExit, GeneratorExit
+            # It leaves the loop without resuming the step: record the failure now.
+            self.step._abort(exc)
+            return False
         return True
 
     def __repr__(self) -> str:
@@ -238,6 +267,12 @@ class Step:
         assert frame is not None
         return self.robot._close(frame, exc, continue_on_error=self.continue_on_error, screenshot=self.screenshot)
 
+    def _abort(self, exc: BaseException) -> None:
+        """Close the running step as failed with ``exc``, which propagates past the step."""
+        frame, self._frame = self._frame, None
+        if frame is not None and not frame.closed:
+            self.robot._close(frame, exc, screenshot=self.screenshot)
+
     # -- retried forms -------------------------------------------------------------
     def __iter__(self) -> Iterator[Attempt]:
         if self._frame is not None:
@@ -254,10 +289,22 @@ class Step:
             attempt = Attempt(self, n)
             try:
                 yield attempt
-            except GeneratorExit:  # the caller broke out of the loop
+            except GeneratorExit:  # the loop was left: 'break', or an exception escaped it
                 self._frame = None
-                robot._close(frame, attempt.error, continue_on_error=True, screenshot=self.screenshot)
+                if frame.closed:  # already recorded (an interrupt in the attempt, a timeout on entering it)
+                    raise
+                if attempt.error is not None:  # gave up after a failed attempt
+                    robot._close(frame, attempt.error, continue_on_error=True, screenshot=self.screenshot)
+                elif attempt.exited:  # 'break' after a successful attempt
+                    robot._close(frame, None)
+                else:  # left before the attempt finished: never report that as passed
+                    detail = f" (last error: {type(last).__name__}: {_exc_text(last)})" if last is not None else ""
+                    robot._close(frame, RuntimeError(
+                        f"step {self.name!r} was left before attempt {n} completed{detail}"), screenshot=False)
                 raise
+            if frame.closed:
+                self._frame = None
+                return
             last = attempt.error
             if last is None:
                 self._frame = None
@@ -265,7 +312,12 @@ class Step:
                 return
             if not robot._retryable(last) or n >= attempts:
                 break
-            robot._handle_retry(frame, mark, n, attempts, last, delay)
+            try:
+                robot._handle_retry(frame, mark, n, attempts, last, delay)
+            except BaseException as exc:  # abort / Ctrl+C during the retry wait
+                self._frame = None
+                robot._close(frame, exc, screenshot=self.screenshot)
+                raise
             delay *= self.backoff
         self._frame = None
         assert last is not None
@@ -346,6 +398,7 @@ class Robot:
         self._stack: List[_Frame] = []
         self.report: Optional[RunReport] = None
         self._active = False
+        self._implicit = False
         self._shot_seq = 0
 
     # ----------------------------------------------------------------- plumbing
@@ -369,9 +422,10 @@ class Robot:
             if self._sleep is not None:
                 self._sleep(seconds)
             elif self._desktop is not None:
-                self._desktop.sleep(seconds)
+                self._desktop.sleep(seconds)  # ends at once on abort() (kill hotkey)
             else:
-                time.sleep(seconds)
+                _failsafe.abortable_sleep(seconds)
+            _failsafe._raise_if_aborted()
         self.check_timeout()
 
     @property
@@ -391,6 +445,7 @@ class Robot:
     def _report(self) -> RunReport:
         if self.report is None or not self._active:
             self.start()
+            self._implicit = True  # adopted by the next run()/start(), ended by finish()
         assert self.report is not None
         return self.report
 
@@ -412,9 +467,11 @@ class Robot:
             retries: Extra attempts after a failure (system errors only).
             retry_delay: Seconds before the first retry; multiplied by ``backoff`` each retry.
             timeout: Seconds the task may take. Enforced cooperatively: checked
-                when steps start/end, on :meth:`log`/:meth:`sleep` and when the
-                task returns (an over-running task fails with
-                :class:`~pypilot.errors.ActionTimeout`).
+                when steps start/end, when step attempts start, on :meth:`sleep` and
+                when the task returns. An over-running task fails with
+                :class:`~pypilot.errors.ActionTimeout` and is **not** retried
+                (its actions may already have taken effect); a step's
+                ``continue_on_error`` or retries do not swallow it.
             continue_on_error: Keep running the following tasks when this one fails
                 (the failure still counts in the report).
         """
@@ -450,11 +507,13 @@ class Robot:
 
     def setup(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Decorator: run ``fn`` before the tasks of every :meth:`run` (a failure skips all tasks)."""
+        _wants_argument(fn, "Setup hook")  # a bad signature fails here, not in the middle of run()
         self._setup.append(fn)
         return fn
 
     def teardown(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Decorator: run ``fn`` after the tasks of every :meth:`run`, even when they failed."""
+        _wants_argument(fn, "Teardown hook")
         self._teardown.append(fn)
         return fn
 
@@ -511,7 +570,7 @@ class Robot:
         try:
             path = save_error_screenshot(self.desktop, self.run_path, f"{self._shot_seq:03d}-{name}")
         except Exception as exc:
-            self.log(f"screenshot failed: {type(exc).__name__}: {exc}", level="warning")
+            self._log_at(self.current_path, f"screenshot failed: {type(exc).__name__}: {exc}", "warning")
             return None
         return path
 
@@ -521,7 +580,7 @@ class Robot:
         now = self._clock()
         for frame in reversed(self._stack):
             if frame.deadline is not None and now > frame.deadline:
-                raise ActionTimeout(
+                raise _deadline_error(
                     f"{frame.result.kind} {frame.result.name!r} exceeded its timeout of {frame.timeout:g}s"
                 )
 
@@ -549,10 +608,13 @@ class Robot:
         screenshot: Optional[bool] = None,
     ) -> bool:
         """Finalize ``frame``; returns True when ``exc`` must be suppressed."""
+        if frame.closed:
+            return False
         if frame in self._stack:
             # Pop the frame and anything left above it (a step leaked by an exception).
-            idx = self._stack.index(frame)
-            del self._stack[idx:]
+            self._drop_above(frame, exc)
+            self._stack.remove(frame)
+        frame.closed = True
         r = frame.result
         r.finished_at = time.time()
         r.duration = max(0.0, self._clock() - frame.extra.get("t0", self._clock()))
@@ -577,7 +639,8 @@ class Robot:
                         setattr(exc, _SHOT_ATTR, r.screenshot)
                     except Exception:  # exceptions with __slots__
                         pass
-        fatal = isinstance(exc, FailSafeTriggered) or not isinstance(exc, Exception)
+        # A task's deadline belongs to the enclosing task: a step must not swallow it.
+        fatal = isinstance(exc, FailSafeTriggered) or not isinstance(exc, Exception) or _is_deadline(exc)
         suppress = bool(continue_on_error) and not fatal
         r.handled = suppress
         self._log_at(
@@ -590,13 +653,34 @@ class Robot:
         )
         return suppress
 
+    def _drop_above(self, frame: Optional[_Frame], exc: Optional[BaseException]) -> None:
+        """Pop the frames above ``frame`` (all frames when ``None``), recording them as failed, never passed."""
+        idx = self._stack.index(frame) + 1 if frame is not None else 0
+        leaked, self._stack[idx:] = self._stack[idx:], []
+        for f in reversed(leaked):
+            if f.closed:
+                continue
+            f.closed = True
+            r = f.result
+            r.finished_at = time.time()
+            r.duration = max(0.0, self._clock() - f.extra.get("t0", self._clock()))
+            r.status = FAILED
+            r.handled = False
+            if exc is not None:
+                r.error = f"did not finish: {type(exc).__name__}: {_exc_text(exc)}"
+                r.error_type = type(exc).__name__
+            else:
+                r.error = f"{r.kind} {r.name!r} did not finish"
+                r.error_type = "Unfinished"
+
     def _log_at(self, path: str, message: str, level: str, **fields: Any) -> None:
         # log() uses the current stack path; failures are logged after popping, so pass it explicitly.
         self._emit(message, level, path, fields)
 
     @staticmethod
     def _retryable(exc: BaseException) -> bool:
-        return isinstance(exc, Exception) and not isinstance(exc, (BusinessException, FailSafeTriggered))
+        return (isinstance(exc, Exception) and not isinstance(exc, (BusinessException, FailSafeTriggered))
+                and not _is_deadline(exc))
 
     def _handle_retry(self, frame: _Frame, mark: int, attempt: int, attempts: int, exc: BaseException, delay: float) -> None:
         report = self._report()
@@ -638,20 +722,30 @@ class Robot:
                 value = fn()
                 elapsed = self._clock() - frame.extra["t_attempt"]
                 if timeout is not None and elapsed > timeout:
-                    raise ActionTimeout(f"{kind} {name!r} exceeded its timeout of {timeout:g}s (took {elapsed:.2f}s)")
-            except (FailSafeTriggered, KeyboardInterrupt, SystemExit) as exc:
-                self._close(frame, exc)
-                raise
+                    # The body finished: its actions happened. Fail, but never run it again.
+                    frame.result.data["note"] = "the body completed, but after the timeout; not retried"
+                    if value is not None:
+                        frame.result.data["result"] = value
+                    raise _deadline_error(f"{kind} {name!r} exceeded its timeout of {timeout:g}s (took {elapsed:.2f}s)")
             except Exception as exc:
                 if self._retryable(exc) and n < attempts:
                     # Drop frames leaked above ours, then retry.
                     if frame in self._stack:
-                        del self._stack[self._stack.index(frame) + 1:]
-                    self._handle_retry(frame, mark, n, attempts, exc, delay)
+                        self._drop_above(frame, exc)
+                    try:
+                        self._handle_retry(frame, mark, n, attempts, exc, delay)
+                    except BaseException as stop:  # abort / Ctrl+C during the retry wait
+                        self._close(frame, stop)
+                        raise
                     delay *= float(backoff)
                     continue
                 self._close(frame, exc)
+                if isinstance(exc, FailSafeTriggered):
+                    raise
                 return frame.result
+            except BaseException as exc:  # KeyboardInterrupt, SystemExit...
+                self._close(frame, exc)
+                raise
             if value is not None:
                 frame.result.data["result"] = value
             self._close(frame, None)
@@ -660,9 +754,18 @@ class Robot:
 
     # ---------------------------------------------------------------- lifecycle
     def start(self, *, metadata: Optional[Dict[str, Any]] = None) -> RunReport:
-        """Begin a new run (done automatically by :meth:`run` and by steps used outside a run)."""
+        """Begin a new run (done automatically by :meth:`run` and by steps used outside a run).
+
+        An implicit run (started by a step or screenshot outside any run) with
+        no step still open is adopted: it becomes this run.
+        """
         if self._active and self.report is not None:
-            raise RuntimeError(f"Robot {self.name!r} already has an active run ({self.report.run_id})")
+            if not self._implicit or self._stack:
+                raise RuntimeError(f"Robot {self.name!r} already has an active run ({self.report.run_id})")
+            self._implicit = False
+            self.report.metadata.update(metadata or {})
+            return self.report
+        self._implicit = False
         self.report = RunReport(name=self.name, run_id=_new_run_id(self.name), started_at=time.time(),
                                 run_dir=None, metadata=dict(metadata or {}))
         self.report.metadata.setdefault("robot", self.name)
@@ -674,8 +777,10 @@ class Robot:
     def finish(self, *, save: Optional[bool] = None) -> RunReport:
         """End the current run: stamp the finish time and (optionally) save JSON + HTML reports."""
         report = self._report()
+        self._drop_above(None, None)  # a step still open now did not finish: never report it as passed
         report.finished_at = time.time()
         self._active = False
+        self._implicit = False
         self._stack = []
         if self.save_reports if save is None else save:
             self.save_report(report)
@@ -704,6 +809,7 @@ class Robot:
                 self.report.error = f"{type(exc).__name__}: {_exc_text(exc)}"
                 if isinstance(exc, (FailSafeTriggered, KeyboardInterrupt)):
                     self.report.aborted = True
+                self._drop_above(None, exc)
             self.finish()
 
     def run(self, *task_names: str, save: Optional[bool] = None) -> RunReport:
@@ -711,14 +817,17 @@ class Robot:
 
         A failed task stops the run (remaining tasks are recorded as skipped)
         unless it has ``continue_on_error``. Teardown hooks always run. A
-        fail-safe abort marks the report ``aborted``. ``save`` overrides
-        ``save_reports``.
+        fail-safe abort marks the report ``aborted`` and returns it; any other
+        exception escaping a task (``KeyboardInterrupt``, ``SystemExit``...)
+        also marks it ``aborted``, runs teardown, ends the run (saving the
+        report) and then propagates. ``save`` overrides ``save_reports``.
+        Steps recorded before by an implicit run are adopted into this run.
         """
         names = list(task_names) or list(self.tasks)
         unknown = [n for n in names if n not in self.tasks]
         if unknown:
             raise KeyError(f"Unknown task(s) {', '.join(map(repr, unknown))}; registered: {', '.join(map(repr, self.tasks)) or 'none'}")
-        if self._active:
+        if self._active and (not self._implicit or self._stack):
             raise RuntimeError(f"Robot {self.name!r} is already running")
         report = self.start(metadata={"tasks": names})
         self.log(f"run {report.run_id} started", tasks=names)
@@ -743,20 +852,31 @@ class Robot:
                     stop = True
                 elif res.status == PASSED:
                     self.log(f"task {name!r} passed in {res.duration:.2f}s", attempts=res.attempts)
-        except (FailSafeTriggered, KeyboardInterrupt) as exc:
+        except BaseException as exc:  # fail-safe, Ctrl+C, SystemExit, a bug in the robot...
             report.aborted = True
             report.error = f"{type(exc).__name__}: {_exc_text(exc)}"
+            self._drop_above(None, exc)
             done = {s.name for s in report.steps if s.kind == "task"}
             for name in names:
                 if name not in done:
                     report.add(StepResult(name=name, kind="task", status=SKIPPED, started_at=time.time(),
                                           finished_at=time.time(), data={"reason": "run aborted"}))
+            self._end_run(save)
+            if isinstance(exc, FailSafeTriggered):
+                return report
+            raise
+        return self._end_run(save)
+
+    def _end_run(self, save: Optional[bool]) -> RunReport:
+        """Run the teardown hooks, then finish the run -- also when a teardown hook raises."""
+        try:
             self._run_teardown()
+        except BaseException as exc:
+            report = self._report()
+            report.aborted = True
+            report.error = report.error or f"{type(exc).__name__}: {_exc_text(exc)}"
             self.finish(save=save)
-            if isinstance(exc, KeyboardInterrupt):
-                raise
-            return report
-        self._run_teardown()
+            raise
         return self.finish(save=save)
 
     def _run_teardown(self) -> None:
@@ -775,7 +895,7 @@ class Robot:
         return f"<Robot {self.name!r} tasks={list(self.tasks)} run_dir={str(self.run_dir)!r}>"
 
 
-def _wants_argument(fn: Callable[..., Any]) -> bool:
+def _wants_argument(fn: Callable[..., Any], what: str = "Task") -> bool:
     """Whether ``fn`` has a required positional parameter (it then receives the robot)."""
     try:
         sig = inspect.signature(fn)
@@ -786,5 +906,5 @@ def _wants_argument(fn: Callable[..., Any]) -> bool:
         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
     ]
     if len(required) > 1:
-        raise TypeError(f"Task {getattr(fn, '__name__', fn)!r} must take no argument or one (the robot), not {len(required)}")
+        raise TypeError(f"{what} {getattr(fn, '__name__', fn)!r} must take no argument or one (the robot), not {len(required)}")
     return len(required) == 1

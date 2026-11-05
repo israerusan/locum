@@ -21,7 +21,7 @@ vars:
 
 settings:
   timeout: 15                  # seconds to wait for windows/elements
-  retries: 1                   # retry each failing step once
+  retries: 1                   # retry each failing action step once (loops/blocks are never re-run)
   retry_delay: 1
 
 steps:
@@ -31,6 +31,7 @@ steps:
       timeout: 0
       else:
         - launch: {command: "${excel_command}", wait_window: "${workbook}", timeout: 60}
+          retries: 0           # never start a second Excel because the first one was slow
 
   - name: Bring the workbook to the front
     activate_window: "${workbook}"

@@ -33,17 +33,24 @@ import dataclasses
 import enum
 import inspect
 import json
+import logging
 import re
+import threading
 import time
+import types
 import typing
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
-from ..errors import ElementNotFound, FailSafeTriggered, NotSupported, PolicyViolation, PypilotError
+from ..errors import ActionTimeout, ElementNotFound, FailSafeTriggered, NotSupported, PolicyViolation, PypilotError
 from ..types import Match, Point, Rect, WindowInfo
 from .observe import Observation, ObservedElement, observe
-from .._nodeinfo import node_app, target_label, window_at
-from .safety import AuditLog, Policy, keys_activate
+from .._nodeinfo import ancestors, is_password, node_app, target_label, window_at
+from .safety import (
+    AuditLog, Policy, check_activation_combo, keys_activate, keys_may_move_focus, split_typed_text, typed_text_activates,
+)
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..desktop import Desktop
@@ -114,6 +121,8 @@ class ToolResult:
 # =============================================================================== schemas
 
 _NONE_TYPE = type(None)
+#: ``X | Y`` hints (PEP 604, Python 3.10+) have this origin instead of ``typing.Union``.
+_UNION_TYPES = tuple(t for t in (Union, getattr(types, "UnionType", None)) if t is not None)
 _SECTION_RE = re.compile(r"^\s*(Args|Arguments|Parameters|Params|Returns?|Yields?|Raises|Examples?|Notes?|Attributes)\s*:\s*$")
 _ARG_RE = re.compile(r"^(\s*)\*{0,2}([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s*:\s*(.*)$")
 
@@ -159,7 +168,7 @@ def _json_type_schema(tp: Any) -> Tuple[Dict[str, Any], bool]:
         return {}, False
     origin = typing.get_origin(tp)
     args = typing.get_args(tp)
-    if origin is Union:
+    if origin in _UNION_TYPES:
         non_none = [a for a in args if a is not _NONE_TYPE]
         nullable = len(non_none) != len(args)
         if len(non_none) == 1:
@@ -301,13 +310,20 @@ def _type_ok(value: Any, schema: Dict[str, Any]) -> bool:
 
 @dataclass
 class ToolSpec:
-    """A tool: ``name``, ``description``, JSON-schema ``parameters`` and the callable ``fn``."""
+    """A tool: ``name``, ``description``, JSON-schema ``parameters`` and the callable ``fn``.
+
+    ``read_only``: the tool only reads state (skips confirmations, budgets and
+    dry-run). ``confirm``: every call needs human confirmation through the
+    policy (e.g. an integration tool that releases payments), whatever its
+    name or arguments; honoured for :class:`~pypilot.llm.agent.Agent` extra tools.
+    """
 
     name: str
     description: str
     parameters: Dict[str, Any]
     fn: Callable[..., Any]
     read_only: bool = False
+    confirm: bool = False
 
     @classmethod
     def from_function(
@@ -318,12 +334,13 @@ class ToolSpec:
         description: Optional[str] = None,
         parameters: Optional[Dict[str, Any]] = None,
         read_only: bool = False,
+        confirm: bool = False,
     ) -> "ToolSpec":
         desc, schema = schema_from_function(fn)
         tool_name = name or getattr(fn, "__name__", None)
         if not tool_name or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", tool_name):
             raise ValueError(f"Invalid tool name {tool_name!r} (use 1-64 chars of [A-Za-z0-9_-])")
-        return cls(tool_name, (description or desc or tool_name).strip(), parameters or schema, fn, read_only)
+        return cls(tool_name, (description or desc or tool_name).strip(), parameters or schema, fn, read_only, confirm)
 
     def to_anthropic(self) -> Dict[str, Any]:
         return {"name": self.name, "description": self.description, "input_schema": self.parameters}
@@ -456,7 +473,7 @@ class ToolRegistry:
         except FailSafeTriggered:
             raise
         except PolicyViolation as exc:
-            return ToolResult.error(f"Blocked by policy: {exc}")
+            return ToolResult.error(f"Blocked by policy: {exc}", data={"blocked": True})
         except (ElementNotFound, NotSupported, PypilotError) as exc:
             return ToolResult.error(f"{type(exc).__name__}: {exc}")
         except Exception as exc:
@@ -485,6 +502,166 @@ def _signature(fn: Callable[..., Any]) -> inspect.Signature:
 # =============================================================================== toolkit
 
 
+#: Shown instead of text typed into a password field (audit log, results, confirmations).
+_REDACTED = "***"
+
+
+class _MaskedValue:
+    """A password field node whose ``value`` reads as :data:`_REDACTED` (for descriptions)."""
+
+    value = _REDACTED
+
+    def __init__(self, node: Any) -> None:
+        self._node = node
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._node, name)
+
+
+def _has_enter(parts: Any) -> bool:
+    """Whether a parsed key combination includes Enter."""
+    return any(p in ("enter", "num_enter") for p in parts)
+
+
+def _has_newline(text: str) -> bool:
+    return "\n" in text or "\r" in text
+
+
+_TEXT_INPUT_ROLES = frozenset({"edit", "combobox", "spinbutton", "passwordtext", "entry", "searchbox", "textbox"})
+_FORM_ROLES = frozenset({"form", "dialog", "alert", "window", "frame"})
+
+
+def _default_button(node: Any, limit: int = 400) -> Any:
+    """The default button that Enter in ``node`` (a single-line text field) would activate, or ``None``.
+
+    In dialogs (Win32 ``DM_GETDEFID``, GTK/Qt default buttons) and HTML forms
+    (implicit submission), Enter in a single-line field presses the default
+    button -- "Pay now" -- although the focused control is "Amount". The button
+    is found in the field's nearest form/dialog/window by its ``"default"``
+    state (searching at most ``limit`` nodes).
+    """
+    try:
+        role = str(node.role or "").lower()
+        states = node.states or frozenset()
+    except Exception:
+        return None
+    if role not in _TEXT_INPUT_ROLES and not (role != "document" and "editable" in states):
+        return None
+    if states & {"multi_line", "multiline"}:
+        return None  # Enter inserts a line break
+    from .._nodeinfo import ancestors
+
+    parents = ancestors(node)
+    if not parents:
+        return None
+    scope = next((a for a in parents if str(getattr(a, "role", "") or "").lower() in _FORM_ROLES), parents[-1])
+    queue: Deque[Any] = collections.deque([scope])
+    seen = 0
+    while queue and seen < limit:
+        cur = queue.popleft()
+        seen += 1
+        try:
+            # Role first: reading every node's states is expensive on UI Automation.
+            if str(cur.role or "").lower() == "button" and "default" in (cur.states or ()):
+                return cur
+            queue.extend(cur.children() or ())
+        except Exception:
+            continue
+    return None
+
+
+def _with_default_button(t: "_Target", node: Any) -> "_Target":
+    """``t`` with the label of the default button that Enter in ``node`` would press added to its name."""
+    button = _default_button(node)
+    if button is None:
+        return t
+    try:
+        label = target_label(button)
+    except Exception:
+        label = ""
+    if not label:
+        return t
+    return dataclasses.replace(
+        t,
+        name=f"{t.name} -> {label}" if t.name else label,
+        description=f"{t.description} (Enter activates the default button {label!r})",
+    )
+
+
+_FKEY = re.compile(r"f\d{1,2}")
+#: Controls that carry access keys / accelerators (searched by :func:`_shortcut_targets`).
+_SHORTCUT_ROLES = frozenset({"button", "togglebutton", "menuitem", "link", "checkbox", "radiobutton", "tab"})
+#: Editing shortcuts (select all, copy, cut, paste, undo, redo) never press a labelled control.
+_EDIT_SHORTCUTS = frozenset(frozenset({m, k}) for m in ("ctrl", "cmd") for k in "acvxyz")
+
+
+def _shortcut_targets(desktop: Any, combos: List[List[str]], limit: int = 400) -> List[str]:
+    """Labels of the controls in the focused window that the shortcut ``combos`` press.
+
+    ``alt+p`` presses the button whose access key is Alt+P (Win32 caption
+    ``"&Pay now"``, UI Automation ``AccessKey``) exactly like a click, and a
+    menu item's accelerator (``Ctrl+S`` / ``F8`` next to "Post"/"Execute") runs
+    its command: the policy judges such shortcuts by those labels. Only
+    combos with Alt/Ctrl/Cmd (but not copy/paste-style editing shortcuts) or a
+    function key are looked up, on buttons, menu items, tabs and the like; at most
+    ``limit`` nodes of the window are searched.
+    """
+    from .safety import _combo_sets
+
+    wanted = []
+    for keys in combos:
+        for ks in _combo_sets(list(keys)):
+            if ks in _EDIT_SHORTCUTS:
+                continue
+            if (len(ks) > 1 and ks & {"alt", "ctrl", "cmd"}) or any(_FKEY.fullmatch(k) for k in ks):
+                wanted.append(ks)
+    if not wanted:
+        return []
+    mnemonics = {next(iter(ks - {"alt"})) for ks in wanted if "alt" in ks and len(ks) == 2 and not ks & {"ctrl", "cmd", "shift"}}
+    scope = None
+    try:
+        node = desktop.backend.focused_element()
+        parents = ancestors(node) if node is not None else []
+        scope = parents[-1] if parents else None
+    except Exception:
+        scope = None
+    if scope is None:  # the focus is unknown or has no readable parents: search the active window
+        try:
+            win = desktop.active_window()
+            scope = win.element.node if win is not None else None
+        except Exception:
+            scope = None
+    if scope is None:
+        return []
+    labels: List[str] = []
+    queue: Deque[Any] = collections.deque([scope])
+    seen = 0
+    while queue and seen < limit:
+        cur = queue.popleft()
+        seen += 1
+        try:
+            queue.extend(cur.children() or ())
+            if str(cur.role or "").lower() not in _SHORTCUT_ROLES:
+                continue
+            name = str(cur.name or "")
+            hit = bool(mnemonics) and any(f"&{m}" in name.lower() for m in mnemonics if len(m) == 1)
+            if not hit:
+                attrs = cur.attributes() or {}
+                hit = any(c in wanted for a in ("access_key", "accelerator_key") if attrs.get(a)
+                          for c in _combo_sets(str(attrs[a])))
+            if hit:
+                try:
+                    label = target_label(cur) or name
+                except Exception:
+                    label = name
+                label = label.replace("&", "")
+                if label and label not in labels:
+                    labels.append(label)
+        except Exception:
+            continue
+    return labels
+
+
 @dataclass
 class _Target:
     element: Optional["Element"] = None
@@ -496,6 +673,11 @@ class _Target:
     #: Every application the action may land in (hit-tested node's app and the
     #: front-most window under the point); all must pass the app policy.
     apps: Tuple[str, ...] = ()
+    #: The input can activate something, but what it reaches cannot be identified
+    #: (unreadable focus, nothing under the pointer): ``Policy(unknown_target=...)`` decides.
+    unknown: bool = False
+    #: The target is a password field (typed text is redacted from audit logs and results).
+    secret: bool = False
 
 
 _DIRECTIONS = ("up", "down", "left", "right")
@@ -517,7 +699,10 @@ class DesktopToolkit:
     Element ids refer to the most recent observation (:attr:`last_observation`);
     ``x``/``y`` arguments are pixels of the most recent screenshot and are mapped
     to the screen with :meth:`Observation.to_screen`. Before any observation,
-    coordinates are raw screen pixels.
+    coordinates are pixels of an unscaled screenshot of the whole virtual screen:
+    ``(0, 0)`` is the virtual screen's top-left corner, so they equal raw screen
+    pixels only when no monitor lies left of or above the primary one (with a
+    monitor at ``x=-1920``, screen point ``(-500, 135)`` is ``(1420, 135)``).
     """
 
     def __init__(
@@ -541,6 +726,7 @@ class DesktopToolkit:
         #: (``subprocess.Popen`` options, e.g. ``{"stdout": subprocess.DEVNULL}``).
         self.launch_kwargs: Dict[str, Any] = dict(launch_kwargs or {})
         self.last_observation: Optional[Observation] = None
+        self._local = threading.local()
         self.registry = ToolRegistry()
         self._build()
 
@@ -592,8 +778,15 @@ class DesktopToolkit:
             spec.fn = self._wrap(name, method)
             self.registry.add(spec)
 
+    def _redact(self, *arg_names: str) -> None:
+        """Keep these arguments of the running tool call (a password) out of the audit log."""
+        pending = getattr(self._local, "redact", None)
+        if pending is not None:
+            pending.update(arg_names)
+
     def _wrap(self, name: str, method: Callable[..., Any]) -> Callable[..., Any]:
         def wrapped(**kwargs: Any) -> ToolResult:
+            self._local.redact = redact = set()
             started = time.monotonic()
             status = "ok"
             result: Optional[ToolResult] = None
@@ -617,10 +810,11 @@ class DesktopToolkit:
                 status, error = "error", f"{type(exc).__name__}: {exc}"
                 raise
             finally:
+                self._local.redact = None
                 event: Dict[str, Any] = {
                     "event": "tool_call",
                     "tool": name,
-                    "args": kwargs,
+                    "args": {k: (_REDACTED if k in redact and v is not None else v) for k, v in kwargs.items()},
                     "status": status,
                     "duration_ms": int((time.monotonic() - started) * 1000),
                 }
@@ -629,7 +823,17 @@ class DesktopToolkit:
                     event["image"] = bool(result.image_base64)
                 if error is not None:
                     event["error"] = error
-                self.audit.record(event)
+                try:
+                    self.audit.record(event)
+                except Exception as exc:  # noqa: BLE001 - never turn a performed action into an error
+                    # The action already happened (or was refused): reporting the audit
+                    # failure as the tool's error would invite a retry -- a second payment.
+                    _log.error("Audit log write failed for tool %r: %s", name, exc)
+                    if result is not None:
+                        result.text = (result.text or "OK") + (
+                            f"\n[AUDIT LOG WRITE FAILED: {type(exc).__name__}: {exc}. The action above was "
+                            "performed (or refused) as reported; do not repeat it.]"
+                        )
 
         wrapped.__name__ = name
         return wrapped
@@ -701,27 +905,34 @@ class DesktopToolkit:
             apps.append(w.app)
         return tuple(apps)
 
-    def _focus_target(self, name_it: bool) -> Optional[_Target]:
+    def _focus_target(self, name_it: bool, enter: bool = False, *, activating: Optional[bool] = None) -> Optional[_Target]:
         """The focused element as a policy target for keyboard actions.
 
         Keyboard input goes to the focused control, so its application is always
         reported (``target_app``) and, when ``name_it`` is true (keys that can
         activate it, or typed text), its name too -- so confirmation patterns
         cannot be sidestepped by tabbing to a control and pressing Enter.
+        ``enter``: the input includes Enter, which in a single-line field
+        activates the form's default button (see :func:`_with_default_button`).
+        ``activating`` (default: ``name_it``): the input can press the focused
+        control; if the focus cannot be read, the target is then marked unknown
+        (``Policy(unknown_target=...)``) instead of letting Enter/Space through unchecked.
         """
         try:
             node = self.desktop.backend.focused_element()
         except Exception:
             node = None
         if node is None:
-            return None
+            unknown = name_it if activating is None else activating
+            return _Target(description="the focused control (unknown)", unknown=True) if unknown else None
         name, app = self._node_info(node)
         try:
             role = str(node.role or "")
         except Exception:
             role = ""
         desc = f"the focused {role or 'element'}" + (f" {name!r}" if name else "")
-        return _Target(description=desc, name=name if name_it else "", app=app)
+        t = _Target(description=desc, name=name if name_it else "", app=app, secret=is_password(node))
+        return _with_default_button(t, node) if enter else t
 
     def _element_from_observed(self, oe: ObservedElement) -> "Element":
         from ..element import Element
@@ -760,6 +971,7 @@ class DesktopToolkit:
         text: Optional[str] = None,
         *,
         required: bool = True,
+        activates: bool = False,
     ) -> _Target:
         given = [k for k, v in (("element_id", element_id), ("x/y", x if x is not None else y), ("selector", selector), ("text", text)) if v is not None]
         if len(given) > 1:
@@ -773,29 +985,81 @@ class DesktopToolkit:
             el = self._element_from_observed(oe)
             label = f"element [{oe.id}] {oe.role}" + (f" {oe.name!r}" if oe.name else "")
             name = self._node_info(oe.node)[0] or oe.name or (oe.value or "")
-            return _Target(element=el, description=label, name=name, app=oe.app or self._node_info(oe.node)[1], observed=oe)
+            return self._element_target(_Target(element=el, description=label, name=name,
+                                                app=oe.app or self._node_info(oe.node)[1], observed=oe), activates)
         if selector is not None:
             el = self.desktop.find(selector, timeout=self.find_timeout)
             name, app = self._node_info(el.node)
-            return _Target(element=el, description=f"{el.role} {name!r} (selector {selector!r})", name=name or selector, app=app)
+            return self._element_target(_Target(element=el, description=f"{el.role} {name!r} (selector {selector!r})",
+                                                name=name or selector, app=app), activates)
         if text is not None:
             el, point = self._find_by_text(text)
             if el is not None:
                 name, app = self._node_info(el.node)
-                return _Target(element=el, description=f"{el.role} {name!r} (text {text!r})", name=name or text, app=app)
+                return self._element_target(_Target(element=el, description=f"{el.role} {name!r} (text {text!r})",
+                                                    name=name or text, app=app), activates)
             assert point is not None
             node = self._safe_element_at(point)
             apps = self._point_apps(point, node)
             label = self._node_info(node)[0] if node is not None else ""
             name = text if not label or label == text else f"{text} < {label}"
             return _Target(point=point, description=f"on-screen text {text!r} at ({point.x}, {point.y})", name=name,
-                           app=apps[0] if apps else "", apps=apps)
-        point = self._screen_point(x, y)
+                           app=apps[0] if apps else "", apps=apps, unknown=activates and node is None)
+        return self._point_target(self._screen_point(x, y), f"({x}, {y})", activates=activates)
+
+    def _element_target(self, t: _Target, activates: bool) -> _Target:
+        """``t`` (an element target) judged by what a mouse action on it really reaches.
+
+        The mouse lands at the element's centre, which may lie on a child control:
+        clicking a group/toolbar/pane (or typing into it, which clicks to focus)
+        whose centre is a "Pay now" button presses "Pay now". For ``activates``
+        actions that child's label is added to the policy target and shown in
+        the description.
+        """
+        el = t.element
+        assert el is not None
+        t = dataclasses.replace(t, secret=is_password(el.node))
+        if not activates:
+            return t
+        try:
+            point = el._click_point((0, 0), require=False)
+        except Exception:
+            point = None
+        if point is None:
+            return t
+        hit = self._safe_element_at(point)
+        if hit is None:
+            return t
+        try:
+            if hit.same_as(el.node) or not any(a.same_as(el.node) for a in ancestors(hit)):
+                return t  # the element itself, or something covering it (Element refuses to click that)
+        except Exception:
+            return t
+        label = self._node_info(hit)[0]
+        if not label or label in t.name:
+            return t
+        try:
+            role = str(hit.role or "element")
+        except Exception:
+            role = "element"
+        return dataclasses.replace(
+            t,
+            name=f"{t.name} > {label}" if t.name else label,
+            description=f"{t.description} (the mouse lands on its child {role} {label!r})",
+        )
+
+    def _point_target(self, point: Point, description: str, *, activates: bool = False) -> _Target:
+        """A screen point as a policy target: the hit-tested element's label and every app there.
+
+        ``activates``: the action can press what is there (a left click); when
+        nothing can be hit-tested the target is marked unknown (``Policy(unknown_target=...)``).
+        """
         node = self._safe_element_at(point)
         name = self._node_info(node)[0] if node is not None else ""
         apps = self._point_apps(point, node)
-        desc = f"({x}, {y})" + (f" on {node.role} {name!r}" if node is not None and name else "")
-        return _Target(point=point, description=desc, name=name, app=apps[0] if apps else "", apps=apps)
+        desc = description + (f" on {node.role} {name!r}" if node is not None and name else "")
+        return _Target(point=point, description=desc, name=name, app=apps[0] if apps else "", apps=apps,
+                       unknown=activates and node is None)
 
     def _safe_element_at(self, point: Point) -> Any:
         try:
@@ -832,6 +1096,8 @@ class DesktopToolkit:
                 ctx["point"] = p
             if t.element is not None and isinstance(t.element.selector, str):
                 ctx["selector"] = t.element.selector
+            if t.unknown:
+                ctx["target_unknown"] = True
         ctx.update({k: v for k, v in extra.items() if v is not None})
         return ctx
 
@@ -845,6 +1111,21 @@ class DesktopToolkit:
         out = action()
         text = out if isinstance(out, str) and out else description[0].upper() + description[1:] + "."
         return ToolResult(text + self._feedback_text())
+
+    def _recheck_focus(self, tool: str, args: Dict[str, Any], activates: bool, description: str, *, enter: bool = False,
+                       activating: Optional[bool] = None, **extra: Any) -> None:
+        """Re-run the policy for the next part of a keyboard call after focus may have moved.
+
+        ``press_keys(["tab", "enter"])`` or typed ``"1000\t\n"`` checked only against
+        the control focused *before* the call would press Enter on whatever the Tab
+        reached (a "Pay" button) unchecked. Not counted against the action budget.
+        """
+        ctx = self._context(self._focus_target(activates, enter, activating=activating), **extra)
+        ctx["description"] = description
+        try:
+            self.policy.check(tool, {k: v for k, v in args.items() if v is not None}, context=ctx, count=False)
+        except PolicyViolation as exc:
+            raise PolicyViolation(f"{exc} (the input before it in this call was already sent)") from None
 
     def _feedback_text(self) -> str:
         if not self.feedback:
@@ -861,7 +1142,7 @@ class DesktopToolkit:
             if node is not None:
                 from ..selectors import describe_node
 
-                parts.append("focus: " + describe_node(node, include_bounds=False))
+                parts.append("focus: " + describe_node(_MaskedValue(node) if is_password(node) else node, include_bounds=False))
         except Exception:
             pass
         return (" [" + "; ".join(parts) + "]") if parts else ""
@@ -911,7 +1192,7 @@ class DesktopToolkit:
         button = (button or "left").lower()
         if button not in ("left", "right", "middle"):
             raise ValueError("button must be left, right or middle")
-        t = self._target(element_id, x, y, selector, text)
+        t = self._target(element_id, x, y, selector, text, activates=button == "left")
         verb = {1: "click", 2: "double-click", 3: "triple-click"}[clicks]
         if button != "left":
             verb = f"{button}-{verb}"
@@ -1017,36 +1298,61 @@ class DesktopToolkit:
             clear: Replace the field's existing content instead of appending.
             press_enter: Press Enter after typing.
         """
-        t = self._target(element_id, None, None, selector, None, required=False)
+        # The field may be clicked to focus it: judged like a click on it.
+        t = self._target(element_id, None, None, selector, None, required=False, activates=True)
         where = f" into {t.description}" if t.element is not None else ""
-        shown = text if len(text) <= 60 else text[:57] + "..."
+        # Enter typed into the first control (before any Tab) may submit its form's default button.
+        first = split_typed_text(text)[:1]
+        keys_in_text = any(c in text for c in "\t\n\r")
+        enter_here = (bool(first) and _has_newline(first[0])) or (press_enter and not keys_in_text)
+        focus = None
+        if t.element is None:
+            focus = self._focus_target(True, enter_here, activating=(bool(first) and typed_text_activates(first[0]))
+                                       or (press_enter and not keys_in_text))
+        secret = t.secret or (focus is not None and focus.secret)
+        if secret:
+            self._redact("text")
+        shown = _REDACTED if secret else text if len(text) <= 60 else text[:57] + "..."
         description = f"type {shown!r}{where}" + (" (replacing its content)" if clear else "") + (" and press Enter" if press_enter else "")
         args = {"text": text, "element_id": element_id, "selector": selector, "clear": clear, "press_enter": press_enter}
 
         def run() -> str:
+            # Text after a Tab/newline may land in another control: each such piece
+            # (and the final Enter) is checked against the element focused by then.
+            pieces = split_typed_text(text)
             if t.element is not None:
-                if clear:
+                if clear and not keys_in_text:
                     t.element.set_text(text)
                 else:
-                    t.element.type(text)
+                    if clear:
+                        t.element.set_text("")
+                    if pieces:
+                        t.element.type(pieces[0])
             else:
                 if clear:
                     self.desktop.hotkey("mod+a")
                     self.desktop.press("backspace")
-                self.desktop.type(text)
+                if pieces:
+                    self.desktop.type(pieces[0])
+            for piece in pieces[1:]:
+                self._recheck_focus("type_text", args, True, f"type {_REDACTED if secret else piece!r} (part of {shown!r})",
+                                    enter=_has_newline(piece), activating=typed_text_activates(piece))
+                self.desktop.type(piece)
             if press_enter:
+                if keys_in_text:
+                    self._recheck_focus("type_text", args, True, f"press Enter after typing {shown!r}", enter=True)
                 self.desktop.press("enter")
             value = ""
-            if t.element is not None:
+            if t.element is not None and not secret:
                 v = t.element.value
                 if v is not None:
                     value = f" Field value is now {v!r}."
             return f"Typed {shown!r}{where}." + value
 
         if t.element is not None:
-            ctx = self._context(t)
+            ctx = self._context(_with_default_button(t, t.element.node) if enter_here else t)
         else:
-            ctx = self._context(self._focus_target(True))
+            ctx = self._context(focus)
         return self._act("type_text", args, ctx, description, run)
 
     def tool_press_keys(self, keys: List[str], presses: int = 1) -> ToolResult:
@@ -1064,20 +1370,37 @@ class DesktopToolkit:
         if not 1 <= presses <= 50:
             raise ValueError("presses must be between 1 and 50")
         keys = [str(k) for k in keys]
-        from ..keys import parse_hotkey
+        from ..keys import press_actions
 
-        for k in keys:
-            parse_hotkey(k)  # validate before acting
+        # Validate before acting. An item like "tab tab enter" is a sequence (as in
+        # Keyboard.press): split it so every tap gets its own focus re-check.
+        parsed = [parts for k in keys for parts in press_actions(k)]
+        for parts in parsed:
+            check_activation_combo(parts)
         description = f"press {' '.join(keys)}" + (f" x{presses}" if presses > 1 else "")
         activates = keys_activate(keys)
-        focus = self._focus_target(activates)
+        focus = self._focus_target(activates, any(_has_enter(parts) for parts in parsed))
         if activates and focus is not None and focus.name:
             description += f" on {focus.description}"
-        return self._act(
-            "press_keys", {"keys": keys, "presses": presses},
-            self._context(focus, keys=" ".join(keys)), description,
-            lambda: self.desktop.press(*keys, presses=presses),
-        )
+        args = {"keys": keys, "presses": presses}
+        combos = " ".join("+".join(parts) for parts in parsed)
+        pressed = _shortcut_targets(self.desktop, parsed)
+        if pressed:
+            description += f" (presses {', '.join(map(repr, pressed))})"
+
+        def run() -> None:
+            moved = False
+            for _ in range(presses):
+                for parts in parsed:
+                    k = "+".join(parts)
+                    if moved:  # an earlier key may have moved focus: check what this one acts on
+                        self._recheck_focus("press_keys", args, keys_activate([parts]), f"press {k} (part of {' '.join(keys)!r})",
+                                            enter=_has_enter(parts))
+                    self.desktop.press(parts)
+                    moved = moved or keys_may_move_focus(parts)
+
+        return self._act("press_keys", args, self._context(focus, keys=combos, shortcut_targets=pressed or None),
+                         description, run)
 
     def tool_hotkey(self, combo: str) -> ToolResult:
         """Press a keyboard shortcut such as "ctrl+s", "ctrl+shift+t", "alt+tab", "mod+c"
@@ -1088,13 +1411,17 @@ class DesktopToolkit:
         """
         from ..keys import parse_hotkey
 
-        parse_hotkey(combo)
+        parts = parse_hotkey(combo)
+        check_activation_combo(parts)
         activates = keys_activate([combo])
-        focus = self._focus_target(activates)
+        focus = self._focus_target(activates, _has_enter(parts))
         description = f"press {combo}"
         if activates and focus is not None and focus.name:
             description += f" on {focus.description}"
-        ctx = self._context(focus, keys=combo)
+        pressed = _shortcut_targets(self.desktop, [parts])
+        if pressed:
+            description += f" (presses {', '.join(map(repr, pressed))})"
+        ctx = self._context(focus, keys="+".join(parts), shortcut_targets=pressed or None)
         return self._act("hotkey", {"combo": combo}, ctx, description, lambda: self.desktop.hotkey(combo))
 
     def tool_scroll(
@@ -1123,13 +1450,25 @@ class DesktopToolkit:
         if not 1 <= amount <= 50:
             raise ValueError("amount must be between 1 and 50")
         t = self._target(element_id, x, y, selector, None, required=False)
-        point = self._target_point(t)
         dy = amount if direction == "up" else -amount if direction == "down" else 0
         dx = amount if direction == "right" else -amount if direction == "left" else 0
-        description = f"scroll {direction} {amount} notch{'es' if amount != 1 else ''}" + (f" over {t.description}" if point is not None else "")
+        description = f"scroll {direction} {amount} notch{'es' if amount != 1 else ''}"
+        if t.element is None and t.point is None:
+            # The wheel event goes to whatever is under the pointer: judge that point and its app.
+            t = self._point_target(self.desktop.position(), "the mouse position")
+        else:
+            description += f" over {t.description}"
+        point = self._target_point(t)
+        el = t.element
+
+        def run() -> None:
+            if el is not None:
+                el.scroll(dy, dx)  # raises rather than scrolling a window that covers the element
+            else:
+                self.desktop.scroll(dy, dx, at=point)
+
         args = {"direction": direction, "amount": amount, "element_id": element_id, "x": x, "y": y, "selector": selector}
-        return self._act("scroll", args, self._context(t if point is not None else None), description,
-                         lambda: self.desktop.scroll(dy, dx, at=point))
+        return self._act("scroll", args, self._context(t), description, run)
 
     def tool_move_mouse(
         self,
@@ -1151,7 +1490,15 @@ class DesktopToolkit:
         if point is None:
             raise ElementNotFound(f"{t.description} has no position on screen")
         args = {"element_id": element_id, "x": x, "y": y, "selector": selector}
-        return self._act("move_mouse", args, self._context(t), f"move the mouse to {t.description}", lambda: self.desktop.move(point))
+        el = t.element
+
+        def run() -> None:
+            if el is not None:
+                el.hover()  # brings a covered element's window to the front, or raises
+            else:
+                self.desktop.move(point)
+
+        return self._act("move_mouse", args, self._context(t), f"move the mouse to {t.description}", run)
 
     def tool_drag(
         self,
@@ -1191,8 +1538,25 @@ class DesktopToolkit:
             ctx["target"] = f"{s.name} -> {e.name}".strip()
         args = {"start_element_id": start_element_id, "start_x": start_x, "start_y": start_y,
                 "end_element_id": end_element_id, "end_x": end_x, "end_y": end_y}
-        return self._act("drag", args, ctx, f"drag from {s.description} to {e.description}",
-                         lambda: self.desktop.drag(sp, ep, duration=duration))
+
+        def run() -> None:
+            # Element ends are hit-tested like clicks: a window covering one would
+            # otherwise receive the press or the drop instead of the checked element.
+            start = s.element._mouse_point() if s.element is not None else sp
+            end = e.element._mouse_point() if e.element is not None else ep
+            # Bringing the drop target's window forward may have covered the start point.
+            if s.element is not None:
+                covered = s.element._occluded(start)
+            else:
+                covered = e.element is not None and self._point_apps(start, self._safe_element_at(start)) != s.apps
+            if covered:
+                raise ElementNotFound(
+                    f"The drag start {s.description} is covered once {e.description} is in front; "
+                    "refusing to drag from the wrong thing"
+                )
+            self.desktop.drag(start, end, duration=duration)
+
+        return self._act("drag", args, ctx, f"drag from {s.description} to {e.description}", run)
 
     def tool_set_value(self, value: str, element_id: Optional[int] = None, selector: Optional[str] = None) -> ToolResult:
         """Replace the content of a text field (uses the accessibility API when possible, else types).
@@ -1202,14 +1566,27 @@ class DesktopToolkit:
             element_id: Element id of the field from the last observe call.
             selector: Selector of the field.
         """
-        t = self._target(element_id, None, None, selector, None)
+        t = self._target(element_id, None, None, selector, None, activates=True)  # may click to focus it
         assert t.element is not None
         el = t.element
-        shown = value if len(value) <= 60 else value[:57] + "..."
+        if t.secret:
+            self._redact("value")
+        shown = _REDACTED if t.secret else value if len(value) <= 60 else value[:57] + "..."
 
         def run() -> str:
-            el.set_text(value)
-            v = el.value
+            if _has_newline(value) or "\t" in value:
+                # Typed, a Tab would move focus and the newline press whatever control it
+                # reached (unchecked by the policy): only the native set-value path is safe.
+                try:
+                    el.set_text(value, native=True)
+                except NotSupported:
+                    raise ValueError(
+                        f"{t.description} cannot be set natively and the value contains a Tab or newline, which "
+                        "typing would turn into focus moves and key presses; use type_text instead"
+                    ) from None
+            else:
+                el.set_text(value)
+            v = None if t.secret else el.value
             return f"Set {t.description} to {shown!r}." + (f" Value is now {v!r}." if v is not None else "")
 
         args = {"value": value, "element_id": element_id, "selector": selector}
@@ -1273,22 +1650,57 @@ class DesktopToolkit:
         state = (state or "visible").lower()
         sel = selector if selector is not None else f"*:has-text({quote(text or '')})"
         try:
-            el = self.desktop.wait(sel, state=state, timeout=timeout)
-        except (ElementNotFound, PypilotError) as exc:
             if text is not None and state == "visible":
-                try:
-                    m = self.desktop.find_text(text, timeout=timeout)
-                except NotSupported:
-                    m = None
-                if m is not None:
-                    p = self._mapping().to_image(*m.center)
+                # Accessibility tree and OCR are polled together within one deadline
+                # (one after the other would wait up to twice the timeout).
+                found = self._wait_for_text(sel, text, timeout)
+                if isinstance(found, Match):
+                    p = self._mapping().to_image(*found.center)
                     return ToolResult(f"Text {text!r} is visible at ({p.x}, {p.y}).")
+                el = found
+            else:
+                el = self.desktop.wait(sel, state=state, timeout=timeout)
+        except (FailSafeTriggered, PolicyViolation):
+            raise
+        except (ElementNotFound, PypilotError) as exc:
             return ToolResult.error(f"Timed out after {timeout:g}s waiting for {sel!r} to be {state}: {exc}")
         if el is None:
             return ToolResult(f"{sel!r} is gone.")
+        if isinstance(el, Match):  # the selector named an image file
+            p = self._mapping().to_image(*el.center)
+            return ToolResult(f"{sel!r} is visible at ({p.x}, {p.y}).")
         obs = self._ensure_observation()
         entry = obs.add_element(el.node)
         return ToolResult(f"{sel!r} is {state}: " + obs.describe_element(entry))
+
+    def _wait_for_text(self, sel: str, text: str, timeout: float) -> Any:
+        """Poll the accessibility tree (``sel``) and OCR (``text``) until either shows the text.
+
+        Returns the visible :class:`Element` or the OCR :class:`Match`; raises
+        :class:`ActionTimeout` after ``timeout`` seconds.
+        """
+        ocr = [True]
+
+        def probe() -> Any:
+            try:
+                return self.desktop.wait(sel, state="visible", timeout=0)
+            except (FailSafeTriggered, PolicyViolation):
+                raise
+            except PypilotError:
+                pass
+            if ocr[0]:
+                try:
+                    return self.desktop.find_text(text, timeout=0)
+                except NotSupported:
+                    ocr[0] = False  # no OCR engine: keep polling the accessibility tree only
+            return None
+
+        try:
+            return self.desktop.wait_until(probe, timeout, getattr(self.desktop, "poll_interval", 0.1), ignore_exceptions=False)
+        except ActionTimeout:
+            raise ActionTimeout(
+                f"No element or on-screen text matching {text!r} within {timeout:g}s" + ("" if ocr[0] else " (no OCR engine)")
+            ) from None
 
     def tool_list_windows(self) -> ToolResult:
         """List the open top-level windows (front-most first) with their app and position."""

@@ -8,7 +8,7 @@ user spelling variations like ``"Ctrl"``, ``"control"``, ``"⌘"`` or ``"Return"
 from __future__ import annotations
 
 import sys
-from typing import Iterable, List, Sequence, Union
+from typing import Any, Iterable, List, Sequence, Union
 
 # Canonical names. Backends MUST support every name in this set (mapping to the
 # closest native key) plus any single printable character.
@@ -37,7 +37,7 @@ MODIFIERS = frozenset({"ctrl", "shift", "alt", "cmd", "ctrl_r", "shift_r", "alt_
 
 _ALIASES = {
     # modifiers
-    "control": "ctrl", "ctl": "ctrl", "lctrl": "ctrl", "ctrlleft": "ctrl", "leftctrl": "ctrl", "^": "ctrl",
+    "control": "ctrl", "ctl": "ctrl", "lctrl": "ctrl", "ctrlleft": "ctrl", "leftctrl": "ctrl", "⌃": "ctrl",
     "rctrl": "ctrl_r", "ctrlright": "ctrl_r", "rightctrl": "ctrl_r",
     "lshift": "shift", "shiftleft": "shift", "leftshift": "shift",
     "rshift": "shift_r", "shiftright": "shift_r", "rightshift": "shift_r",
@@ -90,6 +90,9 @@ def normalize_key(key: str) -> str:
     if len(key) == 1:
         return key
     k = key.strip().lower().replace("-", "_").replace(" ", "")
+    if k.startswith("_") or k.endswith("_"):
+        # "shift-" / "ctrl_" are not key names; never silently drop the dash
+        raise ValueError(f"Unknown key name: {key!r}")
     if k in KEYS:
         return k
     if k in _ALIASES:
@@ -115,9 +118,11 @@ def parse_hotkey(combo: Union[str, Sequence[str]]) -> List[str]:
     """
     if isinstance(combo, str):
         if combo.strip() == "":
-            if combo:
+            if combo and set(combo) == {" "}:
                 return ["space"]
-            raise ValueError("Empty hotkey")
+            if len(combo) == 1:
+                return [normalize_key(combo)]  # "\n"/"\r" -> enter, "\t" -> tab
+            raise ValueError(f"Empty hotkey: {combo!r}")
         s = combo.strip()
         if len(s) == 1:
             parts = [s]
@@ -125,7 +130,10 @@ def parse_hotkey(combo: Union[str, Sequence[str]]) -> List[str]:
             raw = combo.lstrip().split("+")
             parts = []
             for i, p in enumerate(raw):
-                if p == " " and i == len(raw) - 1 and i > 0 and raw[i - 1].strip():
+                if p in ("\n", "\r", "\t"):
+                    # "ctrl+\n" -> ctrl+enter, "alt+\t" -> alt+tab
+                    parts.append(p)
+                elif p == " " and i == len(raw) - 1 and i > 0 and raw[i - 1].strip():
                     # "ctrl+ " -> ctrl+space (the trailing space *is* the key)
                     parts.append(" ")
                 elif p.strip() == "":
@@ -134,6 +142,9 @@ def parse_hotkey(combo: Union[str, Sequence[str]]) -> List[str]:
                         parts.append("+")
                 else:
                     parts.append(p.strip())
+        elif len(s) > 2 and s.endswith("--") and not s.startswith("-") and " " not in s:
+            # "ctrl--" / "ctrl-shift--" -> [..., "-"], mirroring "ctrl++"
+            parts = s[:-2].split("-") + ["-"]
         elif " " in s or ("-" in s and not s.startswith("-") and not s.endswith("-")):
             # "ctrl alt del" / "Ctrl-Alt-Del" are combos, but "Page Down" /
             # "caps-lock" are single multi-word key names: split first and fall
@@ -163,7 +174,64 @@ def parse_hotkey(combo: Union[str, Sequence[str]]) -> List[str]:
             out.append("-")
         else:
             out.append(normalize_key(p if len(p) == 1 else p.strip()))
-    return out
+    return lower_combo_letters(out)
+
+
+def lower_combo_letters(keys: List[str]) -> List[str]:
+    """Lowercase single letters in a multi-key combination that contains a modifier.
+
+    Shortcuts are often written the way menus display them (``"Ctrl+S"``);
+    keeping the uppercase ``"S"`` would make backends add an implicit Shift and
+    send Ctrl+Shift+S. Shift is only pressed when the combo names it. A lone
+    key (``press("A")``) keeps its case so it still types ``A``.
+    """
+    if len(keys) > 1 and any(k in MODIFIERS for k in keys):
+        return [k.lower() if len(k) == 1 and k.isalpha() and len(k.lower()) == 1 else k for k in keys]
+    return keys
+
+
+def check_combo(keys: Sequence[str], spec: Any = None) -> List[str]:
+    """Reject a combination that names the same (non-modifier) key twice.
+
+    A key cannot be held down twice: ``"tab+tab"`` used to press Tab once.
+    Returns ``keys`` unchanged.
+    """
+    seen = set()
+    for k in keys:
+        if k in seen and k not in MODIFIERS:
+            raise ValueError(
+                f"Key {k!r} appears twice in the combination {spec if spec is not None else '+'.join(keys)!r}; "
+                f"to press keys one after another use press({k!r}, {k!r}) or presses="
+            )
+        seen.add(k)
+    return list(keys)
+
+
+def press_actions(spec: Union[str, Sequence[str]]) -> List[List[str]]:
+    """How ``Keyboard.press`` performs one argument: a list of taps/chords, in order.
+
+    * ``"enter"`` -> ``[["enter"]]``; ``"ctrl+c"`` / ``["ctrl", "c"]`` /
+      ``"ctrl alt del"`` -> one chord;
+    * a space- or dash-separated string of several keys without modifiers is
+      a *sequence*: ``"tab tab enter"`` -> ``[["tab"], ["tab"], ["enter"]]``;
+    * ambiguous strings (``"shift tab tab"``) and chords naming a key twice
+      (``"tab+tab"``) raise ``ValueError`` instead of silently pressing
+      something else.
+    """
+    if isinstance(spec, str):
+        parsed = parse_hotkey(spec)
+        if len(parsed) == 1:
+            return [parsed]
+        main = [k for k in parsed if k not in MODIFIERS]
+        if "+" not in spec.strip() and len(main) > 1:
+            if len(main) == len(parsed):
+                return [[k] for k in parsed]
+            raise ValueError(
+                f"{spec!r} names several keys and modifiers; write a combination with '+' "
+                "(\"ctrl+shift+tab\") or pass the keys separately (press(\"shift+tab\", \"tab\"))"
+            )
+        return [check_combo(parsed, spec)]
+    return [check_combo(parse_hotkey(list(spec)), list(spec))]
 
 
 # US-layout characters that require shift. Backends that synthesize via

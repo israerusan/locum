@@ -176,6 +176,8 @@ def test_click_variants_drag_move_and_buttons():
     assert {e[1] for e in be.events if e[0] == "down"} >= {"left", "right", "middle"}
     cu.execute("mouse_move", {"coordinate": [10, 20]})
     assert be.mouse_position() == cu.to_screen(10, 20)
+    # Press inside the form: on bare desktop nothing can be hit-tested (an unknown target).
+    cu.execute("mouse_move", {"coordinate": list(cu.to_image(450, 320))})
     be.clear_events()
     cu.execute("left_mouse_down", {})
     cu.execute("left_mouse_up", {})
@@ -203,11 +205,13 @@ def test_scroll_wait_hold():
     slept = []
     d._sleep_fn = slept.append
     assert not cu.execute("wait", {"duration": 1.5}).is_error
+    assert sum(slept) == pytest.approx(1.5)  # slept in abort-aware slices
     assert cu.execute("wait", {"duration": 301}).is_error
     assert cu.execute("wait", {}).is_error
     be.clear_events()
+    slept.clear()
     assert not cu.execute("hold_key", {"text": "shift", "duration": 2}).is_error
-    assert slept == [1.5, 2.0]
+    assert sum(slept) == pytest.approx(2.0)
     assert [e for e in be.events if e[0].startswith("key")] == [("key_down", "shift"), ("key_up", "shift")]
     assert cu.execute("hold_key", {"text": "shift", "duration": 400}).is_error
 

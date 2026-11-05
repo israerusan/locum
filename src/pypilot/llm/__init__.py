@@ -28,7 +28,7 @@ from .agent import (
 from .computer_use import ComputerUseAdapter, map_key, parse_key_combo
 from .mcp_server import MCPServer, serve
 from .observe import Observation, ObservedElement, fit_image_size, observe
-from .safety import DEFAULT_CONFIRM, AuditLog, Policy, console_confirm
+from .safety import CARD_NUMBER, DEFAULT_CONFIRM, DEFAULT_CONFIRM_KEYS, AuditLog, Policy, console_confirm
 from .tools import DesktopToolkit, ToolRegistry, ToolResult, ToolSpec
 
 __all__ = [
@@ -36,8 +36,10 @@ __all__ = [
     "AgentResult",
     "AgentStep",
     "AuditLog",
+    "CARD_NUMBER",
     "ComputerUseAdapter",
     "DEFAULT_CONFIRM",
+    "DEFAULT_CONFIRM_KEYS",
     "DesktopToolkit",
     "LLMClient",
     "MCPServer",

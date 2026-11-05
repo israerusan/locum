@@ -7,7 +7,8 @@ primitives and adds:
 * hotkeys that release keys in reverse order **in a finally block**, so a
   failure halfway through never leaves a modifier stuck down;
 * four text-entry strategies -- ``unicode`` (layout independent injection),
-  ``keys`` (per-character key taps with automatic shift), ``clipboard``
+  ``keys`` (per-character key taps; the backend adds Shift/AltGr as the
+  active layout needs), ``clipboard``
   (paste, with the user's clipboard saved and restored) and ``auto``;
 * bookkeeping of every key this instance holds, so :meth:`Keyboard.release_all`
   can always clean up.
@@ -22,11 +23,18 @@ from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple, Uni
 from .backends.base import CAP_CLIPBOARD, CAP_UNICODE_TYPING
 from .errors import NotSupported
 from .failsafe import FailSafe
-from .keys import SHIFTED_CHARS, char_needs_shift, normalize_key, parse_hotkey, split_text_tokens
+from .keys import check_combo, lower_combo_letters, normalize_key, parse_hotkey, press_actions, split_text_tokens
 
 KeySpec = Union[str, Sequence[str]]
 
 TYPING_MODES = ("auto", "unicode", "keys", "clipboard")
+
+#: Default seconds to wait after a paste before the clipboard is restored, on
+#: backends that cannot tell when the target application has read it.
+DEFAULT_CLIPBOARD_SETTLE = 0.5
+#: Default seconds to wait for the target application to read a paste, on
+#: backends that can tell (X11 with the native clipboard).
+DEFAULT_CLIPBOARD_TIMEOUT = 2.0
 
 # A typing "unit": ("text", s) inject via type_text, ("char", c) key tap with
 # shift handling, ("key", name) canonical key tap, ("paste", s) clipboard paste.
@@ -34,7 +42,7 @@ _Unit = Tuple[str, str]
 
 
 def _is_key_typable(ch: str) -> bool:
-    """Characters that can be reliably produced with US-layout key taps."""
+    """Characters that are typed with key taps by ``auto`` mode on backends without unicode typing."""
     return ch in ("enter", "tab") or (len(ch) == 1 and 32 <= ord(ch) < 127)
 
 
@@ -46,8 +54,15 @@ class Keyboard:
         failsafe: Optional :class:`FailSafe` checked before presses and between typed characters.
         pause: Seconds to sleep after every public action (PyAutoGUI's ``PAUSE``).
         sleep: Sleep function (inject ``lambda s: None`` in tests).
-        clipboard_settle: Seconds to wait after a paste before restoring the
-            clipboard (some apps read the clipboard asynchronously).
+        clipboard_settle: Seconds to wait after a paste before the next paste or
+            restoring the clipboard, when the backend cannot tell whether the
+            target application has read it (Windows, macOS, X11 helper tools).
+            Applications read the clipboard asynchronously: a busy app that reads
+            it after the restore would paste the user's *previous* clipboard.
+        clipboard_timeout: On backends that can tell (X11 native clipboard):
+            seconds to wait for the target application to read the paste. If it
+            has not read it by then the clipboard is **not** restored, so a late
+            paste still inserts the typed text.
     """
 
     def __init__(
@@ -57,12 +72,14 @@ class Keyboard:
         pause: float = 0.0,
         sleep: Callable[[float], Any] = time.sleep,
         *,
-        clipboard_settle: float = 0.05,
+        clipboard_settle: float = DEFAULT_CLIPBOARD_SETTLE,
+        clipboard_timeout: float = DEFAULT_CLIPBOARD_TIMEOUT,
     ):
         self.backend = backend
         self.failsafe = failsafe
         self.pause = float(pause)
         self.clipboard_settle = float(clipboard_settle)
+        self.clipboard_timeout = float(clipboard_timeout)
         self._sleep = sleep
         self._pressed: List[str] = []  # keys held by this instance, in press order
 
@@ -81,16 +98,25 @@ class Keyboard:
         return list(self._pressed)
 
     def _raw_down(self, key: str) -> None:
-        self.backend.key_down(key)
-        if key not in self._pressed:
+        # Record the key *before* the backend call: a KeyboardInterrupt that lands
+        # inside key_down after the press reached the OS (X11 spends most of the call
+        # waiting for the server) must still leave release_all() knowing about it.
+        added = key not in self._pressed
+        if added:
             self._pressed.append(key)
+        try:
+            self.backend.key_down(key)
+        except Exception:
+            if added:  # an ordinary error: the press was not made
+                self._pressed.remove(key)
+            raise
 
     def _raw_up(self, key: str) -> None:
-        try:
-            self.backend.key_up(key)
-        finally:
-            if key in self._pressed:
-                self._pressed.remove(key)
+        # Forget the key only once the backend released it: a key whose release
+        # failed is still down, so release_all() must retry it later.
+        self.backend.key_up(key)
+        if key in self._pressed:
+            self._pressed.remove(key)
 
     def _release_many(self, keys: Sequence[str]) -> Optional[BaseException]:
         """Release ``keys`` in the given order; keep going on errors and return the first one."""
@@ -98,7 +124,7 @@ class Keyboard:
         for k in keys:
             try:
                 self._raw_up(k)
-            except Exception as exc:  # pragma: no cover - backend failure path
+            except Exception as exc:
                 if first is None:
                     first = exc
         return first
@@ -114,20 +140,22 @@ class Keyboard:
                 out.extend(parse_hotkey(list(spec)))
         if not out:
             raise ValueError("No keys given")
-        return out
+        return check_combo(lower_combo_letters(out), keys[0] if len(keys) == 1 else list(keys))
 
     def _tap(self, key: str) -> None:
-        """Tap a canonical key or a character, adding shift for uppercase/shifted symbols."""
-        if len(key) == 1 and char_needs_shift(key) and "shift" not in self._pressed and "shift_r" not in self._pressed:
-            base = SHIFTED_CHARS.get(key, key.lower())
-            self._raw_down("shift")
-            try:
-                self._raw_down(base)
-                self._raw_up(base)
-            finally:
-                self._raw_up("shift")
-            return
-        self._raw_down(key)
+        """Tap a canonical key or a character.
+
+        Characters are passed to the backend as-is: backends map them onto the
+        active keyboard layout and add Shift/AltGr themselves (``"@"`` is
+        Shift+2 on a US layout but AltGr+Q on a German one), honouring CapsLock.
+        """
+        was_held = key in self._pressed
+        try:
+            self._raw_down(key)
+        except BaseException:
+            if not was_held and key in self._pressed:  # interrupted after the press may have been sent
+                self._release_many([key])
+            raise
         self._raw_up(key)
 
     @contextlib.contextmanager
@@ -144,8 +172,11 @@ class Keyboard:
                     continue
                 if i and interval > 0:
                     self._sleep(interval)
-                self._raw_down(k)
-                pressed.append(k)
+                try:
+                    self._raw_down(k)
+                finally:
+                    if k in self._pressed:  # also when interrupted inside the backend call
+                        pressed.append(k)
             yield list(keys)
         finally:
             err = self._release_many(list(reversed(pressed)))
@@ -169,16 +200,16 @@ class Keyboard:
         """Tap each key in sequence, ``presses`` times: ``press("tab", "tab", "enter")``.
 
         An argument that is a combo (``"ctrl+c"``) or a list (``["ctrl", "c"]``)
-        is performed as a hotkey. Uppercase letters and shifted symbols get shift
-        automatically. ``interval`` seconds are waited between taps.
+        is performed as a hotkey. A string of several keys without modifiers
+        (``"tab tab enter"``) is tapped in sequence; ambiguous strings
+        (``"shift tab tab"``) and combos naming a key twice raise ``ValueError``.
+        Uppercase letters and shifted symbols get shift automatically.
+        ``interval`` seconds are waited between taps.
         """
         actions: List[Union[str, List[str]]] = []
         for spec in keys:
-            if isinstance(spec, str):
-                parsed = parse_hotkey(spec)
+            for parsed in press_actions(spec if isinstance(spec, str) else list(spec)):
                 actions.append(parsed[0] if len(parsed) == 1 else parsed)
-            else:
-                actions.append(parse_hotkey(list(spec)))
         if not actions:
             raise ValueError("press() needs at least one key")
         presses = int(presses)
@@ -219,9 +250,15 @@ class Keyboard:
         self._pause()
 
     def release_all(self) -> List[str]:
-        """Release every key this instance holds (reverse press order). Returns the released keys."""
+        """Release every key this instance holds (reverse press order). Returns the released keys.
+
+        Every key is attempted; if a release fails the key stays recorded (so a
+        later call retries it) and the first error is raised afterwards.
+        """
         keys = list(reversed(self._pressed))
-        self._release_many(keys)
+        err = self._release_many(keys)
+        if err is not None:
+            raise err
         return keys
 
     # --------------------------------------------------------------------- typing
@@ -232,8 +269,8 @@ class Keyboard:
             text: The text; ``\\n`` presses Enter and ``\\t`` presses Tab (except in clipboard mode,
                 where text is pasted verbatim).
             interval: Seconds between characters.
-            mode: ``"unicode"`` (backend unicode injection), ``"keys"`` (per-character key taps,
-                shift added for uppercase/shifted symbols), ``"clipboard"`` (paste via ``mod+v``,
+            mode: ``"unicode"`` (backend unicode injection), ``"keys"`` (per-character key taps;
+                the backend adds Shift/AltGr as the active layout needs), ``"clipboard"`` (paste via ``mod+v``,
                 restoring the previous clipboard), or ``"auto"`` (unicode when the backend supports
                 it; otherwise key taps for ASCII and clipboard paste for other characters).
         """
@@ -295,10 +332,37 @@ class Keyboard:
             units.append(("paste", "".join(pending)))
         return units
 
+    def _await_paste(self, since: float) -> bool:
+        """Wait until the target app has (presumably) read the paste. False: it has not read it yet."""
+        wait = getattr(self.backend, "wait_clipboard_read", None)  # optional for duck-typed backends
+        try:
+            read = wait(since, self.clipboard_timeout) if wait is not None else None
+        except NotSupported:
+            read = None
+        if read is None:  # the backend cannot tell: give the app a fixed time
+            if self.clipboard_settle > 0:
+                self._sleep(self.clipboard_settle)
+            return True
+        return bool(read)
+
+    def _save_clipboard(self) -> Any:
+        """Snapshot the user's clipboard (every format where the backend can, else its text)."""
+        save = getattr(self.backend, "save_clipboard", None)
+        return save() if callable(save) else self.backend.get_clipboard()
+
+    def _restore_clipboard(self, saved: Any) -> None:
+        restore = getattr(self.backend, "restore_clipboard", None)
+        if callable(restore):
+            restore(saved)
+        else:
+            self.backend.set_clipboard(saved if saved is not None else "")
+
     def _run_units(self, units: Sequence[_Unit], interval: float, *, first: bool) -> None:
-        saved: Optional[str] = None
+        saved: Any = None
         saved_ok = False
         pasted = False
+        settled = True  # the last paste was waited for
+        restore = True  # False: the app has not read the last paste, keep it on the clipboard
         try:
             for i, (kind, value) in enumerate(units):
                 if (i or not first) and interval > 0:
@@ -313,23 +377,28 @@ class Keyboard:
                 elif kind == "paste":
                     if not pasted:
                         try:
-                            saved, saved_ok = self.backend.get_clipboard(), True
+                            saved, saved_ok = self._save_clipboard(), True
                         except NotSupported:
                             saved_ok = False
                     self.backend.set_clipboard(value)
-                    pasted = True
+                    pasted, settled, restore = True, False, True
+                    since = time.monotonic()
                     with self._held(parse_hotkey("mod+v")):
                         pass
+                    # Before the next paste or the restore replaces it, the app must
+                    # have read this text, or it would paste other data.
+                    restore = self._await_paste(since)
+                    settled = True
                 else:  # pragma: no cover - internal invariant
                     raise AssertionError(kind)
         finally:
-            if pasted and saved_ok:
-                if self.clipboard_settle > 0:
+            if pasted and saved_ok and restore:
+                if not settled and self.clipboard_settle > 0:  # failed mid-paste: mod+v may still be read
                     self._sleep(self.clipboard_settle)
-                self.backend.set_clipboard(saved if saved is not None else "")
+                self._restore_clipboard(saved)
 
     def __repr__(self) -> str:
         return f"<Keyboard backend={getattr(self.backend, 'name', '?')} pressed={self._pressed}>"
 
 
-__all__ = ["Keyboard", "TYPING_MODES"]
+__all__ = ["DEFAULT_CLIPBOARD_SETTLE", "DEFAULT_CLIPBOARD_TIMEOUT", "Keyboard", "TYPING_MODES"]

@@ -62,7 +62,8 @@ from pypilot.cli import DemoBackend
 d = Desktop(DemoBackend())          # Desktop() drives your real screen instead
 
 form = d.window("Invoice Entry*")   # exact title, substring, glob or regex
-form.find("edit#vendor").set_text("ACME Corp")       # native set-value, falls back to typing
+form.find("edit#vendor").set_text("ACME Corp")       # native set-value, falls back to typing;
+                                                     # read back: refused/truncated input raises
 form.find('edit "Invoice No"').set_text("INV-42")
 form.find("edit#amount").set_text("1250.00")
 d.click('button "Save"')                             # selector -> element -> click
@@ -99,12 +100,12 @@ assert [c.name for c in cells] == ["A1", "B1", "C1", "D1", "E1"]
 
 from pypilot import selector_for
 el = d.element_at(370, 171)                                     # what is under this point?
-print(selector_for(el.node))                                    # window "Invoice Entry - ERP" edit#amount
+print(selector_for(el.node, roots=d.roots()))                   # window "Invoice Entry - ERP" edit#amount
 print(d.tree(window="Invoice Entry*", interactive_only=True))   # readable tree dump
 ```
 
 Operators: `=` `!=` `*=` `^=` `$=` `~=` (regex) `%=` (glob), `i` flag for
-case-insensitive; pseudo-classes `:enabled :visible :focused :checked
+case-insensitive; pseudo-classes `:enabled :visible :focused :checked :unchecked :mixed
 :has-text() :has() :not() :nth() :first :last`. Every lookup waits up to
 `default_timeout` and failures say what *was* there:
 `No element matching 'button "Sav"'; did you mean: button "Save" #save`.
@@ -163,21 +164,37 @@ into a screen corner raises `FailSafeTriggered`; `pypilot.install_kill_hotkey()`
 ### RPA: robots, work queues, flows, recorder
 
 ```python
+import re
+from pypilot import FailSafeTriggered
 from pypilot.rpa import BusinessException, Robot, WorkQueue
 
 robot = Robot(d, name="invoices", run_dir="pypilot_runs")
 queue = WorkQueue("invoices", path="pypilot_runs/invoices.queue.json")   # persistent: runs resume
-queue.add({"vendor": "Initech", "invoice_no": "INV-43", "amount": "75"}, reference="INV-43")
-queue.add({"vendor": "Umbrella", "invoice_no": "INV-44", "amount": "-1"}, reference="INV-44")
+queue.add({"vendor": "Initech", "invoice_no": "INV-43", "amount": "75"}, reference="Initech|INV-43")
+queue.add({"vendor": "Umbrella", "invoice_no": "INV-44", "amount": "-1"}, reference="Umbrella|INV-44")
 
 def enter_invoice(item):
-    if float(item["amount"]) <= 0:
-        raise BusinessException("amount must be positive")      # recorded, never retried
-    d.find("edit#vendor").set_text(item["vendor"])
+    if not re.fullmatch(r"\d+(\.\d{1,2})?", item["amount"]) or float(item["amount"]) <= 0:
+        raise BusinessException(f"invalid amount {item['amount']!r}")   # recorded, never retried
+    d.click('button "Clear"')                               # known state: status "Cleared"
+    d.find("edit#vendor").set_text(item["vendor"])          # errors up to here are retried
     d.find("edit#invoice_no").set_text(item["invoice_no"])
     d.find("edit#amount").set_text(item["amount"])
+
+    def answered():                                         # the old status is still on screen
+        status = d.find("text#status").text
+        return status if status not in ("", "Cleared") else None
+
     d.click('button "Save"')
-    return {"status": d.find("text#status").text}
+    try:                                                    # after Save, a retry could post twice
+        status = d.wait_until(answered, timeout=10)
+    except FailSafeTriggered:
+        raise                                               # the operator stopped the robot
+    except Exception as exc:
+        raise BusinessException(f"needs review: no answer after Save ({exc})") from exc
+    if status.lower().startswith("error"):
+        raise BusinessException(status)                     # rejected by the app: never "success"
+    return {"status": status}
 
 @robot.task(retries=1)
 def process():
@@ -256,11 +273,11 @@ Details, prompting tips and the safety model: [`docs/LLM.md`](docs/LLM.md).
 ### Safety policy
 
 ```python
-from pypilot.llm import Policy
+from pypilot.llm import CARD_NUMBER, Policy
 
 policy = Policy(
-    allowed_apps=["erp", "excel"],              # act only inside these apps
-    deny_text_patterns=[r"\b(?:\d[ -]?){13,19}\b"],   # never type card numbers
+    allowed_apps=["erp", "excel"],              # act (and launch) only inside these apps
+    deny_text_patterns=[CARD_NUMBER],           # never type card numbers (Luhn-checked; IBANs pass)
     confirm=lambda description, details: input(f"Allow {description}? [y/N] ") == "y",
     max_actions=200, max_actions_per_minute=30,
     region=(0, 0, 1920, 1080),                  # pointer must stay in this rectangle
@@ -270,8 +287,11 @@ strict = Policy.strict()                        # no launching/clipboard, shells
 ```
 
 By default anything that looks like it commits money or data — *pay, transfer,
-wire, submit, send, delete, approve, post, purchase, …* — needs a human
-`confirm`; without a callback it is **blocked**.
+wire, submit, send, delete, approve, post, purchase, release, …* (plurals and the
+German SAP labels such as *Buchen*, *Überweisen* included) — needs a human
+`confirm`; without a callback it is **blocked**. So does a click or Enter whose
+target cannot be identified (`unknown_target="confirm"`; `"block"`/`"allow"`).
+Text typed into password fields is masked in audit logs and recordings.
 
 ### PyAutoGUI compatibility
 
@@ -316,7 +336,7 @@ plain Python. Full write-up: [`docs/COMPARISON.md`](docs/COMPARISON.md).
 
 | Platform | Input | Screenshots | Windows | Accessibility | Notes |
 |----------|-------|-------------|---------|---------------|-------|
-| Windows 10/11 | SendInput (Unicode, DPI-aware, multi-monitor) | mss / GDI | Win32 | **UI Automation** (comtypes) | run as the same integrity level as the target app (UAC) |
+| Windows 10/11 | SendInput (Unicode, DPI-aware, multi-monitor) | mss / GDI | Win32 | **UI Automation** (comtypes) | run as the same integrity level as the target app (UAC); text pypilot puts on the clipboard is kept out of Clipboard History (Win+V) and cloud sync (`WindowsBackend(clipboard_history=True)` allows it) |
 | macOS 12+ | Quartz events | Quartz (Retina-aware) | Quartz / AppKit | **AX API** | needs Accessibility + Screen Recording permission |
 | Linux X11 | XTEST (Unicode via spare keycodes) | mss / XGetImage | EWMH | **AT-SPI** (PyGObject) | native X11 clipboard (xclip/xsel optional) |
 | Linux Wayland | XWayland apps only | XWayland only | XWayland only | AT-SPI works | see below |

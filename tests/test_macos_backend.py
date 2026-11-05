@@ -1268,3 +1268,345 @@ def test_launch_uses_open_for_app_names(monkeypatch):
     be.launch("Safari")
     be.launch("/Applications/Calculator.app")
     assert calls == [["open", "-a", "Safari"], ["open", "-a", "/Applications/Calculator.app"]]
+
+
+# =============================================================================
+# review regressions: live front-most app, window pairing, minimized windows,
+# activation, zoom, launch, keyboard layout off the main thread, modified keys
+# =============================================================================
+
+
+def test_frontmost_app_is_read_live_not_from_stale_appkit():
+    from pypilot import Desktop
+    from pypilot.llm.safety import Policy
+    from pypilot.llm.tools import DesktopToolkit
+
+    claude, term = FakeRunningApp(100, "Claude"), FakeRunningApp(200, "Terminal")
+    be, q, appkit = make_backend(apps=[claude, term])
+    appkit.front = claude  # NSWorkspace snapshot: never refreshed without a run loop
+    q.windows = [_rec(2, 200, 100, 50, 600, 400, "zsh", owner="Terminal"),
+                 _rec(1, 100, 0, 25, 1440, 875, "Claude", owner="Claude")]
+    assert be.active_window().app == "Terminal"
+    tk = DesktopToolkit(Desktop(be, failsafe=False), policy=Policy.strict())
+    res = tk.registry.call("type_text", {"text": "echo pwned"})
+    assert res.is_error and "Terminal" in res.text
+    assert not [e for e in q.posted if e.kind == "key"]
+    # the system-wide AX focused application wins over everything else
+    ax = FakeAX()
+    ax.apps[100] = FakeEl(pid=100, AXRole="AXApplication", AXWindows=[])
+    ax.apps[200] = FakeEl(pid=200, AXRole="AXApplication", AXWindows=[])
+    be2, q2, appkit2 = make_backend(ax=ax, apps=[claude, term])
+    q2.windows = list(q.windows)
+    ax.system_wide.attrs["AXFocusedApplication"] = ax.apps[100]
+    assert be2._frontmost_pid() == 100
+    # with a serviceable run loop on the main thread, AppKit is refreshed and trusted
+    be3, q3, appkit3 = make_backend(apps=[claude, term])
+    q3.windows = list(q.windows)
+    pumped = []
+
+    def run_in_mode(mode, seconds, once):
+        pumped.append(mode)
+        appkit3.front = claude
+        return 3  # kCFRunLoopRunTimedOut
+
+    appkit3.CFRunLoopRunInMode, appkit3.kCFRunLoopDefaultMode = run_in_mode, "kCFRunLoopDefaultMode"
+    appkit3.front = term
+    assert be3._frontmost_pid() == 100 and pumped
+
+
+def test_apps_launched_after_start_get_accessibility_roots():
+    ax = FakeAX()
+    old_win = FakeEl(pid=100, AXRole="AXWindow", AXTitle="Old", AXPosition=(0.0, 25.0), AXSize=(400.0, 300.0))
+    new_win = FakeEl(pid=300, AXRole="AXWindow", AXTitle="Ledger", AXPosition=(500.0, 25.0), AXSize=(400.0, 300.0))
+    ax.apps[100] = FakeEl(pid=100, AXRole="AXApplication", AXWindows=[old_win])
+    ax.apps[300] = FakeEl(pid=300, AXRole="AXApplication", AXWindows=[new_win])
+    old, new = FakeRunningApp(100, "TextEdit"), FakeRunningApp(300, "Microsoft Excel")
+    be, q, appkit = make_backend(ax=ax, apps=[old, new])
+    snapshot = SimpleNamespace(frontmostApplication=lambda: old, runningApplications=lambda: [old])
+    appkit.NSWorkspace = SimpleNamespace(sharedWorkspace=lambda: snapshot)  # stale: Excel missing
+    q.windows = [_rec(5, 300, 500, 25, 400, 300, "Ledger", owner="Microsoft Excel"),
+                 _rec(4, 100, 0, 25, 400, 300, "Old", owner="TextEdit")]
+    roots = be.accessibility_roots()
+    assert [(r.name, r.handle, r.app) for r in roots] == [("Ledger", 5, "Microsoft Excel"), ("Old", 4, "TextEdit")]
+
+
+def test_pair_ax_windows_is_one_to_one():
+    pair = macos.pair_ax_windows
+    recs = [_rec(11, 1, 0, 25, 1440, 875, "Payments.xlsx"), _rec(12, 1, 0, 25, 1440, 875, "Budget.xlsx")]
+    full = (0.0, 25.0, 1440.0, 875.0)
+    assert pair(recs, [(full, "Payments.xlsx", None), (full, "Budget.xlsx", None)]) == {0: 11, 1: 12}
+    assert pair(recs, [(full, "Budget.xlsx", None), (full, "Payments.xlsx", None)]) == {0: 12, 1: 11}
+    untitled = [_rec(11, 1, 0, 25, 1440, 875), _rec(12, 1, 0, 25, 1440, 875)]
+    assert pair(untitled, [(full, "Payments.xlsx", None), (full, "Budget.xlsx", None)]) == {}  # ambiguous
+    assert pair(untitled, [(full, "Payments.xlsx", 12), (full, "Budget.xlsx", None)]) == {0: 12, 1: 11}
+    # a panel without an AX counterpart is never given the document window
+    panel = [_rec(11, 1, 0, 25, 1440, 875, "Payments.xlsx"), _rec(12, 1, 900, 300, 250, 400, "Formula Builder")]
+    assert pair(panel, [(full, "Payments.xlsx", None)]) == {0: 11}
+    assert pair(panel[1:], [(full, "Payments.xlsx", None)]) == {}
+    # a single window that is moving (frame mismatch) still pairs when titles do not conflict
+    assert pair([_rec(11, 1, 10, 25, 1440, 875)], [(full, "Payments.xlsx", None)]) == {0: 11}
+
+
+def _two_workbooks(window_ids=False):
+    ax = FakeAX()
+    pay = FakeEl(pid=100, AXRole="AXWindow", AXTitle="Payments.xlsx", AXPosition=(0.0, 25.0),
+                 AXSize=(1440.0, 875.0), actions=["AXRaise"], settable={"AXMain", "AXMinimized"})
+    bud = FakeEl(pid=100, AXRole="AXWindow", AXTitle="Budget.xlsx", AXPosition=(0.0, 25.0),
+                 AXSize=(1440.0, 875.0), actions=["AXRaise"], settable={"AXMain", "AXMinimized"})
+    for el in (pay, bud):
+        el.attrs["AXCloseButton"] = FakeEl(actions=["AXPress"])
+    ax.apps[100] = FakeEl(pid=100, AXRole="AXApplication", AXWindows=[pay, bud])
+    if window_ids:
+        ids = {id(pay): 11, id(bud): 12}
+        ax.window_id = lambda el: ids.get(id(el))
+    be, q, appkit = make_backend(ax=ax, apps=[FakeRunningApp(100, "Microsoft Excel")])
+    return be, q, ax, pay, bud
+
+
+def test_windows_with_the_same_frame_are_told_apart():
+    be, q, ax, pay, bud = _two_workbooks()
+    q.windows = [_rec(11, 100, 0, 25, 1440, 875, "Payments.xlsx", owner="Microsoft Excel"),
+                 _rec(12, 100, 0, 25, 1440, 875, "Budget.xlsx", owner="Microsoft Excel")]
+    be.close_window(12)
+    assert bud.attrs["AXCloseButton"].performed == ["AXPress"] and not pay.attrs["AXCloseButton"].performed
+    be.set_window_state(12, "minimized")
+    assert bud.attrs.get("AXMinimized") is True and not pay.attrs.get("AXMinimized")
+    # without Screen Recording (no CG titles) the pairing is ambiguous: never guess
+    q.windows = [_rec(11, 100, 0, 25, 1440, 875, "", owner="Microsoft Excel"),
+                 _rec(12, 100, 0, 25, 1440, 875, "", owner="Microsoft Excel")]
+    bud.attrs["AXMinimized"] = False
+    assert [w.title for w in be.list_windows()] == ["", ""]
+    assert [r.handle for r in be.accessibility_roots()] == [None, None]
+    with pytest.raises(WindowNotFound):
+        be.close_window(11)
+    assert not pay.attrs["AXCloseButton"].performed
+    # with exact window ids (_AXUIElementGetWindow) every window is resolved
+    be, q, ax, pay, bud = _two_workbooks(window_ids=True)
+    q.windows = [_rec(11, 100, 0, 25, 1440, 875, "", owner="Microsoft Excel"),
+                 _rec(12, 100, 0, 25, 1440, 875, "", owner="Microsoft Excel")]
+    assert [(w.handle, w.title) for w in be.list_windows()] == [(11, "Payments.xlsx"), (12, "Budget.xlsx")]
+    assert sorted((r.name, r.handle) for r in be.accessibility_roots()) == [("Budget.xlsx", 12), ("Payments.xlsx", 11)]
+    be.close_window(12)
+    assert bud.attrs["AXCloseButton"].performed and not pay.attrs["AXCloseButton"].performed
+
+
+def test_window_without_ax_counterpart_is_not_resolved_to_the_only_ax_window():
+    ax = FakeAX()
+    main = FakeEl(pid=100, AXRole="AXWindow", AXTitle="Payments.xlsx", AXPosition=(0.0, 25.0), AXSize=(1440.0, 875.0))
+    main.attrs["AXCloseButton"] = FakeEl(actions=["AXPress"])
+    ax.apps[100] = FakeEl(pid=100, AXRole="AXApplication", AXWindows=[main])
+    be, q, _ = make_backend(ax=ax, apps=[FakeRunningApp(100, "Microsoft Excel")])
+    q.windows = [_rec(11, 100, 0, 25, 1440, 875, "Payments.xlsx", owner="Microsoft Excel"),
+                 _rec(12, 100, 900, 300, 250, 400, "Formula Builder", owner="Microsoft Excel")]
+    with pytest.raises(WindowNotFound):
+        be.close_window(12)
+    assert main.attrs["AXCloseButton"].performed == []
+    be.close_window(11)
+    assert main.attrs["AXCloseButton"].performed == ["AXPress"]
+
+
+def test_minimized_windows_are_listed():
+    from pypilot import Desktop
+    from pypilot.errors import ActionTimeout
+
+    ax = FakeAX()
+    win = FakeEl(pid=100, AXRole="AXWindow", AXTitle="Budget.xlsx", AXPosition=(100.0, 50.0), AXSize=(400.0, 300.0),
+                 AXMinimized=False, actions=["AXRaise"], settable={"AXMain", "AXMinimized"})
+    ax.apps[100] = FakeEl(pid=100, AXRole="AXApplication", AXWindows=[win])
+    be, q, appkit = make_backend(ax=ax, apps=[FakeRunningApp(100, "Microsoft Excel")])
+    q.windows = [_rec(7, 100, 100, 50, 400, 300, "Budget.xlsx", owner="Microsoft Excel"),
+                 _rec(8, 100, 0, 0, 300, 200, "", owner="Microsoft Excel")]  # hidden helper window
+    orig = q.CGWindowListCopyWindowInfo
+
+    def real_quartz(options, relative):  # on-screen lists omit minimized windows
+        out = orig(options, relative)
+        if options & macos.kCGWindowListOptionOnScreenOnly:
+            out = [r for r in out if r["kCGWindowNumber"] != 8
+                   and not (r["kCGWindowNumber"] == 7 and win.attrs.get("AXMinimized"))]
+        return out
+
+    q.CGWindowListCopyWindowInfo = real_quartz
+    d = Desktop(be, failsafe=False)
+    w = d.window("Budget.xlsx")
+    w.minimize()
+    infos = be.list_windows()
+    assert [(i.handle, i.is_minimized, i.is_visible) for i in infos] == [(7, True, False)]
+    assert w.exists and w.is_minimized
+    with pytest.raises(ActionTimeout):
+        w.wait_closed(timeout=0.05)
+    d.window("Budget.xlsx", timeout=0.1).restore()
+    assert win.attrs["AXMinimized"] is False
+    assert [(i.handle, i.is_minimized) for i in be.list_windows()] == [(7, False)]
+
+
+def test_activate_window_must_make_the_app_frontmost(monkeypatch):
+    monkeypatch.setattr(MacOSBackend, "ACTIVATE_TIMEOUT", 0.05)
+    be, q, appkit, ax, win = _window_setup()
+    ax.apps[300] = FakeEl(pid=300, AXRole="AXApplication", AXWindows=[])
+    ax.system_wide.attrs["AXFocusedApplication"] = ax.apps[300]  # the bank portal has focus
+    appkit.apps[100].activateWithOptions_ = lambda opts: False   # activation declined
+    with pytest.raises(BackendError, match="pid 100"):
+        be.activate_window(7)
+    # AXFrontmost works where activateWithOptions_ is declined
+    app = ax.apps[100]
+    app.settable.add("AXFrontmost")
+    orig_set = ax.set_attr
+
+    def set_attr(el, name, value):
+        ok = orig_set(el, name, value)
+        if ok and el is app and name == "AXFrontmost":
+            ax.system_wide.attrs["AXFocusedApplication"] = app
+        return ok
+
+    ax.set_attr = set_attr
+    be.activate_window(7)
+    assert app.attrs["AXFrontmost"] is True
+    # activation "succeeds" but another app keeps keyboard focus: raise
+    ax.system_wide.attrs["AXFocusedApplication"] = ax.apps[300]
+    app.settable.discard("AXFrontmost")
+    appkit.apps[100].activateWithOptions_ = lambda opts: True
+    with pytest.raises(BackendError, match="front-most"):
+        be.activate_window(7)
+
+
+def test_restore_unzooms_a_window_maximized_outside_pypilot():
+    class ZoomAX(FakeAX):
+        def perform(self, el, action):
+            ok = super().perform(el, action)
+            if ok and action == "AXZoomWindow":
+                el.owner.attrs.update(AXPosition=(100.0, 50.0), AXSize=(400.0, 300.0))
+            return ok
+
+    ax = ZoomAX()
+    win = FakeEl(pid=100, AXRole="AXWindow", AXTitle="Ledger", AXPosition=(0.0, 25.0), AXSize=(1440.0, 875.0),
+                 settable={"AXPosition", "AXSize", "AXMinimized", "AXMain"})
+    button = FakeEl(AXSubrole="AXFullScreenButton", actions=["AXPress", "AXZoomWindow"])
+    button.owner = win
+    win.attrs["AXZoomButton"] = button
+    ax.apps[100] = FakeEl(pid=100, AXRole="AXApplication", AXWindows=[win])
+    be, q, _ = make_backend(ax=ax)
+    q.windows = [_rec(7, 100, 0, 25, 1440, 875, "Ledger", owner="TextEdit")]
+    assert be.list_windows()[0].is_maximized
+    be.set_window_state(7, "normal")
+    assert button.performed == ["AXZoomWindow"]  # never AXPress: that would enter full screen
+    assert win.attrs["AXSize"] == (400.0, 300.0)
+    # a full-screen button without a zoom action: refuse instead of reporting success
+    win.attrs.update(AXPosition=(0.0, 25.0), AXSize=(1440.0, 875.0))
+    button.actions = ["AXPress"]
+    button.performed.clear()
+    with pytest.raises(BackendError, match="restore"):
+        be.set_window_state(7, "normal")
+    assert button.performed == []
+
+
+def test_launch_opens_app_names_with_spaces(monkeypatch):
+    calls = []
+
+    class FakePopen:
+        def __init__(self, args, **kw):
+            calls.append(args)
+
+    monkeypatch.setattr(macos.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(macos.shutil, "which", lambda name: "/bin/ls" if name == "ls" else None)
+    be, _, _ = make_backend()
+    for cmd in ("Microsoft Excel", " SAP GUI for Java ", "ls -la", "'My Tool' --x"):
+        be.launch(cmd)
+    assert calls == [["open", "-a", "Microsoft Excel"], ["open", "-a", "SAP GUI for Java"],
+                     ["ls", "-la"], ["My Tool", "--x"]]
+
+
+def test_policy_judges_multi_word_app_names_as_a_whole():
+    from pypilot.errors import PolicyViolation
+    from pypilot.llm.safety import Policy
+
+    with pytest.raises(PolicyViolation, match="Google Chrome"):
+        Policy(blocked_apps=["google chrome"]).check("launch_app", {"command": "Google Chrome"}, context={})
+    Policy(allowed_apps=["Microsoft Excel"]).check("launch_app", {"command": "Microsoft Excel"}, context={})
+    with pytest.raises(PolicyViolation):
+        Policy(allowed_apps=["Microsoft Excel"]).check("launch_app", {"command": "Google Chrome"}, context={})
+
+
+def test_keyboard_layout_unknown_off_main_thread_never_guesses_shortcuts():
+    import threading as _t
+
+    q = FakeQuartz()
+    errors: List[BaseException] = []
+    caught: List[Any] = []
+
+    def worker():
+        import warnings as _w
+
+        be = MacOSBackend._from_parts(q, None, None, layout=DisplayLayout([_d(1, 0, 0, 100, 100, 1.0, True)]),
+                                      keyboard_layouts=FakeLayouts(_AZERTY))
+        be._keyboard_map()
+        be.key_down("cmd")
+        try:
+            be.key_down("a")  # US "a" is "q" on AZERTY: Cmd+Q would quit the app
+        except BackendError as exc:
+            errors.append(exc)
+        be.key_up("cmd")
+        be.key_down("enter")  # layout independent keys still work
+        be.key_up("enter")
+        with _w.catch_warnings(record=True) as rec:
+            _w.simplefilter("always")
+            be.key_down("a")
+            be.key_up("a")
+        caught.extend(rec)
+
+    th = _t.Thread(target=worker)
+    th.start()
+    th.join()
+    assert len(errors) == 1 and "main thread" in str(errors[0])
+    downs = [e for e in q.posted if e.kind == "key" and e.etype == macos.kCGEventKeyDown]
+    assert all(not (e.flags & macos.FLAG_COMMAND) for e in downs)
+    assert [(e.code, e.text) for e in downs] == [(0x24, None), (0, "a")]  # "a" injected as text
+    assert any(issubclass(w.category, RuntimeWarning) for w in caught)
+    # once read on the main thread, other threads use the real layout
+    layouts = FakeLayouts(_AZERTY)
+    be = MacOSBackend._from_parts(q, None, None, layout=DisplayLayout([_d(1, 0, 0, 100, 100, 1.0, True)]),
+                                  keyboard_layouts=layouts)
+    be._keyboard_map()
+    q.posted.clear()
+
+    def shortcut():
+        be.key_down("cmd")
+        be.key_down("a")
+        be.key_up("a")
+        be.key_up("cmd")
+
+    th = _t.Thread(target=shortcut)
+    th.start()
+    th.join()
+    assert [e.code for e in q.posted if e.kind == "key" and e.etype == macos.kCGEventKeyDown] == [0x0C]
+
+
+def test_modified_keys_never_fall_back_to_keycode_zero():
+    def press(layouts, mod, key):
+        q = FakeQuartz()
+        be = MacOSBackend._from_parts(q, None, None, layout=DisplayLayout([_d(1, 0, 0, 100, 100, 1.0, True)]),
+                                      keyboard_layouts=layouts)
+        be.key_down(mod)
+        try:
+            be.key_down(key)
+            be.key_up(key)
+        finally:
+            be.key_up(mod)
+        return [e for e in q.posted if e.etype == macos.kCGEventKeyDown][0]
+
+    ev = press(FakeLayouts(_AZERTY), "cmd", "[")  # needs Option on AZERTY: US position, not 0x00 ("q")
+    assert ev.code == 0x21 and ev.text is None
+    for mod in ("ctrl", "alt", "cmd"):  # Russian: Latin shortcuts use the Command table
+        ev = press(FakeLayouts(_RUSSIAN, _RUSSIAN_CMD), mod, "a")
+        assert ev.code == 0x00 and ev.text is None
+    ev = press(FakeLayouts(_RUSSIAN, _RUSSIAN_CMD), "ctrl", "c")  # not on the layout: US "c"
+    assert ev.code == 0x08 and ev.text is None
+    with pytest.raises(NotSupported):
+        press(FakeLayouts(_AZERTY), "cmd", "ß")
+    assert resolve_key("ß", macos.KeyboardLayoutMap.us_ansi()).kind == "unicode"  # plain typing unchanged
+
+
+def test_pair_ax_windows_unique_frame_beats_title_mismatch():
+    # CG and AX titles may differ (e.g. Java apps); a frame unique on both sides still pairs
+    recs = [_rec(21, 1, 0, 25, 800, 600, "SAP Easy Access"), _rec(22, 1, 900, 25, 400, 300, "Log")]
+    wins = [((0.0, 25.0, 800.0, 600.0), "SAP Easy Access - User menu", None)]
+    assert macos.pair_ax_windows(recs, wins) == {0: 21}

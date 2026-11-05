@@ -97,7 +97,10 @@ def test_persistence_and_resume(tmp_path):
         q.process(handler)
     assert done == [0, 1]
     interrupted = q.get("src#2")
-    assert interrupted.status == NEW  # not its fault
+    # The handler was running: its side effect may have happened -> a human checks it.
+    assert interrupted.status == FAILED and interrupted.error_type == "Interrupted"
+    q.retry_items()  # the human checked it
+    assert interrupted.status == NEW
 
     # Simulate a crash mid-transaction: an item left in_progress in the file.
     data = json.loads(path.read_text())

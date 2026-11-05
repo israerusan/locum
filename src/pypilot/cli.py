@@ -13,6 +13,7 @@
     pypilot locate ok_button.png --confidence 0.85
     pypilot observe --json                         # what an LLM agent sees (set-of-marks)
     pypilot inspect 120,340                        # selector of the element under a point
+    pypilot click -1200,300                        # negative x: a monitor left of the primary
     pypilot mcp --policy strict                    # MCP server over stdio (Claude Desktop / Code)
     pypilot agent "Enter invoice INV-7 for ACME, 120.50" --dry-run
     pypilot run flow.yaml --var customer=ACME --report-dir runs
@@ -36,9 +37,11 @@ in-process (tests inject ``desktop=``, ``stdout=``, ``stderr=``...).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -268,10 +271,13 @@ class DemoBackend(MockBackend):
         except ValueError:
             self._set_status(f"Error: amount {values['amount']!r} is not a number")
             return
+        if not math.isfinite(amount):
+            self._set_status(f"Error: amount {values['amount']!r} is not a number")
+            return
         if amount <= 0:
             self._set_status("Error: amount must be positive")
             return
-        if any(inv["invoice_no"] == values["invoice_no"] for inv in self.invoices):
+        if any(inv["invoice_no"] == values["invoice_no"] and inv["vendor"] == values["vendor"] for inv in self.invoices):
             self._set_status(f"Error: invoice {values['invoice_no']} already exists")
             return
         record = {
@@ -574,22 +580,32 @@ def cmd_tree(ctx: _Ctx) -> int:
     return EXIT_OK
 
 
-def _element_line(el: Any) -> str:
-    from .selectors import describe_node, selector_for
+def _robust_selector(el: Any) -> str:
+    """``selector_for(el.node)`` checked for uniqueness across *all* windows,
+    so the printed selector finds this element (not a same-titled window's) with ``find``."""
+    from .selectors import selector_for
 
     try:
-        sel = selector_for(el.node)
+        roots: Optional[List[Any]] = list(el.desktop.roots())
+    except Exception:
+        roots = None
+    return selector_for(el.node, roots=roots)
+
+
+def _element_line(el: Any) -> str:
+    from .selectors import describe_node
+
+    try:
+        sel = _robust_selector(el)
     except Exception:
         sel = ""
     return describe_node(el.node) + (f"  ->  {sel}" if sel else "")
 
 
 def _element_dict(el: Any) -> Dict[str, Any]:
-    from .selectors import selector_for
-
     d = el.to_dict()
     try:
-        d["robust_selector"] = selector_for(el.node)
+        d["robust_selector"] = _robust_selector(el)
     except Exception:
         d["robust_selector"] = None
     return d
@@ -699,6 +715,12 @@ def cmd_scroll(ctx: _Ctx) -> int:
 def cmd_wait(ctx: _Ctx) -> int:
     a = ctx.args
     el = ctx.desktop.wait(a.selector, state=a.state, timeout=a.timeout)
+    if el is not None and not hasattr(el, "node"):  # an image path: a vision Match
+        if ctx.json:
+            ctx.emit_json({"state": a.state, "match": el.to_dict()})
+        else:
+            ctx.print(f"{a.state}: image at {tuple(el.rect)} (confidence {el.confidence:.3f})")
+        return EXIT_OK
     if ctx.json:
         ctx.emit_json({"state": a.state, "element": _element_dict(el) if el is not None else None})
     elif el is None:
@@ -769,15 +791,13 @@ def cmd_observe(ctx: _Ctx) -> int:
 
 
 def cmd_inspect(ctx: _Ctx) -> int:
-    from .selectors import selector_for
-
     d = ctx.desktop
     point = _parse_point(ctx.args.point, "POINT") if ctx.args.point else d.position()
     el = d.element_at(point)
     if el is None:
         ctx.info(f"no accessible element at ({point.x}, {point.y})")
         return EXIT_FAILURE
-    sel = selector_for(el.node)
+    sel = _robust_selector(el)
     chain = []
     cur = el
     while cur is not None and len(chain) < 64:
@@ -908,6 +928,12 @@ def cmd_record(ctx: _Ctx, *, sleep: Callable[[float], Any] = time.sleep, clock: 
         raise _UsageError(f"-o/--output must end in .py, .yaml, .yml or .json, got {a.output!r}")
     if a.duration is not None and a.duration < 0:
         raise _UsageError("--duration must be >= 0")
+    if ext in (".yaml", ".yml"):
+        try:  # fail before the session, not after the user has recorded everything
+            import yaml  # type: ignore  # noqa: F401
+        except ImportError:
+            raise ImportError("Saving YAML flows requires PyYAML: pip install pypilot[yaml] "
+                              "(or record to a .json/.py file)") from None
     rec = Recorder(ctx.desktop)
     source = a.source
     from .backends.mock import MockBackend
@@ -927,12 +953,34 @@ def cmd_record(ctx: _Ctx, *, sleep: Callable[[float], Any] = time.sleep, clock: 
         pass
     finally:
         actions = rec.stop()
-    path = rec.save(a.output)
+    try:
+        path = rec.save(a.output)
+    except Exception as exc:
+        # Never lose a recording session to a save error (unwritable path, missing PyYAML...):
+        # keep it as JSON in the current (or temp) directory and still report the failure.
+        rescue = _rescue_recording(rec, a.output)
+        if rescue is not None:
+            ctx.info(f"pypilot: could not save {a.output!r} ({type(exc).__name__}: {exc}); "
+                     f"the recording was saved to {rescue}")
+        raise
     if ctx.json:
         ctx.emit_json({"path": os.path.abspath(path), "actions": [x.to_dict() for x in actions]})
     else:
         ctx.print(f"recorded {len(actions)} action(s) to {os.path.abspath(path)}")
     return EXIT_OK
+
+
+def _rescue_recording(rec: Any, wanted: str) -> Optional[str]:
+    import tempfile
+
+    stem = os.path.splitext(os.path.basename(wanted))[0] or "recording"
+    name = f"{stem}-rescued-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    for folder in (os.path.dirname(os.path.abspath(wanted)), os.getcwd(), tempfile.gettempdir()):
+        try:
+            return os.path.abspath(rec.save(os.path.join(folder, name), name=stem))
+        except Exception:
+            continue
+    return None
 
 
 COMMANDS: Dict[str, Callable[[_Ctx], int]] = {
@@ -961,9 +1009,22 @@ COMMANDS: Dict[str, Callable[[_Ctx], int]] = {
 # =============================================================================== parser
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse treating ``-5,10`` / ``-5,0,800,600`` like a negative number, not an option.
+
+    Monitors left of / above the primary one have negative coordinates
+    (``pypilot click -5,10``, ``--at -1200,300``); stock argparse only accepts a
+    bare ``-5`` as a value. Subparsers inherit the class.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._negative_number_matcher = re.compile(rf"^-\d+$|^-\d*\.\d+$|^-\d+(?:\.\d+)?(?:\s*[,\s]\s*{_INT_RE})+$")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The ``pypilot`` argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="pypilot",
         description="Desktop automation for humans, robots and LLMs.",
         epilog=(
@@ -989,7 +1050,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="machine-readable JSON output")
     parser.add_argument("--debug", action="store_true", help="show full tracebacks on errors")
 
-    common = argparse.ArgumentParser(add_help=False)
+    common = _Parser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -1140,7 +1201,10 @@ def main(
     inp = stdin if stdin is not None else sys.stdin
     parser = build_parser()
     try:
-        args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+        # argparse prints --help/--version to sys.stdout and usage errors to sys.stderr:
+        # route them to the streams this call was given.
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     except SystemExit as exc:  # argparse: --help/--version (0) or usage error (2)
         code = exc.code
         return code if isinstance(code, int) else (EXIT_OK if code is None else EXIT_USAGE)

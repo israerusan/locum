@@ -53,7 +53,15 @@ them into characters through the active input source. Characters are therefore
 mapped to keycodes with the live layout (Text Input Sources + ``UCKeyTranslate``,
 re-read when the input source changes), so ``hotkey("cmd", "a")`` presses the key
 that types "a" on AZERTY instead of the US "a" position (which is "q" there).
-Characters the layout cannot type with at most Shift are injected as unicode.
+Characters the layout cannot type with at most Shift are injected as unicode,
+except while Command/Control/Option is held: shortcuts then use the layout's
+Command table, else the US-ANSI key position (a unicode event would carry
+keycode 0, which apps read as Cmd+A on US and Cmd+Q on AZERTY).
+
+The layout can only be read on the main thread. A backend created and used
+only on other threads never learns it; it then types characters as unicode text
+(with a :class:`RuntimeWarning`) and refuses character shortcuts with a
+:class:`~pypilot.errors.BackendError` rather than guessing US-ANSI positions.
 
 Permissions
 -----------
@@ -111,6 +119,7 @@ __all__ = [
     "chunk_utf16",
     "map_ax_role",
     "match_window_record",
+    "pair_ax_windows",
     "resolve_key",
     "split_typing_segments",
     "utf16_len",
@@ -329,40 +338,62 @@ def _named_key_flags(key: str) -> int:
     return flags
 
 
+def _us_char_spec(key: str) -> Optional[KeySpec]:
+    """The US-ANSI key (plus Shift if needed) that types the character ``key``."""
+    if key in CHAR_KEYCODES:
+        return KeySpec("key", CHAR_KEYCODES[key], 0, key)
+    lower = key.lower()
+    if lower != key and len(lower) == 1 and lower in CHAR_KEYCODES:
+        return KeySpec("key", CHAR_KEYCODES[lower], FLAG_SHIFT | _NX_LSHIFT, key)
+    base = SHIFTED_CHARS.get(key)
+    if base is not None and base in CHAR_KEYCODES:
+        return KeySpec("key", CHAR_KEYCODES[base], FLAG_SHIFT | _NX_LSHIFT, key)
+    return None
+
+
 def resolve_key(key: str, keymap: Optional["KeyboardLayoutMap"] = None, *,
-                command: bool = False) -> KeySpec:
+                command: bool = False, modified: bool = False) -> KeySpec:
     """Map a canonical key name (or a single character) to a :class:`KeySpec`.
 
     ``keymap`` is the active keyboard layout (:class:`KeyboardLayoutMap`). With
     it, characters are mapped to the keycode that produces them on that layout
     (so ``"a"`` is keycode ``0x0C`` on AZERTY), and characters the layout cannot
     type with at most Shift are injected as unicode. ``command`` says whether
-    Command is held, in which case the layout's Command table is consulted first
-    (non-Latin layouts switch to Latin letters while Command is down). Without a
-    keymap the static US-ANSI table is used.
+    Command is held and ``modified`` whether Command, Control or Option is held;
+    then the layout's Command table is consulted first (non-Latin layouts switch
+    to Latin letters while Command is down, and Control/Option shortcuts match
+    the same keys). A shortcut character the layout cannot type falls back to its
+    US-ANSI key position (like :data:`SHORTCUT_KEYS`), never to unicode injection:
+    a unicode event still carries a keycode (0, the "a" key on US and the "q" key
+    on AZERTY) and apps match shortcuts against it. Without a keymap the static
+    US-ANSI table is used.
 
     Raises :class:`NotSupported` for ``f21``-``f24`` (macOS has no such keys) and
+    for a character with no key at all while a modifier is held, and
     ``ValueError`` for unknown names.
     """
     if not isinstance(key, str) or key == "":
         raise ValueError(f"Invalid key: {key!r}")
+    modified = modified or command
     if len(key) == 1:
         if key in ("\n", "\r", "\t", "\b", "\x1b"):
-            return resolve_key(normalize_key(key), keymap, command=command)
+            return resolve_key(normalize_key(key), keymap, command=command, modified=modified)
+        spec: Optional[KeySpec] = None
         if keymap is not None:
-            hit = keymap.lookup(key, command=command)
-            if hit is None:
-                return KeySpec("unicode", 0, 0, key)
-            code, shift = hit
-            return KeySpec("key", code, (FLAG_SHIFT | _NX_LSHIFT) if shift else 0, key)
-        if key in CHAR_KEYCODES:
-            return KeySpec("key", CHAR_KEYCODES[key], 0, key)
-        lower = key.lower()
-        if lower != key and len(lower) == 1 and lower in CHAR_KEYCODES:
-            return KeySpec("key", CHAR_KEYCODES[lower], FLAG_SHIFT | _NX_LSHIFT, key)
-        base = SHIFTED_CHARS.get(key)
-        if base is not None and base in CHAR_KEYCODES:
-            return KeySpec("key", CHAR_KEYCODES[base], FLAG_SHIFT | _NX_LSHIFT, key)
+            hit = keymap.lookup(key, command=modified)
+            if hit is not None:
+                code, shift = hit
+                spec = KeySpec("key", code, (FLAG_SHIFT | _NX_LSHIFT) if shift else 0, key)
+            elif modified:
+                spec = _us_char_spec(key)
+        else:
+            spec = _us_char_spec(key)
+        if spec is not None:
+            return spec
+        if modified:
+            raise NotSupported(
+                f"Cannot press {key!r} together with Command/Control/Option: no key types it "
+                "on the active keyboard layout")
         return KeySpec("unicode", 0, 0, key)
     if key in MODIFIER_KEYCODES:
         return KeySpec("modifier", MODIFIER_KEYCODES[key], MODIFIER_FLAGS[key])
@@ -385,7 +416,7 @@ def resolve_key(key: str, keymap: Optional["KeyboardLayoutMap"] = None, *,
     canonical = normalize_key(key)  # raises ValueError for unknown names
     if canonical == key:
         raise ValueError(f"Unknown key name: {key!r}")
-    return resolve_key(canonical, keymap, command=command)
+    return resolve_key(canonical, keymap, command=command, modified=modified)
 
 
 # =============================================================================
@@ -1106,6 +1137,85 @@ def match_window_record(records: Iterable[Dict[str, Any]], pid: Optional[int],
     return None
 
 
+def _plausible_record(rec: Dict[str, Any]) -> bool:
+    """A layer-0, non-transparent, non-degenerate window (what a user would call a window)."""
+    if int(rec.get("kCGWindowLayer", 0)) != 0:
+        return False
+    if float(rec.get("kCGWindowAlpha", 1.0) or 0.0) <= 0.0:
+        return False
+    if str(rec.get("kCGWindowOwnerName") or "") == "Window Server":
+        return False
+    _, _, w, h = _record_bounds(rec)
+    return w > 1 and h > 1
+
+
+def pair_ax_windows(records: Iterable[Dict[str, Any]],
+                    ax_windows: Sequence[Tuple[Optional[Tuple[float, float, float, float]], str, Optional[int]]],
+                    tolerance: float = 2.0) -> Dict[int, int]:
+    """Pair one app's AX windows with its CG windows, one-to-one.
+
+    ``records`` are the app's ``CGWindowList`` records; ``ax_windows`` holds
+    ``(bounds_points, title, window_id)`` per AX window, where ``window_id`` is
+    the exact ``CGWindowID`` when known (``_AXUIElementGetWindow``) or ``None``.
+    Returns ``{ax_index: kCGWindowNumber}``.
+
+    Exact ids win. The rest are paired in rounds, each accepting only pairs that
+    are unique on *both* sides: equal frame and equal title; equal frame and no
+    title conflict; equal frame (CG and AX titles can differ, e.g. Java apps);
+    equal (non-empty) title; and finally a single leftover AX
+    window with a single leftover record whose titles do not conflict. Windows
+    that stay ambiguous (two untitled windows with the same frame) are left
+    unpaired rather than guessed, so two AX windows never share a handle and an
+    action never lands on the wrong window.
+    """
+    recs = [r for r in records if _plausible_record(r)]
+    nums = [int(r.get("kCGWindowNumber", 0)) for r in recs]
+    rtitles = [str(r.get("kCGWindowName") or "") for r in recs]
+    rbounds = [_record_bounds(r) for r in recs]
+    out: Dict[int, int] = {}
+    used: Set[int] = set()
+    for i, (_, _, wid) in enumerate(ax_windows):
+        if wid is not None and wid in nums:
+            j = nums.index(wid)
+            if j not in used:
+                out[i] = j
+                used.add(j)
+
+    def same_frame(i: int, j: int) -> bool:
+        b = ax_windows[i][0]
+        return b is not None and all(abs(p - q) <= tolerance for p, q in zip(b, rbounds[j]))
+
+    def same_title(i: int, j: int) -> bool:
+        return bool(ax_windows[i][1]) and ax_windows[i][1] == rtitles[j]
+
+    def no_conflict(i: int, j: int) -> bool:
+        return not ax_windows[i][1] or not rtitles[j] or ax_windows[i][1] == rtitles[j]
+
+    rounds: List[Callable[[int, int], bool]] = [
+        lambda i, j: same_frame(i, j) and same_title(i, j),
+        lambda i, j: same_frame(i, j) and no_conflict(i, j),
+        same_frame,
+        same_title,
+        no_conflict,
+    ]
+    for k, ok in enumerate(rounds):
+        progress = True
+        while progress:
+            progress = False
+            free_a = [i for i in range(len(ax_windows)) if i not in out]
+            free_r = [j for j in range(len(recs)) if j not in used]
+            if k == len(rounds) - 1 and (len(free_a) != 1 or len(free_r) != 1):
+                break
+            for i in free_a:
+                cands = [j for j in free_r if ok(i, j)]
+                if len(cands) == 1 and sum(1 for i2 in free_a if ok(i2, cands[0])) == 1:
+                    out[i] = cands[0]
+                    used.add(cands[0])
+                    progress = True
+                    break
+    return {i: nums[j] for i, j in out.items()}
+
+
 # =============================================================================
 # Thin wrapper over the HIServices accessibility API
 # =============================================================================
@@ -1170,6 +1280,41 @@ class _AXApi:
             return bool(a == b)
         except Exception:
             return a is b
+
+    def window_id(self, el: Any) -> Optional[int]:
+        """The exact ``CGWindowID`` of an AX window (private but long-stable
+        ``_AXUIElementGetWindow``), or ``None`` when unavailable."""
+        fn = self._get_window
+        if fn is None:
+            return None
+        try:
+            import ctypes
+            import objc  # type: ignore
+
+            out = ctypes.c_uint32(0)
+            if fn(ctypes.c_void_p(objc.pyobjc_id(el)), ctypes.byref(out)) != kAXErrorSuccess:
+                return None
+            return int(out.value) or None
+        except Exception:
+            return None
+
+    @property
+    def _get_window(self) -> Any:
+        if not hasattr(self, "_get_window_fn"):
+            self._get_window_fn = None
+            try:
+                import ctypes
+                import ctypes.util
+
+                path = ctypes.util.find_library("ApplicationServices")
+                fn = getattr(ctypes.cdll.LoadLibrary(path), "_AXUIElementGetWindow") if path else None
+                if fn is not None:
+                    fn.restype = ctypes.c_int32
+                    fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+                    self._get_window_fn = fn
+            except Exception:
+                self._get_window_fn = None
+        return self._get_window_fn
 
     # -- attributes ------------------------------------------------------------------------
     def _convert(self, val: Any) -> Any:
@@ -1757,6 +1902,7 @@ class MacOSBackend(Backend):
             self._layout_ttl = None
         if keyboard_layout is not None:
             self._kbd_map = keyboard_layout
+            self._kbd_fixed = True
         return self
 
     def _setup(self, quartz: Any, appkit: Any, ax: Optional[_AXApi], *, check_permissions: bool,
@@ -1785,6 +1931,8 @@ class MacOSBackend(Backend):
         self._kbd_map: KeyboardLayoutMap = KeyboardLayoutMap.us_ansi()
         self._kbd_fingerprint: Optional[bytes] = None
         self._kbd_checked: Optional[float] = None
+        self._warned_layout = False
+        self._kbd_fixed = False
         try:
             self._source = quartz.CGEventSourceCreate(kCGEventSourceStateHIDSystemState)
         except Exception:
@@ -2049,7 +2197,7 @@ class MacOSBackend(Backend):
 
         The Text Input Sources API must be used from the main thread on recent
         macOS (it traps otherwise), so other threads use the last map read on the
-        main thread (or US-ANSI if none was read yet).
+        main thread (or US-ANSI if none was read yet; see :meth:`_layout_known`).
         """
         provider = self._kbd_provider
         if provider is None or threading.current_thread() is not threading.main_thread():
@@ -2067,9 +2215,32 @@ class MacOSBackend(Backend):
             self._kbd_fingerprint = fingerprint
         return self._kbd_map
 
+    def _layout_known(self) -> bool:
+        """False while the live layout was never queried (backend only used off the
+        main thread): the US-ANSI stand-in may then be wrong, and on AZERTY the US
+        "a"/"z" keys are "q"/"w" (Cmd+A would quit the app, Cmd+Z close a window)."""
+        return self._kbd_provider is None or self._kbd_checked is not None or self._kbd_fixed
+
     def _resolve(self, key: str) -> KeySpec:
-        return resolve_key(key, self._keyboard_map(),
-                           command=bool(self._current_flags() & FLAG_COMMAND))
+        keymap = self._keyboard_map()
+        flags = self._current_flags()
+        modified = bool(flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE))
+        if (len(key) == 1 and key not in ("\n", "\r", "\t", "\b", "\x1b")
+                and not self._layout_known()):
+            if modified:
+                raise BackendError(
+                    f"Refusing to press {key!r} with Command/Control/Option: the keyboard layout "
+                    "has not been read yet (macOS only allows that on the main thread), so the "
+                    "key that types it is unknown and could trigger a different shortcut (on "
+                    "AZERTY the US 'a' key is 'q'). Create the backend/Desktop on the main thread.")
+            if not self._warned_layout:
+                self._warned_layout = True
+                warnings.warn(
+                    "pypilot (macOS): the keyboard layout cannot be read off the main thread; "
+                    "characters are injected as unicode text until the backend is used on the "
+                    "main thread", RuntimeWarning, stacklevel=4)
+            return KeySpec("unicode", 0, 0, key)
+        return resolve_key(key, keymap, command=bool(flags & FLAG_COMMAND), modified=modified)
 
     def _post_key(self, keycode: int, down: bool, flags: int, *, flags_changed: bool = False,
                   text: Optional[str] = None) -> None:
@@ -2212,7 +2383,66 @@ class MacOSBackend(Backend):
         recs = self._q.CGWindowListCopyWindowInfo(options, relative)
         return [dict(r) for r in (recs or [])]
 
+    def _pump_appkit(self) -> bool:
+        """Let AppKit process pending notifications so ``NSWorkspace`` and
+        ``NSRunningApplication`` values are current.
+
+        AppKit only refreshes them while the main run loop runs, which a plain
+        Python script never does, so without this they stay a snapshot of the
+        moment they were first read. Only possible on the main thread; returns
+        whether the run loop was serviced."""
+        appkit = self._appkit
+        if appkit is None or threading.current_thread() is not threading.main_thread():
+            return False
+        try:
+            run, mode = appkit.CFRunLoopRunInMode, appkit.kCFRunLoopDefaultMode
+        except AttributeError:
+            return False
+        try:
+            for _ in range(64):  # kCFRunLoopRunHandledSource == 4: more may be pending
+                if run(mode, 0.0, True) != 4:
+                    break
+            return True
+        except Exception:
+            return False
+
+    def _front_window_pid(self) -> Optional[int]:
+        """Owner of the front-most layer-0 window (live window-server z-order)."""
+        try:
+            records = self._window_records(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements)
+        except Exception:
+            return None
+        for rec in records:
+            if _plausible_record(rec):
+                return int(rec.get("kCGWindowOwnerPID", -1))
+        return None
+
     def _frontmost_pid(self) -> Optional[int]:
+        """Pid of the application that receives keyboard input.
+
+        Read live: the system-wide AX ``AXFocusedApplication`` first. AppKit's
+        ``frontmostApplication`` is only trusted after the run loop could be
+        serviced (see :meth:`_pump_appkit`); otherwise the owner of the front-most
+        window is used, and the possibly stale AppKit value only as a last resort."""
+        ax = self._ax
+        if ax is not None:
+            try:
+                el = ax.attr(ax.system_wide, "AXFocusedApplication")
+                pid = ax.pid(el) if el is not None else None
+                if pid is not None and pid > 0:
+                    return int(pid)
+            except Exception:
+                pass
+        if self._pump_appkit():
+            pid = self._workspace_front_pid()
+            if pid is not None:
+                return pid
+        pid = self._front_window_pid()
+        if pid is not None:
+            return pid
+        return self._workspace_front_pid()
+
+    def _workspace_front_pid(self) -> Optional[int]:
         if self._appkit is None:
             return None
         try:
@@ -2248,32 +2478,56 @@ class MacOSBackend(Backend):
         except Exception:
             return False
 
-    def _ax_windows(self, pid: int) -> List[Tuple[Any, Optional[Tuple[float, float, float, float]], str, bool]]:
-        """``(element, bounds_points, title, minimized)`` for every AX window of ``pid``."""
+    def _ax_windows(self, pid: int) -> List[Tuple[Any, Optional[Tuple[float, float, float, float]], str, bool,
+                                                  Optional[int]]]:
+        """``(element, bounds_points, title, minimized, window_id)`` for every AX window
+        of ``pid`` (``window_id`` is the exact ``CGWindowID`` when it can be read)."""
         ax = self._ax
         if ax is None:
             return []
+        get_id = getattr(ax, "window_id", None)
         out = []
         for el in ax.attr(ax.application(pid), "AXWindows") or []:
             a = ax.attrs(el, ("AXPosition", "AXSize", "AXTitle", "AXMinimized"))
             pos, size = a.get("AXPosition"), a.get("AXSize")
             bounds = (pos[0], pos[1], size[0], size[1]) if pos and size else None
-            out.append((el, bounds, str(a.get("AXTitle") or ""), bool(a.get("AXMinimized"))))
+            wid = get_id(el) if get_id is not None else None
+            out.append((el, bounds, str(a.get("AXTitle") or ""), bool(a.get("AXMinimized")), wid))
         return out
+
+    def _ax_pairing(self, pid: int, records: Optional[List[Dict[str, Any]]] = None) -> Tuple[list, Dict[int, int]]:
+        """``(ax_windows, {ax_index: CGWindowID})`` for ``pid`` (see :func:`pair_ax_windows`)."""
+        wins = self._ax_windows(pid)
+        if records is None:
+            records = self._window_records(kCGWindowListOptionAll)
+        own = [r for r in records if int(r.get("kCGWindowOwnerPID", -1)) == pid]
+        return wins, pair_ax_windows(own, [(b, t, wid) for _, b, t, _, wid in wins])
 
     def _handle_for_ax_window(self, win: Any, pid: Optional[int],
                               records: Optional[List[Dict[str, Any]]] = None) -> Optional[int]:
         ax = self._ax
         if ax is None:
             return None
+        if pid is None:
+            pid = ax.pid(win)
+        if pid is None:
+            return None
+        if records is None:
+            records = self._window_records(kCGWindowListOptionAll)
+        wins, pairs = self._ax_pairing(pid, records)
+        for i, w in enumerate(wins):
+            if ax.same(w[0], win):
+                return pairs.get(i)
+        # not in AXWindows (e.g. a sheet): match it against the still unpaired windows
         a = ax.attrs(win, ("AXPosition", "AXSize", "AXTitle"))
         pos, size = a.get("AXPosition"), a.get("AXSize")
         bounds = (pos[0], pos[1], size[0], size[1]) if pos and size else None
-        if pid is None:
-            pid = ax.pid(win)
-        if records is None:
-            records = self._window_records(kCGWindowListOptionAll)
-        return match_window_record(records, pid, bounds, str(a.get("AXTitle") or ""))
+        get_id = getattr(ax, "window_id", None)
+        taken = set(pairs.values())
+        rest = [r for r in records if int(r.get("kCGWindowOwnerPID", -1)) == pid
+                and int(r.get("kCGWindowNumber", -1)) not in taken]
+        return pair_ax_windows(rest, [(bounds, str(a.get("AXTitle") or ""),
+                                       get_id(win) if get_id is not None else None)]).get(0)
 
     def _window_record(self, handle: Any) -> Dict[str, Any]:
         try:
@@ -2286,23 +2540,29 @@ class MacOSBackend(Backend):
         raise WindowNotFound(f"No window with id {num}")
 
     def _ax_window(self, handle: Any) -> Any:
-        """The AXUIElement of the CG window ``handle``."""
+        """The AXUIElement of the CG window ``handle``.
+
+        Raises :class:`WindowNotFound` when no AX window pairs with it one-to-one
+        (e.g. two untitled windows with the same frame): acting on a guess could
+        close or move the wrong document."""
         self._require_ax()
         rec = self._window_record(handle)
+        num = int(rec.get("kCGWindowNumber", -1))
         pid = int(rec.get("kCGWindowOwnerPID", -1))
-        bounds = _record_bounds(rec)
-        title = str(rec.get("kCGWindowName") or "")
-        wins = self._ax_windows(pid)
-        for el, b, _, _ in wins:
-            if b is not None and all(abs(p - q) <= 2.0 for p, q in zip(b, bounds)):
-                return el
-        if title:
-            titled = [el for el, _, t, _ in wins if t == title]
-            if len(titled) == 1:
-                return titled[0]
-        if len(wins) == 1:
-            return wins[0][0]
-        raise WindowNotFound(f"Cannot find the accessibility element of window {handle!r} (pid {pid})")
+        records = [r for r in self._window_records(kCGWindowListOptionAll)
+                   if int(r.get("kCGWindowNumber", -1)) != num]
+        wins, pairs = self._ax_pairing(pid, [rec, *records])
+        for i, n in pairs.items():
+            if n == num:
+                return wins[i][0]
+        raise WindowNotFound(
+            f"Cannot tell which accessibility window is window {handle!r} (pid {pid}); "
+            "it has no unambiguous AX counterpart")
+
+    def _ax_frame(self, win: Any) -> Optional[Tuple[float, float, float, float]]:
+        a = self._ax.attrs(win, ("AXPosition", "AXSize")) if self._ax is not None else {}
+        pos, size = a.get("AXPosition"), a.get("AXSize")
+        return (pos[0], pos[1], size[0], size[1]) if pos and size else None
 
     def _work_area_for(self, bounds: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
         x, y, w, h = bounds
@@ -2314,7 +2574,9 @@ class MacOSBackend(Backend):
         return all(abs(a - b) <= 2.0 for a, b in zip(bounds, work))
 
     def list_windows(self) -> List[WindowInfo]:
-        """On-screen, layer-0 windows, front-most first. Handles are ``CGWindowID`` ints.
+        """Layer-0 windows: on-screen ones front-most first, then minimized ones
+        (``is_minimized=True``, ``is_visible=False``; needs Accessibility permission).
+        Handles are ``CGWindowID`` ints.
 
         Titles need Screen Recording permission; when missing they are filled in
         from the accessibility API if Accessibility permission was granted."""
@@ -2322,36 +2584,46 @@ class MacOSBackend(Backend):
         layout = self._get_layout()
         front_pid = self._frontmost_pid()
         ax_ok = self._ax is not None and self._ax.is_trusted()
-        ax_cache: Dict[int, list] = {}
+        all_records: List[Dict[str, Any]] = []
+        if ax_ok:
+            try:
+                all_records = self._window_records(kCGWindowListOptionAll)
+            except Exception:
+                all_records = []
+        ax_cache: Dict[int, Tuple[list, Dict[int, int]]] = {}
+
+        def ax_info(pid: int, num: int) -> Optional[tuple]:
+            if pid not in ax_cache:
+                try:
+                    ax_cache[pid] = self._ax_pairing(pid, all_records or records)
+                except Exception:
+                    ax_cache[pid] = ([], {})
+            wins, pairs = ax_cache[pid]
+            for i, n in pairs.items():
+                if n == num:
+                    return wins[i]
+            return None
+
         out: List[WindowInfo] = []
+        seen: Set[int] = set()
         active_seen = False
         for rec in records:
-            if int(rec.get("kCGWindowLayer", 0)) != 0:
-                continue
-            if float(rec.get("kCGWindowAlpha", 1.0) or 0.0) <= 0.0:
+            if not _plausible_record(rec):
                 continue
             bounds = _record_bounds(rec)
-            if bounds[2] <= 1 or bounds[3] <= 1:
-                continue
-            owner = str(rec.get("kCGWindowOwnerName") or "")
-            if owner == "Window Server":
-                continue
+            num = int(rec.get("kCGWindowNumber", 0))
             pid = int(rec.get("kCGWindowOwnerPID", -1))
+            owner = str(rec.get("kCGWindowOwnerName") or "")
             title = str(rec.get("kCGWindowName") or "")
             if not title and ax_ok:
-                if pid not in ax_cache:
-                    try:
-                        ax_cache[pid] = self._ax_windows(pid)
-                    except Exception:
-                        ax_cache[pid] = []
-                for _, b, t, _ in ax_cache[pid]:
-                    if b is not None and all(abs(p - q) <= 2.0 for p, q in zip(b, bounds)):
-                        title = t
-                        break
+                info = ax_info(pid, num)
+                if info is not None:
+                    title = info[2]
             is_active = not active_seen and front_pid is not None and pid == front_pid
             active_seen = active_seen or is_active
+            seen.add(num)
             out.append(WindowInfo(
-                handle=int(rec.get("kCGWindowNumber", 0)),
+                handle=num,
                 title=title,
                 rect=layout.points_rect_to_pixels(*bounds),
                 app=owner or self._app_name(pid),
@@ -2362,25 +2634,82 @@ class MacOSBackend(Backend):
                 is_visible=True,
                 class_name="",
             ))
+        # minimized windows are not on screen; the AX tree says which off-screen
+        # windows are minimized (rather than on another Space or merely hidden)
+        regular: Optional[Set[int]] = None
+        for rec in all_records:
+            num = int(rec.get("kCGWindowNumber", 0))
+            if num in seen or not _plausible_record(rec):
+                continue
+            pid = int(rec.get("kCGWindowOwnerPID", -1))
+            if regular is None:  # only ask apps with a Dock icon (agents never minimize)
+                regular = {p for p, _ in self._regular_apps()} if self._appkit is not None else set()
+            if self._appkit is not None and pid not in regular:
+                continue
+            info = ax_info(pid, num)
+            if info is None or not info[3]:
+                continue
+            seen.add(num)
+            owner = str(rec.get("kCGWindowOwnerName") or "")
+            out.append(WindowInfo(
+                handle=num,
+                title=str(rec.get("kCGWindowName") or "") or info[2],
+                rect=layout.points_rect_to_pixels(*_record_bounds(rec)),
+                app=owner or self._app_name(pid),
+                pid=pid,
+                is_active=False,
+                is_minimized=True,
+                is_maximized=False,
+                is_visible=False,
+                class_name="",
+            ))
         return out
 
+    #: Seconds :meth:`activate_window` waits for the app to become front-most.
+    ACTIVATE_TIMEOUT = 1.0
+
+    def _wait_frontmost(self, pid: int, timeout: float) -> Optional[bool]:
+        """Whether ``pid`` became front-most within ``timeout`` (``None``: unknown)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            front = self._frontmost_pid()
+            if front is None or front == pid:
+                return None if front is None else True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
     def activate_window(self, handle: Any) -> None:
+        """Bring the window to the front and give its app keyboard focus.
+
+        Raises :class:`BackendError` when the app could not be made front-most
+        (``AXRaise`` alone only reorders windows inside an app; typing would still
+        go to the previous app)."""
         rec = self._window_record(handle)
         pid = int(rec.get("kCGWindowOwnerPID", -1))
         activated = self._activate_pid(pid)
-        if self._ax is not None and self._ax.is_trusted():
+        ax = self._ax
+        if ax is not None and ax.is_trusted():
             try:
                 win = self._ax_window(handle)
             except WindowNotFound:
                 win = None
             if win is not None:
-                if self._ax.attr(win, "AXMinimized"):
-                    self._ax.set_attr(win, "AXMinimized", False)
-                self._ax.perform(win, "AXRaise")
-                self._ax.set_attr(win, "AXMain", True)
-                return
+                if ax.attr(win, "AXMinimized"):
+                    ax.set_attr(win, "AXMinimized", False)
+                ax.perform(win, "AXRaise")
+                ax.set_attr(win, "AXMain", True)
+            # works where activateWithOptions_ is declined (cooperative activation)
+            try:
+                activated = ax.set_attr(ax.application(pid), "AXFrontmost", True) or activated
+            except Exception:
+                pass
         if not activated:
             raise BackendError(f"Could not activate window {handle!r} (pid {pid})")
+        if self._wait_frontmost(pid, self.ACTIVATE_TIMEOUT) is False:
+            raise BackendError(
+                f"Window {handle!r} (pid {pid}) did not become the front-most app; "
+                f"{self._app_name(self._frontmost_pid()) or 'another app'} still has keyboard focus")
 
     def move_window(self, handle: Any, rect: Rect) -> None:
         """Move/resize to the pixel ``rect`` (converted to points of the target display)."""
@@ -2410,6 +2739,21 @@ class MacOSBackend(Backend):
             if saved is not None:
                 ax.set_point(win, "AXPosition", saved[0], saved[1])
                 ax.set_size(win, "AXSize", saved[2], saved[3])
+                return
+            if self._is_maximized(self._ax_frame(win) or (0.0, 0.0, 0.0, 0.0)):
+                # zoomed by the user (green button / double-click on the title bar):
+                # zoom back to the user size, never toggle full screen instead
+                button = ax.attr(win, "AXZoomButton")
+                if button is not None:
+                    if "AXZoomWindow" in ax.action_names(button):
+                        ax.perform(button, "AXZoomWindow")
+                    elif ax.attr(button, "AXSubrole") != "AXFullScreenButton":
+                        ax.perform(button, "AXPress")
+                deadline = time.monotonic() + 0.5
+                while self._is_maximized(self._ax_frame(win) or (0.0, 0.0, 0.0, 0.0)):
+                    if time.monotonic() >= deadline:
+                        raise BackendError(f"Could not restore window {handle!r} from its maximized size")
+                    time.sleep(0.02)
             return
         if state in ("maximized", "maximize", "max"):
             if ax.attr(win, "AXMinimized"):
@@ -2439,15 +2783,22 @@ class MacOSBackend(Backend):
             raise BackendError(f"Window {handle!r} has no usable close button")
 
     def launch(self, command: Any, **kwargs: Any) -> Any:
-        """Start an application. ``"Safari"``, ``"/Applications/Safari.app"`` and bundle
-        paths are opened with ``open -a``; anything else runs via :class:`subprocess.Popen`."""
+        """Start an application. App names (``"Safari"``, ``"Microsoft Excel"``),
+        ``"/Applications/Safari.app"`` and bundle paths are opened with ``open -a``;
+        anything else runs via :class:`subprocess.Popen`. A string is treated as an
+        app name when its first word is not a command on ``PATH`` and it contains
+        no ``/`` or quotes."""
         if isinstance(command, str):
             stripped = command.strip()
             if stripped.endswith(".app") or stripped.endswith(".app/"):
                 return subprocess.Popen(["open", "-a", stripped], **kwargs)
-            parts = shlex.split(stripped)
-            if len(parts) == 1 and "/" not in parts[0] and shutil.which(parts[0]) is None:
-                return subprocess.Popen(["open", "-a", parts[0]], **kwargs)
+            try:
+                parts = shlex.split(stripped)
+            except ValueError:
+                parts = []
+            if (parts and "/" not in stripped and not any(c in stripped for c in "\"'\\")
+                    and shutil.which(parts[0]) is None):
+                return subprocess.Popen(["open", "-a", " ".join(parts)], **kwargs)
             if parts and parts[0].endswith(".app") and os.path.isdir(parts[0]):
                 return subprocess.Popen(["open", "-a", parts[0], "--args", *parts[1:]], **kwargs)
         return super().launch(command, **kwargs)
@@ -2473,17 +2824,44 @@ class MacOSBackend(Backend):
 
     # --------------------------------------------------------------- accessibility
     def _regular_apps(self) -> List[Tuple[int, str]]:
-        if self._appkit is None:
+        """``(pid, name)`` of running apps with a Dock icon.
+
+        ``NSWorkspace.runningApplications`` is a snapshot unless the run loop runs
+        (see :meth:`_pump_appkit`), so owners of on-screen windows that are not in
+        it (apps launched since) are added from the live window list."""
+        appkit = self._appkit
+        if appkit is None:
             return []
+        self._pump_appkit()
         out = []
-        for app in self._appkit.NSWorkspace.sharedWorkspace().runningApplications() or []:
+        seen: Set[int] = set()
+        for app in appkit.NSWorkspace.sharedWorkspace().runningApplications() or []:
             try:
+                pid = int(app.processIdentifier())
+                seen.add(pid)
                 if int(app.activationPolicy()) != _NS_APPLICATION_ACTIVATION_POLICY_REGULAR:
                     continue
                 if app.isTerminated():
                     continue
-                pid = int(app.processIdentifier())
                 name = str(app.localizedName() or "")
+            except Exception:
+                continue
+            self._app_names[pid] = name
+            out.append((pid, name))
+        try:
+            records = self._window_records(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements)
+        except Exception:
+            records = []
+        for rec in records:
+            pid = int(rec.get("kCGWindowOwnerPID", -1))
+            if pid in seen or not _plausible_record(rec):
+                continue
+            seen.add(pid)
+            try:
+                app = appkit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                if app is None or int(app.activationPolicy()) != _NS_APPLICATION_ACTIVATION_POLICY_REGULAR:
+                    continue
+                name = str(app.localizedName() or rec.get("kCGWindowOwnerName") or "")
             except Exception:
                 continue
             self._app_names[pid] = name
@@ -2494,7 +2872,8 @@ class MacOSBackend(Backend):
         """Top-level AX windows of every regular application, front-most first.
 
         Each root's ``handle`` is the matching ``CGWindowID`` (so it pairs with
-        :meth:`list_windows`)."""
+        :meth:`list_windows`), or ``None`` when no CG window pairs with it
+        unambiguously; two roots never share a handle."""
         ax = self._require_ax()
         records = self._window_records(kCGWindowListOptionAll)
         z_order = {int(r.get("kCGWindowNumber", 0)): i for i, r in enumerate(
@@ -2502,10 +2881,11 @@ class MacOSBackend(Backend):
         roots: List[Tuple[int, int, AXNode]] = []
         for app_index, (pid, name) in enumerate(self._regular_apps()):
             app_el = ax.application(pid)
-            for win in ax.attr(app_el, "AXWindows") or []:
-                handle = self._handle_for_ax_window(win, pid, records)
+            wins, pairs = self._ax_pairing(pid, records)
+            for i, w in enumerate(wins):
+                handle = pairs.get(i)
                 parent = AXNode(app_el, self, app=name, pid=pid, handle=None, parent=None)
-                node = AXNode(win, self, app=name, pid=pid, handle=handle, parent=parent)
+                node = AXNode(w[0], self, app=name, pid=pid, handle=handle, parent=parent)
                 roots.append((z_order.get(handle, len(z_order) + app_index) if handle is not None
                               else len(z_order) + 10000 + app_index, len(roots), node))
         roots.sort(key=lambda t: (t[0], t[1]))

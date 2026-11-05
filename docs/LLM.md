@@ -94,7 +94,11 @@ print(reg.call("lookup_vendor", {"name": "ACME"}).text)
 ```
 
 Pass functions or `ToolSpec`s to `Agent(extra_tools=[lookup_vendor])` to mix
-business lookups with desktop control.
+business lookups with desktop control. They obey the agent's policy: the tool
+name and its string arguments are matched against the confirmation patterns,
+and `ToolSpec.from_function(release_batch, confirm=True)` asks a human before
+every call. In `mode="tools"` the computer-use toolset is not offered, and a
+`computer` call the model makes anyway is answered with an error, not run.
 
 ## 3. The agent loop
 
@@ -123,8 +127,21 @@ of a turn go back in one user message; `stop_reason` drives the loop
 (`tool_use` continues, `end_turn` finishes, `max_tokens`, `pause_turn` and
 `refusal` are handled). It sends no sampling parameters, thinking budgets,
 forced `tool_choice` or prefill. The model ends a task with the `done` tool
-(`summary`, `success`). The first user message carries an observation, so the
-model starts with eyes open.
+(`summary`, `success`). A `done(success=true)` written in the same turn as a
+call that failed, was blocked or was skipped is answered with an error instead
+(the model has not seen those results yet), and calls after an accepted `done`
+are not executed. A run that ends with `end_turn` (no `done`) only reports
+`success=True` when no call of the last tool turn failed, was blocked or was
+skipped and no call in the whole run was blocked by the policy or declined by
+a human; otherwise `success` is `False` (`stop_reason` stays `end_turn`), so
+`if result.success: mark_paid()` never fires after a blocked payment. The first user message carries an observation, so the
+model starts with eyes open. However a run ends, mouse buttons the model left
+pressed (`left_mouse_down`) and keys still held are released. Configuration
+errors on the first request (a `TypeError` from wrong `create_kwargs`, a
+missing or invalid API key) are raised instead of being reported as a failed
+run. `create_kwargs` are passed to `messages.create` (e.g. `extra_headers`,
+`extra_body`); a `betas` list routes the requests through
+`client.beta.messages.create`.
 
 `client=` accepts anything with `client.messages.create(**kwargs)` returning
 SDK objects or plain dicts — your own gateway, a proxy, or `ScriptedClient`
@@ -175,6 +192,11 @@ key, hold_key, wait`) and the legacy single `computer` tool with
 `input.action`. Batches run in order and stop at the first failure; the rest
 are answered with *"Not executed: an earlier computer action in this turn
 failed."* Key names follow xdotool (`Return`, `ctrl+s`, `alt+Tab`, `super`).
+Keyboard actions are checked against the focused control, and again before
+every key or typed piece that follows a key that may have moved focus: `"Tab
+Return"` or typed `"1000\t\n"` that lands on a "Pay" button needs the same
+confirmation as clicking it. A single combination that mixes Enter/Space with
+another key (`tab+Return`) is rejected.
 Screenshots are downscaled by pypilot (long edge ≤ 2576 px and ≤ 4784 visual
 tokens) and every coordinate is scaled back to physical pixels — on HiDPI and
 multi-monitor setups too. Pick a monitor with `ComputerUseAdapter(d, monitor=1)`.
@@ -207,7 +229,9 @@ unattended use, `--allow-app excel` to fence it in.
 
 MCP stdio has no channel for asking you mid-call, so actions that need
 confirmation are **blocked** with an explanatory error (the model sees it and
-can ask you in chat); use `--policy permissive` only in sandboxes.
+can ask you in chat); use `--policy permissive` only in sandboxes. The
+stdio transport is UTF-8 whatever the console code page, so umlauts and `€`
+arrive intact on Windows too.
 
 In-process (tests, custom transports):
 
@@ -231,13 +255,13 @@ desktop, then the outcome is written to the `AuditLog`.
 
 ```python
 from pypilot import PolicyViolation
-from pypilot.llm import DesktopToolkit, Policy
+from pypilot.llm import CARD_NUMBER, DesktopToolkit, Policy
 
 asked = []
 policy = Policy(
-    allowed_apps=["erp"],                        # globs, ".exe" optional
+    allowed_apps=["erp"],                        # globs, ".exe" optional; also limits launch_app
     blocked_apps=["cmd", "powershell", "terminal"],
-    deny_text_patterns=[r"\b(?:\d[ -]?){13,19}\b"],   # card numbers
+    deny_text_patterns=[CARD_NUMBER],            # Luhn-valid card numbers (IBANs pass)
     confirm=lambda description, details: asked.append(details["reason"]) or False,  # decline everything
     max_actions=50,
     max_actions_per_minute=20,
@@ -256,13 +280,54 @@ except PolicyViolation as exc:
 
 * **Confirmations.** By default (`DEFAULT_CONFIRM`), targets that look like
   they commit something — *delete, remove, pay, transfer, wire, submit, send,
-  purchase, approve, post, buy, checkout, refund, authorize* — need
+  purchase, approve, post, buy, checkout, refund, authorize, release* and their
+  plurals (*Payments, Transfers, make_payments*), plus the German SAP labels
+  *Buchen, Zahlen, Überweisen, Freigeben, Löschen, Senden* — need
   `confirm(description, details) -> bool`. No callback = blocked. Typed text
-  is not matched; the click that submits it is.
+  is not matched; the click that submits it is. A click on an element is
+  judged by what the mouse really hits: clicking a group or toolbar whose
+  centre lies on a "Pay now" button counts as clicking "Pay now".
+* **Shortcuts.** A shortcut that presses a control is judged by that
+  control's label: `alt+p` on a "&Pay now" button (its access key), or a
+  menu item's accelerator (`Ctrl+S` next to "Post"), needs the same
+  confirmation as clicking it. Combos in `Policy(confirm_keys=...)` — by
+  default `ctrl+enter`/`cmd+enter` (send) and `ctrl+s`/`cmd+s` (save, which
+  posts the document in SAP FB60) — always need confirmation, whatever has
+  focus. Other application shortcuts (F8 = Execute in SAP) are not gated:
+  add them to `confirm_keys`, e.g. `Policy(confirm_keys=DEFAULT_CONFIRM_KEYS + ("f8",))`.
+* **Unknown targets.** When input that can press something (a left click,
+  Enter/Space, typed text) reaches a control nobody can identify — the
+  focused element is unreadable (no AT-SPI, Java, Citrix) or nothing is found
+  under the pointer — the patterns cannot be matched, so
+  `Policy(unknown_target="confirm")` (default) asks the human; `"block"`
+  refuses and `"allow"` lets it run (e.g. computer use on a Linux desktop
+  without accessibility).
+* **Extra tools.** `Agent(extra_tools=...)` are judged by their name *and*
+  every string argument (`erp_api(operation="pay")` needs confirmation);
+  `ToolSpec.from_function(fn, confirm=True)` makes every call need a human.
+* **Passwords.** Text typed into a password field (UIA `IsPassword`, AT-SPI
+  `password text`, macOS secure text fields) is written as `***` in the audit
+  log and tool results, and the `Recorder` saves `${env.PYPILOT_PASSWORD}`
+  (`os.environ["PYPILOT_PASSWORD"]` in scripts) instead of the text.
+* **Applications.** `allowed_apps`/`blocked_apps` judge the application the
+  input really reaches: the element acted on, the focused control for keyboard
+  input, the window under the pointer (the active window only when no target
+  is known). A blocked terminal in front therefore does not stop the agent from
+  focusing SAP, and `launch_app` may only start programs matching
+  `allowed_apps` (the quoted first token of the command line, e.g.
+  `"C:\Program Files\PowerShell\7\pwsh.exe"` -> `pwsh`).
+* **Enter submits.** Enter in a single-line field presses the form's default
+  button (HTML implicit submission, dialog default buttons), so keyboard
+  actions with Enter are also judged by that button's label when the
+  accessibility tree reports one (`"default"` state).
 * **Presets.** `Policy.permissive()` (no confirmations; sandboxes and evals),
   `Policy()` (default), `Policy.strict()` (no app launching or clipboard,
-  shells/registry blocked, broad confirmations incl. save/close/install,
-  200 actions max, 30/min).
+  shells/registry blocked, card numbers denied, broad confirmations incl.
+  save/close/install, 200 actions max, 30/min).
+* **Audit failures.** If the audit file cannot be written (locked, disk full,
+  share offline), the tool result still reports what happened, with an
+  `AUDIT LOG WRITE FAILED` note appended — a performed payment is never
+  reported as a failed call the model might retry.
 * **Dry-run.** `Policy(dry_run=True)` makes every acting tool report what it
   *would* do; read-only tools still work so the model can plan.
 * **Region.** `Policy(region=(0, 0, 1280, 800))` keeps pointer actions on one

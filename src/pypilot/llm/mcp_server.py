@@ -212,8 +212,16 @@ class MCPServer:
         When ``stdout`` is omitted (or is ``sys.stdout``) the process's stdout carries the protocol;
         for the duration of the call everything else that would write there
         (``print``, native code, inherited child descriptors) is sent to stderr.
+        The process's own stdin/stdout are read and written as UTF-8 (the MCP
+        stdio encoding) whatever the locale -- on Windows a piped ``sys.stdin``
+        would otherwise decode with the ANSI code page and garble every
+        non-ASCII argument (``Müller``, ``€``).
         """
-        inp = stdin if stdin is not None else sys.stdin
+        detach: Optional[Callable[[], None]] = None
+        if stdin is None or stdin is sys.stdin:
+            inp, detach = _utf8_stream(sys.stdin, "r")
+        else:
+            inp = stdin
         restore: Optional[Callable[[], None]] = None
         if stdout is not None and stdout is not sys.stdout:
             out: TextIO = stdout
@@ -229,6 +237,39 @@ class MCPServer:
         finally:
             if restore is not None:
                 restore()
+            if detach is not None:
+                detach()
+
+
+def _utf8_stream(stream: Any, mode: str) -> Tuple[Any, Optional[Callable[[], None]]]:
+    """A UTF-8 text view of a process stream (``mode`` ``"r"``/``"w"``) and a function that releases it.
+
+    Streams that are already UTF-8, or have no binary ``buffer`` (``StringIO``,
+    captured streams), are returned unchanged. The wrapper is detached afterwards,
+    so the underlying stream stays open.
+    """
+    encoding = str(getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None or encoding in ("utf8", "utf8sig"):
+        return stream, None
+    try:
+        if mode == "w":
+            stream.flush()
+            wrapper = io.TextIOWrapper(buffer, encoding="utf-8", errors="replace", newline="\n", write_through=True)
+        else:
+            wrapper = io.TextIOWrapper(buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        return stream, None
+
+    def release() -> None:
+        try:
+            if mode == "w":
+                wrapper.flush()
+            wrapper.detach()
+        except Exception:
+            pass
+
+    return wrapper, release
 
 
 def _claim_stdout() -> Tuple[TextIO, Callable[[], None]]:
@@ -250,22 +291,12 @@ def _claim_stdout() -> Tuple[TextIO, Callable[[], None]]:
         proto_fd = os.dup(fd)
     except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
         # No real descriptors (embedded interpreter, captured streams): Python-level only.
-        sys.stdout = sys.stderr
-
-        def restore_py() -> None:
-            sys.stdout = real
-
-        return real, restore_py
+        return _claim_stdout_py(real)
     try:
         os.dup2(err_fd, fd)
     except OSError:
         os.close(proto_fd)
-        sys.stdout = sys.stderr
-
-        def restore_py2() -> None:
-            sys.stdout = real
-
-        return real, restore_py2
+        return _claim_stdout_py(real)
     proto = io.TextIOWrapper(io.FileIO(proto_fd, "wb", closefd=True), encoding="utf-8", newline="\n", write_through=True)
     sys.stdout = sys.stderr
 
@@ -282,6 +313,23 @@ def _claim_stdout() -> Tuple[TextIO, Callable[[], None]]:
             except Exception:
                 pass
             sys.stdout = real
+
+    return proto, restore
+
+
+def _claim_stdout_py(real: TextIO) -> Tuple[TextIO, Callable[[], None]]:
+    """Fallback of :func:`_claim_stdout` without descriptors: redirect ``sys.stdout`` only.
+
+    The protocol stream is a UTF-8 view of ``real`` (a cp1252 console stream
+    could not even encode ``€``).
+    """
+    proto, release = _utf8_stream(real, "w")
+    sys.stdout = sys.stderr
+
+    def restore() -> None:
+        if release is not None:
+            release()
+        sys.stdout = real
 
     return proto, restore
 

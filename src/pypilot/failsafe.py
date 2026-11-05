@@ -14,8 +14,11 @@ explicit request to stop.
 
 from __future__ import annotations
 
+import math
+import sys
 import threading
-from typing import Any, List, Optional, Sequence
+import time
+from typing import Any, Callable, List, Optional, Sequence
 
 from .errors import FailSafeTriggered, PypilotError
 from .types import Point, PointLike, coerce_point
@@ -52,6 +55,36 @@ def abort_reason() -> str:
     return _abort_reason if _abort_event.is_set() else ""
 
 
+def _raise_if_aborted() -> None:
+    if _abort_event.is_set():
+        reason = abort_reason()
+        raise FailSafeTriggered("Automation aborted" + (f": {reason}" if reason else ""))
+
+
+#: Longest uninterrupted slice :func:`abortable_sleep` sleeps with a custom sleep function.
+ABORT_POLL_INTERVAL = 0.1
+
+
+def abortable_sleep(seconds: float, sleep: Callable[[float], Any] = time.sleep) -> bool:
+    """Sleep ``seconds`` but wake up as soon as :func:`abort` is called. Returns :func:`is_aborted`.
+
+    With the default ``time.sleep`` this waits on the abort event itself (the
+    wake-up is immediate); a custom ``sleep`` function is called in slices of
+    at most :data:`ABORT_POLL_INTERVAL` seconds with the flag checked between them.
+    """
+    seconds = float(seconds)
+    if seconds <= 0 or _abort_event.is_set():
+        return _abort_event.is_set()
+    if sleep is time.sleep:
+        return _abort_event.wait(seconds)
+    slices = max(1, math.ceil(seconds / ABORT_POLL_INTERVAL - 1e-9))
+    for _ in range(slices):  # equal slices: they add up to ``seconds``
+        sleep(seconds / slices)
+        if _abort_event.is_set():
+            return True
+    return False
+
+
 def _pynput_combo(combo: str) -> str:
     """Convert ``"ctrl+alt+shift+q"`` to pynput's ``"<ctrl>+<alt>+<shift>+q"`` format."""
     from .keys import parse_hotkey
@@ -65,8 +98,31 @@ def _pynput_combo(combo: str) -> str:
         "up": "<up>", "down": "<down>", "left": "<left>", "right": "<right>",
         "printscreen": "<print_screen>", "scrolllock": "<scroll_lock>",
     }
+    keys = parse_hotkey(combo)
+    mods = set(keys)
+    for key in keys:
+        if len(key) != 1:
+            continue
+        # pynput matches the *character* a key event produces, and Shift/AltGr
+        # change it ("shift+1" arrives as "!", "altgr+q" as "@" on German
+        # layouts), so such a hotkey would be accepted but could never fire.
+        if mods & {"altgr"} or (mods & {"shift", "shift_r"} and not key.isalpha()):
+            raise ValueError(
+                f"Kill hotkey {combo!r} cannot be detected reliably: Shift/AltGr change the character "
+                f"of {key!r}; use a letter (e.g. 'ctrl+alt+shift+q') or a named key (e.g. 'ctrl+alt+pause')"
+            )
+    if (
+        sys.platform.startswith("linux")
+        and mods & {"ctrl", "ctrl_r"}
+        and mods & {"alt", "alt_r"}
+        and any(k.startswith("f") and k[1:].isdigit() for k in keys)
+    ):
+        raise ValueError(
+            f"Kill hotkey {combo!r} cannot be detected on Linux: Ctrl+Alt+F<n> is the virtual-terminal switch "
+            "(XF86Switch_VT_n); choose another combination"
+        )
     parts = []
-    for key in parse_hotkey(combo):
+    for key in keys:
         if key in names:
             parts.append(names[key])
         elif key.startswith("f") and key[1:].isdigit():
@@ -83,8 +139,14 @@ def install_kill_hotkey(combo: str = "ctrl+alt+shift+q") -> bool:
 
     Requires the optional ``pynput`` package (``pip install pypilot[record]``)
     and a session where global keyboard hooks are allowed. Returns ``True`` if
-    the hotkey is active, ``False`` if it could not be installed. Calling it
-    again replaces the previously installed hotkey.
+    the hotkey is active, ``False`` if it could not be installed or cannot
+    receive key events (the listener died, e.g. an X server without the RECORD
+    extension, or macOS without Accessibility/Input Monitoring permission).
+    Calling it again replaces the previously installed hotkey.
+
+    Raises ``ValueError`` for combinations that could never fire: unknown keys,
+    Shift with a non-letter character (``ctrl+shift+1`` arrives as ``!``), AltGr
+    with a character, and Ctrl+Alt+F<n> on Linux (the VT switch).
     """
     global _hotkey_listener
     hotkey = _pynput_combo(combo)  # ValueError for unusable combos, before touching pynput
@@ -92,11 +154,22 @@ def install_kill_hotkey(combo: str = "ctrl+alt+shift+q") -> bool:
         from pynput import keyboard as pkb  # type: ignore[import-not-found]
     except Exception:
         return False
+    listener: Any = None
     try:
         listener = pkb.GlobalHotKeys({hotkey: lambda: abort(f"kill hotkey {combo} pressed")})
         listener.daemon = True
         listener.start()
+        ok = _listener_works(listener)
     except Exception:
+        ok = False
+    if not ok:
+        # No emergency stop must ever be reported when the hook cannot deliver events.
+        # (pynput's stop() waits forever for a listener that never became ready.)
+        if listener is not None and getattr(listener, "_ready", True):
+            try:
+                listener.stop()
+            except Exception:
+                pass
         return False
     with _state_lock:
         old, _hotkey_listener = _hotkey_listener, listener
@@ -106,6 +179,25 @@ def install_kill_hotkey(combo: str = "ctrl+alt+shift+q") -> bool:
         except Exception:
             pass
     return True
+
+
+def _listener_works(listener: Any, timeout: float = 2.0) -> bool:
+    """Whether a started pynput listener really receives events.
+
+    ``start()`` returns before the OS hook exists: the listener thread dies at once
+    on an X server without the RECORD extension (common with VNC), and on macOS
+    without Accessibility/Input Monitoring permission it gets no events
+    (``IS_TRUSTED`` is False). pynput marks a listener ready once its hook is in place.
+    """
+    alive = getattr(listener, "is_alive", None)
+    deadline = time.monotonic() + timeout
+    while not getattr(listener, "_ready", True):
+        if (alive is not None and not alive()) or time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    if alive is not None and not alive():
+        return False
+    return getattr(listener, "IS_TRUSTED", True) is not False
 
 
 def uninstall_kill_hotkey() -> None:
@@ -126,7 +218,10 @@ class FailSafe:
     Args:
         backend: The backend whose cursor position is inspected.
         enabled: Whether the corner check is active (the abort flag always is).
-        corners: Explicit trigger points. Default: the four corners of the virtual screen.
+        corners: Explicit trigger points. Default: every monitor corner the cursor
+            stops at when pushed outwards (the four corners of a single screen;
+            corners shared with a neighbouring monitor are left out, and corners of
+            the virtual-screen bounding box that lie on no monitor are never used).
         margin: Distance in pixels (Chebyshev) around each corner that also triggers.
     """
 
@@ -141,18 +236,42 @@ class FailSafe:
 
     @property
     def corners(self) -> List[Point]:
-        """The trigger points (computed from the virtual screen on first use unless given explicitly)."""
+        """The trigger points (computed from the monitor layout on first use unless given explicitly)."""
         if self._explicit is not None:
             return list(self._explicit)
         if self._cached is None:
-            vs = self.backend.virtual_screen()
-            self._cached = [
-                Point(vs.left, vs.top),
-                Point(vs.right - 1, vs.top),
-                Point(vs.left, vs.bottom - 1),
-                Point(vs.right - 1, vs.bottom - 1),
-            ]
+            self._cached = self._default_corners()
         return list(self._cached)
+
+    def _default_corners(self) -> List[Point]:
+        rects: List[Any] = []
+        try:
+            rects = [m.rect for m in self.backend.monitors() if m.rect.width > 0 and m.rect.height > 0]
+        except Exception:
+            rects = []
+        if not rects:
+            vs = self.backend.virtual_screen()
+            rects = [vs]
+
+        def on_screen(x: int, y: int) -> bool:
+            return any(r.left <= x < r.right and r.top <= y < r.bottom for r in rects)
+
+        out: List[Point] = []
+        for r in rects:
+            for x, y, dx, dy in (
+                (r.left, r.top, -1, -1),
+                (r.right - 1, r.top, 1, -1),
+                (r.left, r.bottom - 1, -1, 1),
+                (r.right - 1, r.bottom - 1, 1, 1),
+            ):
+                # The cursor stops here only if it can go neither further
+                # sideways nor further up/down (no neighbouring monitor).
+                if on_screen(x + dx, y) or on_screen(x, y + dy):
+                    continue
+                p = Point(x, y)
+                if p not in out:
+                    out.append(p)
+        return out
 
     @corners.setter
     def corners(self, value: Optional[Sequence[PointLike]]) -> None:
@@ -205,6 +324,7 @@ __all__ = [
     "reset_abort",
     "is_aborted",
     "abort_reason",
+    "abortable_sleep",
     "install_kill_hotkey",
     "uninstall_kill_hotkey",
 ]

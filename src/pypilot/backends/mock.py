@@ -44,6 +44,9 @@ from .base import (
 
 _handles = itertools.count(0x1000)
 
+#: Caret-navigation keys: in an edit field they cancel a ``ctrl+a`` selection.
+_NAV_KEYS = frozenset({"home", "end", "left", "right", "up", "down", "pageup", "pagedown"})
+
 _SHIFT_MAP = {
     "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(",
     "0": ")", "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", "'": '"', ",": "<", ".": ">", "/": "?",
@@ -116,6 +119,24 @@ class MockWidget:
         for c in self.children:
             yield from c.iter_tree()
 
+    def iter_shown(self):
+        """Like :meth:`iter_tree`, but skips invisible widgets *and their whole subtree*."""
+        if not self.visible:
+            return
+        yield self
+        for c in self.children:
+            yield from c.iter_shown()
+
+    @property
+    def shown(self) -> bool:
+        """Visible, and so are all its ancestors (an invisible panel hides its children)."""
+        w: Optional[MockWidget] = self
+        while w is not None:
+            if not w.visible:
+                return False
+            w = w.parent
+        return True
+
     def find(self, name: Optional[str] = None, role: Optional[str] = None) -> Optional["MockWidget"]:
         for w in self.iter_tree():
             if (name is None or w.name == name) and (role is None or w.role == role):
@@ -150,6 +171,8 @@ class MockWindow:
     class_name: str = "MockWindow"
     root: MockWidget = field(init=False)
     _restore_rect: Optional[Rect] = field(default=None, repr=False)
+    #: The widget that had keyboard focus when the window was last active (restored on activation).
+    _last_focus: Optional["MockWidget"] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.root = MockWidget(role="window", name=self.title, rect=Rect(0, 0, self.rect.width, self.rect.height))
@@ -218,12 +241,14 @@ class MockNode(AccessibleNode):
         w = self.widget
         if w.window is not None and (w.window.minimized or not w.window.visible):
             return None
+        if not w.shown:
+            return None
         return w.screen_rect
 
     @property
     def states(self) -> frozenset:
         w = self.widget
-        s = {"enabled" if w.enabled else "disabled", "visible" if w.visible else "invisible"}
+        s = {"enabled" if w.enabled else "disabled", "visible" if w.shown else "invisible"}
         if w.role in ("button", "edit", "checkbox", "listitem", "window"):
             s.add("focusable")
         if self._be._focus is w:
@@ -236,6 +261,10 @@ class MockNode(AccessibleNode):
             s.add("active")
         if w.attrs.get("selected"):
             s.add("selected")
+        if w.attrs.get("default"):
+            s.add("default")  # the dialog's default button (Enter in a single-line field presses it)
+        if w.attrs.get("multiline"):
+            s.add("multi_line")
         return frozenset(s)
 
     @property
@@ -278,8 +307,8 @@ class MockNode(AccessibleNode):
         return True
 
     def toggle(self) -> bool:
-        if self.widget.role != "checkbox":
-            return False
+        if self.widget.role != "checkbox" or not self.widget.enabled:
+            return False  # nothing would change: report it, like invoke()
         self.widget.activate()
         return True
 
@@ -293,6 +322,8 @@ class MockNode(AccessibleNode):
         return True
 
     def focus(self) -> bool:
+        if not self.widget.enabled or not self.widget.shown:
+            return False
         self._be._set_focus(self.widget)
         return True
 
@@ -324,7 +355,7 @@ class MockBackend(Backend):
         self.pressed_buttons: set = set()
         self.launched: List[Any] = []
         self._pos = Point(self.virtual_screen().center.x, self.virtual_screen().center.y)
-        self._focus: Optional[MockWidget] = None
+        self._focus_widget: Optional[MockWidget] = None
         self._active: Optional[MockWindow] = None
         self._down_target: Optional[MockWidget] = None
         self._lock = threading.RLock()
@@ -342,7 +373,7 @@ class MockBackend(Backend):
         with self._lock:
             self.windows.insert(0, w)
             if activate:
-                self._active = w
+                self._raise(w)  # the new window takes the keyboard focus, like a real OS
         return w
 
     def remove_window(self, window: MockWindow) -> None:
@@ -351,7 +382,7 @@ class MockBackend(Backend):
             if window in self.windows:
                 self.windows.remove(window)
             if self._active is window:
-                self._active = next((w for w in self.windows if not w.minimized), None)
+                self._activate_next()
             if self._focus is not None and self._focus.window is window:
                 self._focus = None
 
@@ -369,6 +400,20 @@ class MockBackend(Backend):
     def _log(self, *event: Any) -> None:
         self.events.append(tuple(event))
 
+    @property
+    def _focus(self) -> Optional[MockWidget]:
+        """The widget with keyboard focus (always inside the active window, or None)."""
+        return self._focus_widget
+
+    @_focus.setter
+    def _focus(self, widget: Optional[MockWidget]) -> None:
+        old = self._focus_widget
+        if old is not None and old is not widget:
+            old.attrs.pop("select_all", None)  # leaving a field cancels its selection
+        self._focus_widget = widget
+        if widget is not None and widget.window is not None:
+            widget.window._last_focus = widget
+
     def _set_focus(self, widget: Optional[MockWidget]) -> None:
         self._focus = widget
         if widget is not None and widget.window is not None:
@@ -380,6 +425,31 @@ class MockBackend(Backend):
             self.windows.insert(0, window)
         window.minimized = False
         self._active = window
+        # Keyboard input follows the active window: back to the widget it had focused.
+        last = window._last_focus
+        if last is not None and (last.window is not window or not last.shown or not last.enabled
+                                 or not any(w is last for w in window.root.iter_tree())):
+            last = None
+        self._focus = last
+
+    def _activate_next(self, exclude: Optional[MockWindow] = None) -> None:
+        """The front-most remaining window becomes active (after a minimize/close)."""
+        nxt = next((x for x in self.windows if not x.minimized and x.visible and x is not exclude), None)
+        if nxt is not None:
+            self._raise(nxt)
+        else:
+            self._active = None
+            self._focus = None
+
+    def _keyboard_target(self) -> Optional[MockWidget]:
+        """The focused widget, if it can receive keystrokes right now."""
+        w = self._focus
+        if w is None or not w.enabled or not w.shown:
+            return None
+        win = w.window
+        if win is not None and (win is not self._active or win.minimized or not win.visible or win.closed):
+            return None
+        return w
 
     def window_at(self, x: int, y: int) -> Optional[MockWindow]:
         for w in self.windows:
@@ -392,8 +462,8 @@ class MockBackend(Backend):
         if win is None:
             return None
         best = win.root
-        for wd in win.root.iter_tree():
-            if wd.visible and wd.screen_rect.contains((x, y)) and wd.screen_rect.area <= best.screen_rect.area:
+        for wd in win.root.iter_shown():  # an invisible panel hides (and disables) its children
+            if wd.screen_rect.contains((x, y)) and wd.screen_rect.area <= best.screen_rect.area:
                 best = wd
         return best
 
@@ -419,6 +489,7 @@ class MockBackend(Backend):
             if win is not None:
                 self._raise(win)
             if button is MouseButton.LEFT and target is not None and target.enabled and target.role != "text":
+                target.attrs.pop("select_all", None)  # a click places the caret: the selection is gone
                 self._focus = target
 
     def mouse_up(self, button: MouseButton = MouseButton.LEFT) -> None:
@@ -452,7 +523,7 @@ class MockBackend(Backend):
         return {k.replace("_r", "") for k in self.pressed_keys if k in ("ctrl", "shift", "alt", "cmd", "ctrl_r", "shift_r", "alt_r", "cmd_r")}
 
     def _apply_key(self, key: str) -> None:
-        w = self._focus
+        w = self._keyboard_target()
         mods = self._mods()
         command = mods & {"ctrl", "cmd"}
         if command:
@@ -467,7 +538,9 @@ class MockBackend(Backend):
             elif k == "v" and w is not None and w.role == "edit":
                 self._insert(w, self.clipboard)
             return
-        if w is None or not w.enabled:
+        if "alt" in mods:
+            return  # Alt+key is a menu accelerator (WM_SYSCHAR): it never types into the field
+        if w is None:
             return
         if key in ("enter", "space") and w.role in ("button", "checkbox", "listitem"):
             w.activate()
@@ -477,7 +550,9 @@ class MockBackend(Backend):
             return
         if w.role != "edit":
             return
-        if key == "backspace":
+        if key in _NAV_KEYS:
+            w.attrs.pop("select_all", None)  # the caret moved: typing inserts instead of replacing
+        elif key == "backspace":
             if w.attrs.pop("select_all", False):
                 self._edit(w, "")
             else:
@@ -497,7 +572,7 @@ class MockBackend(Backend):
     def _focus_next(self, w: MockWidget) -> None:
         if w.window is None:
             return
-        focusables = [x for x in w.window.root.iter_tree() if x.role in ("button", "edit", "checkbox") and x.enabled and x.visible]
+        focusables = [x for x in w.window.root.iter_shown() if x.role in ("button", "edit", "checkbox") and x.enabled]
         if not focusables:
             return
         i = focusables.index(w) if w in focusables else -1
@@ -520,8 +595,8 @@ class MockBackend(Backend):
 
     def type_text(self, text: str) -> None:
         self._log("type", text)
-        w = self._focus
-        if w is not None and w.role == "edit" and w.enabled:
+        w = self._keyboard_target()
+        if w is not None and w.role == "edit":
             if not w.attrs.get("multiline"):
                 text = text.replace("\r", "").replace("\n", "")
             self._insert(w, text)
@@ -557,8 +632,8 @@ class MockBackend(Backend):
             title_bg = (40, 90, 160) if win is self._active else (120, 120, 130)
             draw.rectangle([r.left, r.top, r.right - 1, r.top + 27], fill=title_bg)
             draw.text((r.left + 8, r.top + 6), win.title, fill=(255, 255, 255), font=font)
-            for wd in win.root.iter_tree():
-                if wd is win.root or not wd.visible:
+            for wd in win.root.iter_shown():  # an invisible panel hides its whole subtree
+                if wd is win.root:
                     continue
                 wr = wd.screen_rect.offset(ox, oy)
                 if wr.is_empty:
@@ -568,8 +643,10 @@ class MockBackend(Backend):
                     draw.rectangle([wr.left, wr.top, wr.right - 1, wr.bottom - 1], fill=wd.fill, outline=outline)
                 color = wd.text_color if wd.enabled else (150, 150, 150)
                 if wd.role == "checkbox":
-                    box = [wr.left + 4, wr.top + 4, wr.left + wr.height - 4, wr.bottom - 4]
-                    draw.rectangle(box, outline=(0, 0, 0), fill=(0, 0, 0) if wd.checked else (255, 255, 255))
+                    side = min(wr.height, wr.width) - 8  # the box is inset 4px; tiny widgets get no box
+                    if side > 0:
+                        box = [wr.left + 4, wr.top + 4, wr.left + 4 + side, wr.top + 4 + side]
+                        draw.rectangle(box, outline=(0, 0, 0), fill=(0, 0, 0) if wd.checked else (255, 255, 255))
                     draw.text((wr.left + wr.height + 2, wr.top + max(0, (wr.height - 14) // 2)), wd.name, fill=color, font=font)
                 elif wd.role == "edit":
                     draw.text((wr.left + 4, wr.top + max(0, (wr.height - 14) // 2)), wd.value or "", fill=color, font=font)
@@ -586,6 +663,7 @@ class MockBackend(Backend):
         return img
 
     def screenshot(self, region: Optional[Rect] = None) -> Any:
+        region = Rect.coerce(region) if region is not None else None
         self._log("screenshot", region.as_tuple() if region else None)
         img = self.render()
         if region is None:
@@ -634,9 +712,10 @@ class MockBackend(Backend):
         if state == "minimized":
             w.minimized = True
             if self._active is w:
-                self._active = next((x for x in self.windows if not x.minimized and x is not w), None)
+                self._activate_next(exclude=w)
         elif state == "maximized":
-            w._restore_rect = w.rect
+            if not w.maximized:  # maximizing twice must not forget the normal-state rect
+                w._restore_rect = w.rect
             w.maximized, w.minimized = True, False
             self.move_window(handle, self._monitors[0].rect)
             self._raise(w)
@@ -671,7 +750,10 @@ class MockBackend(Backend):
         return [MockNode(self, w.root) for w in self.windows if w.visible]
 
     def element_at(self, x: int, y: int) -> Optional[AccessibleNode]:
-        wd = self.widget_at(x, y)
+        return self._node_with_parents(self.widget_at(x, y))
+
+    def _node_with_parents(self, wd: Optional[MockWidget]) -> Optional[AccessibleNode]:
+        """A node for ``wd`` whose ``parent`` chain leads up to its window (like real backends)."""
         if wd is None:
             return None
         chain = []

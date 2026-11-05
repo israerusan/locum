@@ -407,7 +407,8 @@ def test_requeued_abandoned_items_respect_retry_budget_across_runs(tmp_path):
     q.process(boom, retries=1)
     assert ran == [2] and q.get("inv1").status == FAILED and q.get("inv1").attempts == 2
 
-    # an interruption by the human does not use up an attempt
+    # an interruption by the human while the handler runs: a human checks the item
+    # (its side effect may have happened); retrying it then starts from scratch
     (tmp_path / "q.json").unlink()
     from pypilot.errors import FailSafeTriggered
 
@@ -419,6 +420,8 @@ def test_requeued_abandoned_items_respect_retry_budget_across_runs(tmp_path):
 
     with pytest.raises(FailSafeTriggered):
         q.process(stop, retries=0)
+    assert q.get("a").status == FAILED and q.get("a").error_type == "Interrupted"
+    q.retry_items()
     assert q.get("a").attempts == 0
     q.process(lambda item: None, retries=0)
     assert q.get("a").status == SUCCESS

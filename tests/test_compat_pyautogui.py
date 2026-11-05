@@ -19,7 +19,7 @@ from pypilot.errors import FailSafeTriggered, ImageNotFound, PypilotError
 
 def noise(w: int, h: int, seed: int = 1) -> Image.Image:
     rng = np.random.default_rng(seed)
-    return Image.fromarray(rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8), "RGB")
+    return Image.fromarray(rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8))
 
 
 @pytest.fixture

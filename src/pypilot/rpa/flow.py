@@ -6,11 +6,12 @@ one *action* key plus optional common keys::
     name: Enter invoice
     vars:
       customer: ACME
-      amount: 12.50
+      amount: "12.50"
     settings:            # defaults for every step (all optional)
       timeout: 5         # seconds to wait for elements / images
-      retries: 0
+      retries: 0         # retries of a failing *action* step (not of whole blocks)
       retry_delay: 0.5
+      screenshot_on_error: true   # with a run/report dir (default)
     steps:
       - activate_window: "ERP*"
       - set_text: {target: 'edit "Customer"', text: "${customer}"}
@@ -20,7 +21,7 @@ one *action* key plus optional common keys::
           then:
             - click: 'dialog "Warning" button "OK"'
       - for_each:
-          csv: lines.csv           # or items: [...] / items: "${list_var}"
+          csv: lines.csv           # or items: [...] / items: "${list_var}"; strict: false
           as: line
           steps:
             - type: {text: "${line.sku}\\t${line.qty}\\n", into: 'edit "Lines"'}
@@ -52,11 +53,28 @@ Step types (shorthand scalar form -> the key in brackets):
   ``repeat`` {times, steps, as}, ``call`` [flow] {flow, vars, outputs}
   (a name under the document's ``flows:`` mapping or a YAML/JSON file).
 
+A ``target`` that ends in an image extension (``warn.png``) or is a
+``data:image/`` URL is a template image in every step (``click``, ``move``,
+``wait``, ``wait_gone``, ``assert_exists``, ``if_exists``), relative to the
+flow's directory; a missing file is an error, never a selector.
+
 Common step keys: ``name``, ``retries``, ``retry_delay``, ``timeout``,
-``continue_on_error``, ``description``.
+``continue_on_error``, ``description``. ``settings.retries``/``retry_delay``
+apply to action steps only: a failing step inside ``for_each``/``try``/``call``...
+is retried on its own, the block is never re-run (iterations that already
+succeeded -- a payment -- are not repeated). An explicit ``retries:`` on a
+control step re-runs the whole block. ``continue_on_error`` on a control step
+also marks the failed steps inside it as handled.
+
+Scalars are read as written: YAML values that look like numbers keep their
+source text when typed (``00123`` stays ``00123``, ``1250.50`` stays
+``1250.50``, ``12:30`` stays ``12:30``) and only ``true``/``false`` are booleans
+(``NO``, ``yes``, ``off`` are strings). A CSV row with more or fewer fields than
+the header is an error naming the line (``strict: false`` pads/ignores instead).
 
 Interpolation: ``${var}``, nested paths ``${item.address.city}`` /
-``${rows.0.name}``, environment ``${env.HOME}``, loop state ``${loop.index}``
+``${rows.0.name}``, environment ``${env.HOME}`` (a flow variable named ``env``
+takes precedence; a bare ``${env}`` is never the whole environment), loop state ``${loop.index}``
 (also ``number``, ``count``, ``first``, ``last``), the caught error in a
 ``catch`` block ``${error.message}`` / ``${error.type}`` / ``${error.step}``,
 defaults ``${name:-fallback}`` and ``$${`` for a literal ``${``. A string
@@ -140,7 +158,7 @@ _SPEC: Dict[str, Tuple[Optional[str], frozenset]] = {
     "log": ("message", frozenset({"message", "level"})),
     "fail": ("message", frozenset({"message"})),
     "if_exists": ("target", frozenset({"target", "selector", "image", "timeout", "confidence", "then", "else"})),
-    "for_each": (None, frozenset({"items", "csv", "json", "as", "steps", "on_error", "encoding", "delimiter"})),
+    "for_each": (None, frozenset({"items", "csv", "json", "as", "steps", "on_error", "encoding", "delimiter", "strict"})),
     "try": (None, frozenset({"steps", "catch", "finally"})),
     "repeat": (None, frozenset({"times", "steps", "as"})),
     "call": ("flow", frozenset({"flow", "vars", "outputs"})),
@@ -181,9 +199,11 @@ def _lookup(variables: Mapping[str, Any], expr: str) -> Any:
     if not parts or not parts[0]:
         raise _Undefined(f"empty variable reference ${{{expr}}}")
     head, rest = parts[0], parts[1:]
-    if head == "env":
+    if head == "env" and head not in variables:
+        # A user variable named ``env`` (PROD/QA...) wins; a bare ``${env}`` never
+        # expands to the whole process environment (it holds credentials).
         if not rest:
-            return dict(os.environ)
+            raise _Undefined("${env} needs a variable name: ${env.NAME}")
         name = ".".join(rest)
         if name not in os.environ:
             raise _Undefined(f"environment variable {name!r} is not set")
@@ -277,11 +297,84 @@ def interpolate(value: Any, variables: Mapping[str, Any], *, path: str = "") -> 
 
 # ============================================================ loading & validation
 
+class _SourceFloat(float):
+    """A float that remembers how it was written: ``str()`` gives ``1250.50``, not ``1250.5``.
+
+    Flows type values into applications, so a document amount must reach the
+    field exactly as written; arithmetic and comparisons still see the number.
+    """
+
+    def __new__(cls, value: float, text: str) -> "_SourceFloat":
+        obj = super().__new__(cls, value)
+        obj._text = text
+        return obj
+
+    def __str__(self) -> str:
+        return self._text
+
+    def __format__(self, spec: str) -> str:
+        return self._text if not spec else float.__format__(self, spec)
+
+    def __reduce__(self) -> Any:
+        return (_SourceFloat, (float(self), self._text))
+
+
+def _number_from_text(value: Any, text: str) -> Any:
+    """``value`` when its canonical spelling is ``text``, else something that types as ``text``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if isinstance(value, int):
+        # 00123 (YAML 1.1 octal = 83), 0x1F, 1_000, 12:30 (sexagesimal = 750), +5:
+        # identifiers and times, not numbers -> keep the text.
+        return value if str(value) == text else text
+    if value != value or value in (float("inf"), float("-inf")):
+        return value
+    return value if repr(value) == text else _SourceFloat(value, text)
+
+
+def _json_loads(text: str) -> Any:
+    return json.loads(text, parse_float=lambda t: _number_from_text(float(t), t))
+
+
+_YAML_LOADER: Any = None
+
+
+def _yaml_loader() -> Any:
+    """A ``yaml.SafeLoader`` that keeps scalars as written (see :func:`_number_from_text`)
+    and, like YAML 1.2, only treats ``true``/``false`` as booleans (``NO``, ``on``,
+    ``yes`` stay strings: a country code or a CSV flag must not become ``false``)."""
+    global _YAML_LOADER
+    if _YAML_LOADER is not None:
+        return _YAML_LOADER
+    import yaml  # type: ignore
+
+    class FlowLoader(yaml.SafeLoader):
+        pass
+
+    bool_tag = "tag:yaml.org,2002:bool"
+    FlowLoader.yaml_implicit_resolvers = {
+        first: [(tag, rx) for tag, rx in resolvers if tag != bool_tag]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    FlowLoader.add_implicit_resolver(bool_tag, re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF"))
+
+    def construct_int(loader: Any, node: Any) -> Any:
+        return _number_from_text(yaml.SafeLoader.construct_yaml_int(loader, node), str(node.value))
+
+    def construct_float(loader: Any, node: Any) -> Any:
+        return _number_from_text(yaml.SafeLoader.construct_yaml_float(loader, node), str(node.value))
+
+    FlowLoader.add_constructor("tag:yaml.org,2002:int", construct_int)
+    FlowLoader.add_constructor("tag:yaml.org,2002:float", construct_float)
+    _YAML_LOADER = FlowLoader
+    return FlowLoader
+
+
 def _parse_text(text: str, source: str) -> Any:
     stripped = text.lstrip()
     if stripped.startswith(("{", "[")):
         try:
-            return json.loads(text)
+            return _json_loads(text)
         except json.JSONDecodeError:
             pass  # might still be YAML flow style
     try:
@@ -291,7 +384,7 @@ def _parse_text(text: str, source: str) -> Any:
             raise ImportError(f"Reading YAML flows ({source}) requires PyYAML: pip install pypilot[yaml]") from None
         raise
     try:
-        return yaml.safe_load(text)
+        return yaml.load(text, Loader=_yaml_loader())  # noqa: S506 - a SafeLoader subclass
     except yaml.YAMLError as exc:
         raise WorkflowError(f"{source}: invalid YAML: {exc}") from exc
 
@@ -300,13 +393,17 @@ def load_flow(source: Union[PathLike, Mapping[str, Any], Sequence[Any]]) -> Tupl
     """Load a flow document. Returns ``(document, file_path_or_None)``.
 
     ``source`` may be a path to a ``.yaml``/``.yml``/``.json`` file, a mapping,
-    a bare list of steps, or YAML/JSON text (a string with a newline or starting with ``{``).
+    a bare list of steps, or YAML/JSON text (a string with a newline, or starting with
+    ``{``/``[`` that is not the name of an existing file such as ``[Q4] close.yaml``).
     """
     if isinstance(source, Mapping):
         return copy.deepcopy(dict(source)), None
     if isinstance(source, (list, tuple)):
         return {"steps": copy.deepcopy(list(source))}, None
-    text_like = isinstance(source, str) and ("\n" in source or source.lstrip().startswith(("{", "[")))
+    text_like = isinstance(source, str) and (
+        "\n" in source
+        or (source.lstrip().startswith(("{", "[")) and not _is_existing_file(source))
+    )
     if text_like:
         doc = _parse_text(str(source), "<flow text>")
         file_path = None
@@ -317,7 +414,7 @@ def load_flow(source: Union[PathLike, Mapping[str, Any], Sequence[Any]]) -> Tupl
         raw = file_path.read_text(encoding="utf-8")
         if file_path.suffix.lower() == ".json":
             try:
-                doc = json.loads(raw)
+                doc = _json_loads(raw)
             except json.JSONDecodeError as exc:
                 raise WorkflowError(f"{file_path}: invalid JSON: {exc}") from exc
         else:
@@ -327,6 +424,13 @@ def load_flow(source: Union[PathLike, Mapping[str, Any], Sequence[Any]]) -> Tupl
     if not isinstance(doc, dict):
         raise WorkflowError(f"{file_path or 'flow'}: a flow must be a mapping with a 'steps' list, got {type(doc).__name__}")
     return doc, file_path
+
+
+def _is_existing_file(source: str) -> bool:
+    try:
+        return pathlib.Path(source).expanduser().is_file()
+    except (OSError, ValueError):  # e.g. a name too long for the file system
+        return False
 
 
 def _step_type(step: Mapping[str, Any]) -> List[str]:
@@ -363,6 +467,9 @@ def validate_flow(doc: Mapping[str, Any], *, prefix: str = "") -> List[str]:
             for k in doc["settings"]:
                 if k not in allowed:
                     problems.append(f"{prefix or 'flow'}: unknown setting {k!r}{_suggest(k, sorted(allowed))}")
+            shot = doc["settings"].get("screenshot_on_error")
+            if shot is not None and not isinstance(shot, bool) and str(shot).strip().lower() not in _TRUE_WORDS + _FALSE_WORDS:
+                problems.append(f"{prefix or 'flow'}: settings.screenshot_on_error must be true or false")
     flows = doc.get("flows")
     if flows is not None:
         if not isinstance(flows, Mapping):
@@ -576,9 +683,19 @@ class FlowRunner:
         p = pathlib.Path(str(value)).expanduser()
         return p if p.is_absolute() else scope.base_dir / p
 
-    def _is_image_ref(self, value: str, scope: _Scope) -> bool:
-        low = value.strip().lower()
-        return low.startswith("data:image/") or (low.endswith(_IMAGE_EXTS) and self._file(value.strip(), scope).is_file())
+    def _image_ref(self, value: Any, scope: _Scope) -> Any:
+        """The image a string target names, else ``None``.
+
+        A string ending in an image extension is an image path (relative to the
+        flow's directory) and a missing file raises :class:`FileNotFoundError`:
+        read as a selector (``warn.png`` = role ``warn``, class ``png``) it could
+        never match, so ``if_exists``/``wait_gone`` would silently go the wrong way.
+        """
+        if isinstance(value, str):
+            low = value.strip().lower()
+            if low.startswith("data:image/") or low.endswith(_IMAGE_EXTS):
+                return self._image(value, scope)
+        return None
 
     def _image(self, value: Any, scope: _Scope) -> Any:
         if isinstance(value, str) and not value.strip().lower().startswith("data:image/"):
@@ -622,8 +739,9 @@ class FlowRunner:
         if isinstance(value, Mapping):
             return self._target(value, timeout, scope)
         if isinstance(value, str):
-            if self._is_image_ref(value, scope):
-                return self.desktop.wait_image(self._image(value, scope), timeout=timeout)
+            image = self._image_ref(value, scope)
+            if image is not None:
+                return self.desktop.wait_image(image, timeout=timeout)
             return self.desktop.find(value, timeout=timeout)
         raise WorkflowError(f"cannot use {value!r} as a target (expected a selector, 'x,y', [x, y], or an image path)")
 
@@ -691,10 +809,9 @@ class FlowRunner:
         if kind == "move":
             t = self._timeout(args, step, scope)
             target = self._target(args, t, scope)
-            dx, dy = self._offset(args)
-            point = d.resolve_point(target).offset(dx, dy)
             dur = args.get("duration")
-            d.move(point, duration=None if dur is None else float(dur))
+            # Desktop.move hit-tests element targets (never hover what covers them).
+            point = d.move(target, offset=self._offset(args), duration=None if dur is None else float(dur))
             return {"point": [point.x, point.y]}
         if kind == "drag":
             t = self._timeout(args, step, scope)
@@ -729,7 +846,7 @@ class FlowRunner:
         if kind == "set_text":
             el = self._element(args["target"], self._timeout(args, step, scope))
             native = args.get("native", "auto")
-            el.set_text(_to_text(args.get("text")), native=native, clear=bool(args.get("clear", True)))
+            el.set_text(_to_text(args.get("text")), native=native, clear=_bool_arg(args.get("clear", True), "set_text.clear"))
             return None
         if kind in _ELEMENT_ACTIONS:
             el = self._element(args["target"], self._timeout(args, step, scope))
@@ -737,10 +854,16 @@ class FlowRunner:
             return None
         if kind == "wait":
             state = args.get("state", "visible")
-            el = d.wait(args["target"], state=state, timeout=self._timeout(args, step, scope))
-            return None if el is None else {"element": el.to_dict()}
+            target = args["target"]
+            image = self._image_ref(target, scope)
+            found = d.wait(target if image is None else image, state=state, timeout=self._timeout(args, step, scope))
+            if found is None:
+                return None
+            return {"match": found.to_dict()} if image is not None else {"element": found.to_dict()}
         if kind == "wait_gone":
-            d.wait(args["target"], state="gone", timeout=self._timeout(args, step, scope))
+            target = args["target"]
+            image = self._image_ref(target, scope)
+            d.wait(target if image is None else image, state="gone", timeout=self._timeout(args, step, scope))
             return None
         if kind in ("wait_image", "click_image"):
             kw = {}
@@ -748,7 +871,7 @@ class FlowRunner:
                 if args.get(k) is not None:
                     kw[k] = float(args[k])
             if args.get("grayscale") is not None:
-                kw["grayscale"] = bool(args["grayscale"])
+                kw["grayscale"] = _bool_arg(args["grayscale"], "grayscale")
             if args.get("region") is not None:
                 kw["region"] = self._region(args["region"], scope)
             image = self._image(args["image"], scope)
@@ -765,7 +888,7 @@ class FlowRunner:
             kw = {}
             for k in ("regex", "case_sensitive"):
                 if args.get(k) is not None:
-                    kw[k] = bool(args[k])
+                    kw[k] = _bool_arg(args[k], k)
             if args.get("fuzzy") is not None:
                 kw["fuzzy"] = float(args["fuzzy"])
             if args.get("region") is not None:
@@ -790,7 +913,14 @@ class FlowRunner:
             result = d.launch(cmd, wait_window=args.get("wait_window"), timeout=self._timeout(args, step, scope))
             return {"window": result.title} if args.get("wait_window") is not None and result is not None else None
         if kind == "activate_window":
-            win = d.window(args.get("title"), app=args.get("app"), timeout=self._timeout(args, step, scope))
+            title, app = args.get("title"), args.get("app")
+            title = None if title is None or _to_text(title).strip() == "" else title
+            app = None if app is None or _to_text(app).strip() == "" else app
+            if title is None and app is None:
+                # e.g. "${title}" from an empty CSV cell: activating "any window" would send
+                # the following keystrokes to whatever application happens to be in front.
+                raise WorkflowError("activate_window needs a non-empty 'title' or 'app' (after interpolation)")
+            win = d.window(title, app=app, timeout=self._timeout(args, step, scope))
             win.activate()
             return {"window": win.title}
         if kind == "sleep":
@@ -811,6 +941,14 @@ class FlowRunner:
                     raise FlowAssertionError(message or f"expected image {args['image']!r} on screen")
                 return None
             target = args.get("target")
+            image = self._image_ref(target, scope)
+            if image is not None:
+                if "equals" in args:
+                    raise WorkflowError("assert_exists: 'equals' needs an element target, not an image")
+                kw = {"confidence": float(args["confidence"])} if args.get("confidence") is not None else {}
+                if d.locate(image, timeout=t or 0.0, **kw) is None:
+                    raise FlowAssertionError(message or f"expected image {target!r} on screen within {t:g}s")
+                return None
             try:
                 el = d.find(target, timeout=t)
             except Exception as exc:
@@ -869,7 +1007,12 @@ class FlowRunner:
                 found = self.desktop.locate(self._image(args["image"], scope), timeout=t, **kw) is not None
             else:
                 sel = args.get("target", args.get("selector"))
-                found = self.desktop.exists(sel, timeout=t)
+                image = self._image_ref(sel, scope) if "target" in args else None
+                if image is not None:
+                    kw = {"confidence": float(args["confidence"])} if args.get("confidence") is not None else {}
+                    found = self.desktop.locate(image, timeout=t, **kw) is not None
+                else:
+                    found = self.desktop.exists(sel, timeout=t)
             branch = "then" if found else "else"
             body = raw.get(branch) or []
             self.run_steps(body, f"{path}.if_exists.{branch}", depth + 1, scope)
@@ -899,13 +1042,29 @@ class FlowRunner:
     def _loop_items(self, args: Mapping[str, Any], scope: _Scope) -> List[Any]:
         if "csv" in args:
             p = self._file(args["csv"], scope)
+            strict = _bool_arg(args.get("strict", True), "for_each.strict")
+            rows: List[Dict[str, Any]] = []
             with open(p, "r", encoding=str(args.get("encoding", "utf-8-sig")), newline="") as fh:
                 reader = csv.DictReader(fh, delimiter=str(args.get("delimiter", ",")))
-                return [{str(k).strip(): (v if v is not None else "") for k, v in row.items() if k is not None} for row in reader]
+                for row in reader:
+                    # A row with more fields than the header (an unquoted "1,234.56") or
+                    # fewer (a truncated line) would silently shift or blank values.
+                    extra = row.get(None)  # type: ignore[call-overload]
+                    missing = [k for k, v in row.items() if k is not None and v is None]
+                    if strict and (extra or missing):
+                        width = len(reader.fieldnames or ())
+                        got = width + len(extra) if extra else width - len(missing)
+                        raise WorkflowError(
+                            f"{p}:{reader.line_num}: expected {width} field(s) like the header, got {got}"
+                            + (" (quote values that contain the delimiter, e.g. \"1,234.56\")" if extra else "")
+                            + "; set strict: false on the for_each to accept such rows"
+                        )
+                    rows.append({str(k).strip(): (v if v is not None else "") for k, v in row.items() if k is not None})
+            return rows
         if "json" in args:
             p = self._file(args["json"], scope)
             with open(p, "r", encoding=str(args.get("encoding", "utf-8"))) as fh:
-                data = json.load(fh)
+                data = _json_loads(fh.read())
             if isinstance(data, Mapping) and isinstance(data.get("items"), list):
                 data = data["items"]
             if not isinstance(data, list):
@@ -989,7 +1148,9 @@ class FlowRunner:
                 }
                 try:
                     self.run_steps(raw.get("catch") or [], f"{path}.try.catch", depth + 1, scope)
-                except BaseException as catch_exc:
+                except (FailSafeTriggered, KeyboardInterrupt, SystemExit):
+                    raise  # an abort/interrupt stops at once: 'finally' must not act on the desktop
+                except Exception as catch_exc:
                     pending = catch_exc
                 finally:
                     if had:
@@ -1091,9 +1252,15 @@ class FlowRunner:
                             data={"type": kind})
         if self._contexts:
             result.data["context"] = self._contexts[-1]
+        first = len(self.report.steps)
         self.report.add(result)
         t0 = time.monotonic()
-        defaults = scope.settings
+        # settings.retries / retry_delay are per *action* step: a control step (for_each,
+        # try, call...) inheriting them would re-run its whole block when one nested step
+        # fails, repeating iterations that already succeeded (payments included). The
+        # failing nested step is retried on its own instead.
+        defaults = scope.settings if kind not in CONTROL_STEPS else {
+            k: v for k, v in scope.settings.items() if k not in ("retries", "retry_delay")}
         try:
             retries = int(interpolate(step.get("retries", defaults.get("retries", 0)), self.vars, path=path) or 0)
             delay = float(interpolate(step.get("retry_delay", defaults.get("retry_delay", 0.5)), self.vars, path=path) or 0)
@@ -1144,7 +1311,10 @@ class FlowRunner:
         assert last is not None
         err = self._fail(result, kind, path, last, t0)
         if continue_on_error and not isinstance(last, FailSafeTriggered):
-            result.handled = True
+            # Also the failed steps nested in a container: the flow continued as configured.
+            for s in self.report.steps[first:]:
+                if s.status == FAILED:
+                    s.handled = True
             self.log(f"step failed, continuing: {err}", level="warning", path=path)
             return result
         raise err
@@ -1195,6 +1365,22 @@ def _truthy(v: Any) -> bool:
     return bool(v)
 
 
+_TRUE_WORDS = ("1", "true", "yes", "on", "y")
+_FALSE_WORDS = ("0", "false", "no", "off", "n", "")
+
+
+def _bool_arg(v: Any, what: str) -> bool:
+    """A boolean step argument; interpolated strings (``"false"`` from ``--var``/CSV) count by meaning."""
+    if isinstance(v, str):
+        word = v.strip().lower()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+        raise WorkflowError(f"{what} must be true or false, got {v!r}")
+    return bool(v)
+
+
 def run_flow(
     path_or_dict: Union[PathLike, Mapping[str, Any], Sequence[Any]],
     desktop: Optional["Desktop"] = None,
@@ -1216,7 +1402,8 @@ def run_flow(
             screenshots); default: the flow file's directory, else the current directory.
         run_dir: When given, the run's evidence goes to ``run_dir/<run-id>/``:
             error screenshots plus ``report.json`` and ``report.html``.
-        screenshot_on_error: Save a screenshot when a step fails (default: ``True`` when ``run_dir`` is set).
+        screenshot_on_error: Save a screenshot when a step fails (default: the document's
+            ``settings.screenshot_on_error``, else ``True`` when ``run_dir`` is set).
         raise_on_error: Raise the :class:`FlowStepError` instead of returning a failed report.
 
     Raises:
@@ -1235,7 +1422,11 @@ def run_flow(
     evidence_dir = pathlib.Path(run_dir).expanduser() / report.run_id if run_dir is not None else None
     if evidence_dir is not None:
         report.run_dir = str(evidence_dir)
-    shots = (run_dir is not None) if screenshot_on_error is None else bool(screenshot_on_error)
+    if screenshot_on_error is None:
+        setting = (doc.get("settings") or {}).get("screenshot_on_error")
+        shots = (run_dir is not None) if setting is None else _bool_arg(setting, "settings.screenshot_on_error")
+    else:
+        shots = bool(screenshot_on_error)
     if desktop is None:
         from ..desktop import Desktop
 

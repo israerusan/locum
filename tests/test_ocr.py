@@ -389,3 +389,55 @@ def test_missing_optional_engines_raise_not_supported(monkeypatch):
 def test_ocr_engine_protocol():
     assert isinstance(FakeEngine(), ocr.OCREngine)
     assert not isinstance(object(), ocr.OCREngine)
+
+
+# ------------------------------------------------- amounts, columns, bad regex
+def test_numeric_tokens_keep_sign_and_parentheses():
+    words = [
+        W("1,500.00", 200, 0, line=0),
+        W("-1,500.00", 200, 30, line=1),
+        W("(250.00)", 200, 60, line=2),
+        W("250.00", 300, 60, line=2),
+        W("1,500.00-", 200, 90, line=3),  # SAP's trailing minus
+        W("Total:", 10, 120, line=4),
+        W("99.90.", 70, 120, line=4),  # sentence period still ignored
+        W("|42.00*", 10, 150, line=5),  # grid line and ALV total marker ignored
+    ]
+
+    def hits(q):
+        return [(m.text, m.rect.top) for m in ocr.find_text(None, q, words=words)]
+
+    assert hits("-1,500.00") == [("-1,500.00", 30)]
+    assert hits("1,500.00") == [("1,500.00", 0)]
+    assert hits("1,500.00-") == [("1,500.00-", 90)]
+    assert hits("(250.00)") == [("(250.00)", 60)]
+    assert hits("250.00") == [("250.00", 60)]
+    assert hits("99.90") == [("99.90.", 120)]
+    assert hits("total") == [("Total:", 120)]
+    assert hits("42.00") == [("|42.00*", 150)]
+
+
+def test_split_word_join_needs_adjacent_words():
+    # grid row "Item 10 | Qty 1 | Amount 500.00"; the real 1500.00 is on the next row
+    words = [
+        W("10", 0, 0, w=20, line=0),
+        W("1", 100, 0, w=10, line=0),
+        W("500.00", 200, 0, w=60, line=0),
+        W("20", 0, 20, w=20, line=1),
+        W("3", 100, 20, w=10, line=1),
+        W("1500.00", 200, 20, w=70, line=1),
+    ]
+    ms = ocr.find_text(None, "1500.00", words=words)
+    assert [(m.text, m.rect.top) for m in ms] == [("1500.00", 20)]
+    # phrases across columns are not phrases either
+    assert [m.rect.top for m in ocr.find_text(None, "1 500.00", words=words)] == [20]
+    # a genuine split word still joins, but ranks after an exact single word
+    words2 = [W("Log", 10, 0, line=0), W("in", 40, 0, line=0), W("Login", 10, 30, line=1)]
+    assert [m.text for m in ocr.find_text(None, "login", words=words2)] == ["Login", "Log in"]
+
+
+def test_invalid_regex_is_value_error_before_ocr():
+    eng = FakeEngine()
+    with pytest.raises(ValueError, match="Invalid regex"):
+        ocr.find_text(IMG, "Post(", regex=True, engine=eng)
+    assert eng.calls == 0

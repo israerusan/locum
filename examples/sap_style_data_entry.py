@@ -5,11 +5,22 @@ This is the classic "SAP-style" back-office robot, written code-first:
 * a :class:`~pypilot.rpa.WorkQueue` (Orchestrator-style transactions) is loaded
   from ``data/invoices.csv``; it is persisted to JSON, so an interrupted run
   resumes where it stopped and re-running never enters an invoice twice;
+* an invoice is identified by vendor + invoice number (invoice numbers are
+  only unique per vendor); the same row exported twice is entered once, while
+  two *different* rows for the same vendor and invoice number are both
+  recorded as business exceptions for a human to resolve (neither is entered);
 * every transaction fills the form through **accessibility selectors** (no
   coordinates), clicks *Save* and reads the status bar;
-* bad data (a negative amount, a duplicate, a validation message from the app)
-  raises a :class:`~pypilot.rpa.BusinessException` -- recorded, never retried;
-  technical failures (element not found, app hiccup) are retried;
+* bad data (an amount that is not a plain positive number with at most two
+  decimals, a duplicate, a validation message from the app) raises a
+  :class:`~pypilot.rpa.BusinessException` -- recorded, never retried. Amounts
+  are read as ``1250.00`` / ``1,250.00`` (``--decimal-comma`` for
+  ``1.250,00`` / ``1250,00``); anything ambiguous (``1,250`` or ``1.250``
+  without decimals) is rejected rather than guessed;
+* technical failures *before* Save (element not found, app hiccup) are
+  retried. Once Save has been clicked the outcome is unknown, so a missing or
+  late answer is never retried (that could post the invoice twice): the item
+  is recorded as "needs review" -- check the ERP, then re-queue it if needed;
 * the :class:`~pypilot.rpa.Robot` times every step, saves a screenshot when
   something fails and writes ``report.json`` + a self-contained ``report.html``.
 
@@ -44,12 +55,16 @@ Run for real (the ERP window must be open or ``--launch`` must start it):
 from __future__ import annotations
 
 import argparse
+import csv
 import os
+import re
 import sys
 import tempfile
-from typing import Any, Dict, Optional
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
 
 from pypilot import Desktop
+from pypilot.errors import FailSafeTriggered
 from pypilot.rpa import BusinessException, QueueItem, Robot, WorkQueue
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -77,18 +92,72 @@ def make_desktop() -> Desktop:
     return Desktop(default_timeout=15)
 
 
-def parse_amount(raw: Any) -> float:
-    """Business validation before touching the UI (cheap, and keeps bad data out of the ERP)."""
-    try:
-        amount = float(str(raw).replace(",", "").strip())
-    except ValueError:
-        raise BusinessException(f"amount {raw!r} is not a number") from None
+# A plain amount: digits with optional thousands groups and an optional decimal part.
+_AMOUNT_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?")
+_AMBIGUOUS_RE = re.compile(r"[+-]?\d{1,3},\d{3}")  # 1,250: 1250 (US) or 1.25 (DE)?
+
+
+def parse_amount(raw: Any, decimal_comma: bool = False) -> Decimal:
+    """Business validation before touching the UI (cheap, and keeps bad data out of the ERP).
+
+    Never guesses: ``1250.00`` and ``1,250.00`` are accepted (with
+    ``decimal_comma``: ``1250,00`` and ``1.250,00``); a different separator
+    style, ``1,250`` (1250 or 1.25?), ``NaN``/``inf``, a non-positive amount or
+    more than two decimals raise :class:`BusinessException`.
+    """
+    text = str(raw).strip()
+    if decimal_comma:
+        text = text.translate(str.maketrans(",.", ".,"))
+    if not _AMOUNT_RE.fullmatch(text):
+        example = "1250,00 or 1.250,00" if decimal_comma else "1250.00 or 1,250.00"
+        raise BusinessException(f"amount {raw!r} is not a plain amount (expected e.g. {example})")
+    if _AMBIGUOUS_RE.fullmatch(text):
+        raise BusinessException(f"amount {raw!r} is ambiguous (thousands or decimal separator?); "
+                                "write it with two decimals")
+    amount = Decimal(text.replace(",", ""))
     if amount <= 0:
-        raise BusinessException(f"amount must be positive, got {amount:g}")
-    return amount
+        raise BusinessException(f"amount must be positive, got {raw!r}")
+    if amount != amount.quantize(Decimal("0.01")):
+        raise BusinessException(f"amount {raw!r} has more than two decimals")
+    return amount.quantize(Decimal("0.01"))
 
 
-def build_robot(desktop: Desktop, csv_path: str, queue_path: str, run_dir: str, launch: Optional[str] = None) -> Robot:
+def invoice_key(row: Dict[str, Any]) -> Optional[str]:
+    """Queue reference of an invoice: vendor + invoice number (numbers are unique per vendor only)."""
+    vendor = " ".join(str(row.get("vendor", "")).split())
+    number = str(row.get("invoice_no", "")).strip()
+    return f"{vendor} | {number}" if vendor and number else None
+
+
+def queue_invoices(queue: WorkQueue, csv_path: str) -> List[QueueItem]:
+    """Add the CSV rows to ``queue`` (idempotent: re-loading the same file adds nothing).
+
+    An exact duplicate row is entered once. Rows that share vendor + invoice
+    number but differ otherwise are all queued as conflicts, so each one is
+    reported as a business exception instead of one of them silently winning.
+    """
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
+        rows = [{str(k).strip(): (v or "").strip() for k, v in row.items() if k is not None}
+                for row in csv.DictReader(fh)]
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for line, row in enumerate(rows, 2):  # line 1 is the header
+        if any(row.values()):
+            key = invoice_key(row) or f"{os.path.basename(csv_path)} line {line}"  # reported by enter_invoice
+            group = groups.setdefault(key, [])
+            if row not in group:
+                group.append(row)
+    items = []
+    for key, distinct in groups.items():
+        if len(distinct) == 1:
+            items.append(queue.add(distinct[0], reference=key))
+            continue
+        for n, row in enumerate(distinct, 1):
+            items.append(queue.add(dict(row, _conflicts=len(distinct)), reference=f"{key} #{n}"))
+    return items
+
+
+def build_robot(desktop: Desktop, csv_path: str, queue_path: str, run_dir: str, launch: Optional[str] = None,
+                decimal_comma: bool = False) -> Robot:
     robot = Robot(desktop, name="invoice-entry", run_dir=run_dir)
     queue = WorkQueue("invoices", path=queue_path)
     robot.vars["queue"] = queue
@@ -97,8 +166,14 @@ def build_robot(desktop: Desktop, csv_path: str, queue_path: str, run_dir: str, 
         return desktop.find(SEL["status"], timeout=0).text
 
     def enter_invoice(item: QueueItem) -> Dict[str, Any]:
-        amount = parse_amount(item["amount"])
+        if not item.get("vendor") or not item.get("invoice_no"):
+            raise BusinessException("vendor and invoice_no are required")
+        if item.get("_conflicts"):
+            raise BusinessException(f"invoice {item['invoice_no']} of {item['vendor']} appears "
+                                    f"{item['_conflicts']} times in the CSV with different data; none was entered")
+        amount = parse_amount(item["amount"], decimal_comma)
         robot.log("entering invoice", invoice=item["invoice_no"], attempt=item.attempts)
+        # 1. Fill the form. Nothing is posted yet: a failure here is safe to retry.
         desktop.click(SEL["clear"])                      # known state; status becomes "Cleared"
         desktop.find(SEL["vendor"]).set_text(item["vendor"])
         desktop.find(SEL["invoice_no"]).set_text(item["invoice_no"])
@@ -109,16 +184,26 @@ def build_robot(desktop: Desktop, csv_path: str, queue_path: str, run_dir: str, 
             urgent.check()
         else:
             urgent.uncheck()
-        desktop.click(SEL["save"])
-        # Wait for the application to answer in its status bar.
+        save = desktop.find(SEL["save"])
+
+        # 2. Commit. From the click on, the ERP may have posted the invoice even if
+        #    we never see its answer, so nothing after this point is retried.
         def answered() -> Optional[str]:
             text = status_text()
             return text if text not in ("", "Cleared") else None
 
-        status = desktop.wait_until(answered, timeout=10)
+        try:
+            save.click()
+            status = desktop.wait_until(answered, timeout=10)  # the application answers in its status bar
+        except FailSafeTriggered:
+            raise  # the operator stopped the robot
+        except Exception as exc:
+            raise BusinessException(
+                f"needs review: Save was clicked but the ERP gave no answer ({type(exc).__name__}: {exc}); "
+                f"check whether invoice {item['invoice_no']} was posted before re-queuing it") from exc
         if status.lower().startswith("error"):
             raise BusinessException(status)              # the app rejected the data: do not retry
-        return {"status": status, "amount": amount}
+        return {"status": status, "amount": f"{amount:.2f}"}
 
     @robot.setup
     def open_application() -> None:
@@ -129,8 +214,8 @@ def build_robot(desktop: Desktop, csv_path: str, queue_path: str, run_dir: str, 
 
     @robot.task(retries=1, retry_delay=2)
     def load_queue() -> None:
-        """Load the CSV into the persistent queue (idempotent: references are invoice numbers)."""
-        items = queue.load_csv(csv_path, reference_field="invoice_no")
+        """Load the CSV into the persistent queue (idempotent: references are vendor + invoice number)."""
+        items = queue_invoices(queue, csv_path)
         robot.log(f"queue has {len(queue)} item(s) ({len(items)} from {os.path.basename(csv_path)})")
 
     @robot.task
@@ -154,15 +239,17 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--queue", default=os.path.join(scratch, "invoices.queue.json"), help="queue state (resume) file")
     p.add_argument("--run-dir", default=os.path.join(scratch, "pypilot_runs"))
     p.add_argument("--launch", help="command that starts the ERP client if its window is not open")
+    p.add_argument("--decimal-comma", action="store_true",
+                   help="amounts are written 1.250,00 / 1250,00 (default: 1,250.00 / 1250.00)")
     args = p.parse_args(argv)
 
     with make_desktop() as desktop:
-        robot = build_robot(desktop, args.csv, args.queue, args.run_dir, args.launch)
+        robot = build_robot(desktop, args.csv, args.queue, args.run_dir, args.launch, args.decimal_comma)
         report = robot.run()
         print(report.summary())
         stats = robot.vars.get("stats", {})
         for item in robot.vars["queue"].items:
-            print(f"  {item.reference:10} {item.status:20} {item.error or item.output.get('status', '')}")
+            print(f"  {item.reference:24} {item.status:20} {item.error or item.output.get('status', '')}")
         if stats:
             print(f"success {stats['success']}, business exceptions {stats['business_exception']}, failed {stats['failed']}")
         print(f"report: {os.path.join(report.run_dir or str(robot.run_path), 'report.html')}")

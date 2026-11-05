@@ -312,21 +312,55 @@ class Backend(abc.ABC):
     def set_clipboard(self, text: str) -> None:
         raise NotSupported(f"{self.name} backend has no clipboard support")
 
+    def save_clipboard(self) -> Any:
+        """An opaque snapshot of the clipboard for :meth:`restore_clipboard`.
+
+        Clipboard-mode typing saves the user's clipboard with this and puts it
+        back afterwards. The default keeps only its text; backends that can
+        snapshot every format (images, file lists, spreadsheet ranges) override
+        both methods (the Windows backend does).
+        """
+        return self.get_clipboard()
+
+    def restore_clipboard(self, saved: Any) -> None:
+        """Put back what :meth:`save_clipboard` returned."""
+        self.set_clipboard(saved if saved is not None else "")
+
+    def wait_clipboard_read(self, since: float, timeout: float) -> Optional[bool]:
+        """Wait until an application read the text last put on the clipboard (a paste).
+
+        ``since`` is a :func:`time.monotonic` time: only reads at or after it count.
+        Returns True once it was read, False if it was not read within ``timeout``
+        seconds, or None when the backend cannot tell (the default; the caller then
+        waits a fixed settle time).
+        """
+        return None
+
     # --------------------------------------------------------------- accessibility
     def accessibility_roots(self) -> List[AccessibleNode]:
         """Top-level accessible nodes (usually one per top-level window/application)."""
         raise NotSupported(f"{self.name} backend has no accessibility tree")
 
     def element_at(self, x: int, y: int) -> Optional[AccessibleNode]:
-        """Deepest accessible element at a screen point (default: tree walk)."""
-        best = None
+        """Deepest accessible element at a screen point (default: tree walk).
+
+        Roots are taken in Z-order (front-most first, like :meth:`list_windows`):
+        only the first root that has an element at the point is searched, so a
+        control hidden behind the front-most window is never returned.
+        """
+        pt = (x, y)
         for root in self.accessibility_roots():
+            rb = root.bounds
+            if rb is not None and not rb.contains(pt):
+                continue  # this window is not under the point
+            best, best_area = None, None
             for node in root.walk():
                 b = node.bounds
-                if b is not None and b.contains((x, y)):
-                    if best is None or (b.area <= (best.bounds.area if best.bounds else 1 << 62)):
-                        best = node
-        return best
+                if b is not None and b.contains(pt) and (best_area is None or b.area <= best_area):
+                    best, best_area = node, b.area
+            if best is not None:
+                return best
+        return None
 
     def focused_element(self) -> Optional[AccessibleNode]:
         for root in self.accessibility_roots():

@@ -435,6 +435,10 @@ def _key(key: Any) -> Optional[str]:
     """PyAutoGUI key name -> pypilot canonical key, or ``None`` if the backend has no such key."""
     if not isinstance(key, str) or key == "":
         return None
+    if len(key) == 1 and key.isprintable() and not key.isspace():
+        # A printable character types itself in PyAutoGUI ("^" is a caret, "+" a
+        # plus sign): never let a modifier-symbol alias turn it into a modifier.
+        return key
     k = key if len(key) == 1 else key.lower()
     k = _KEY_MAP.get(k, k)
     try:

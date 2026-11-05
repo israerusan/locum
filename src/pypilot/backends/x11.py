@@ -9,7 +9,11 @@ Features
   that the current keymap cannot produce with at most Shift are bound to a
   *spare* keycode (one with no keysyms) on the fly, exactly like ``xdotool``
   does. Bindings are kept in a small LRU pool, re-used across calls and
-  restored when the backend is closed (or the interpreter exits).
+  restored when the backend is closed (or garbage collected). Keycodes are
+  claimed under a server grab and listed in the ``_PYPILOT_SCRATCH_KEYCODES``
+  root property, so several backends (in one or more processes) never share
+  one. Characters follow the active XKB group (second layout) like a user's
+  keystrokes would.
 * **Screenshots** via ``mss`` (fast SHM path) with an ``XGetImage`` fallback,
   always returned as ``RGB`` PIL images; regions partially outside the screen
   are padded with black so pixel (0, 0) is always the region's top-left.
@@ -18,13 +22,16 @@ Features
 * **Windows** via EWMH (``_NET_CLIENT_LIST_STACKING``, ``_NET_ACTIVE_WINDOW``,
   ``_NET_WM_STATE``, ``_NET_MOVERESIZE_WINDOW``, ``_NET_CLOSE_WINDOW``...), with
   an ICCCM / bare-X fallback when no window manager is running (e.g. Xvfb).
-* **Clipboard** through ``xclip`` / ``xsel`` / ``wl-copy`` when installed.
+* **Clipboard** through ``xclip`` / ``xsel`` / ``wl-copy`` when installed, else
+  natively (:mod:`._x11clip`: the backend owns ``CLIPBOARD`` and serves it,
+  large texts with the ``INCR`` protocol).
 * **Accessibility** through AT-SPI (``gi.repository.Atspi`` / ``pyatspi``) when
   importable, exposed as :class:`AtspiNode` with portable role names.
 
 The X connection is shared by all threads and guarded by a re-entrant lock;
 every injected event is followed by ``XSync`` so the server has processed it
-before the primitive returns.
+before the primitive returns. A lost X connection raises
+:class:`~pypilot.errors.BackendError`.
 
 Under a pure Wayland session XTEST only reaches XWayland clients; use the
 backend inside an X11 session for full-desktop control.
@@ -32,6 +39,8 @@ backend inside an X11 session for full-desktop control.
 
 from __future__ import annotations
 
+import collections
+import functools
 import os
 import shutil
 import subprocess
@@ -168,6 +177,12 @@ def _is_keypad_keysym(ks: int) -> bool:
     return 0xFF80 <= ks <= 0xFFBD
 
 
+def _is_char_keysym(ks: int) -> bool:
+    """True for keysyms of printable characters (Latin-1 or the Unicode keysym range),
+    the only keysyms whose key differs between keyboard layouts (XKB groups)."""
+    return 0x20 <= ks <= 0x7E or 0xA0 <= ks <= 0xFF or ks & 0xFF000000 == 0x01000000
+
+
 def _lower_upper(ks: int) -> Tuple[int, int]:
     """(lowercase, uppercase) keysym pair for Latin-1/Unicode letters, else (ks, ks)."""
     if ks < 0x100:
@@ -182,7 +197,11 @@ def _lower_upper(ks: int) -> Tuple[int, int]:
     return char_to_keysym(lo), char_to_keysym(up)
 
 
+#: Held modifiers that turn a character tap into a shortcut (CapsLock is then ignored).
+_COMMAND_MODIFIERS = ("ctrl", "ctrl_r", "alt", "alt_r", "cmd", "cmd_r")
+
 # --------------------------------------------------------------------------- lazy imports
+
 class _XlibModules:
     """Holder for lazily imported python-xlib modules."""
 
@@ -759,12 +778,14 @@ class _InputState:
     """State that must be cleaned up even if the backend is garbage collected.
 
     Held separately from :class:`X11Backend` so a :func:`weakref.finalize`
-    callback can restore the keyboard mapping and release stuck keys without
-    keeping the backend alive.
+    callback can restore the keyboard mapping, release stuck keys and close the
+    helper connections (clipboard owner, screenshot grabbers) without keeping
+    the backend alive.
     """
 
-    def __init__(self, display: Any, lock: threading.RLock, remap_settle: float) -> None:
+    def __init__(self, display: Any, lock: threading.RLock, remap_settle: float, display_name: str = "") -> None:
         self.display = display
+        self.display_name = display_name
         self.lock = lock
         self.remap_settle = remap_settle
         self.bound: Dict[int, int] = {}  # keysym -> scratch keycode
@@ -773,19 +794,78 @@ class _InputState:
         self.last_used: Dict[int, float] = {}  # scratch keycode -> monotonic time of last use
         self.held_keycodes: Dict[int, int] = {}  # keycode -> press count
         self.held_buttons: set = set()
+        self.clipboard: Any = None  # native X11Clipboard (own connection + serving thread)
+        self.mss_closers: List[Any] = []  # weakref.finalize objects closing per-thread mss grabbers
         self.closed = False
+        # A KeyboardInterrupt (or other BaseException) landed inside an X call: python-xlib
+        # may have been waiting for a reply and its connection state is now unusable (every
+        # later request would block forever). The connection is dropped and reopened on demand.
+        self.desynced = False
+
+
+class _MssHolder:
+    """Thread-local owner of one mss grabber; its finalizer closes the grabber."""
+
+    __slots__ = ("sct", "__weakref__")
+
+    def __init__(self, sct: Any) -> None:
+        self.sct = sct
+
+
+def _close_quietly(obj: Any) -> None:
+    try:
+        obj.close()
+    except Exception:
+        pass
+
+
+def _abandon_display(d: Any) -> None:
+    """Drop a python-xlib connection without talking to the server.
+
+    ``Display.close()`` flushes first, which blocks forever on a connection an
+    interrupt left half way through a request/reply exchange (its internal
+    send/receive lock or "receiving" flag is never reset). Closing the socket
+    directly also wakes other threads blocked on it (they get a connection error).
+    """
+    try:
+        d.display.close_internal("client")
+    except Exception:
+        try:
+            d.display.socket.close()
+        except Exception:
+            pass
 
 
 def _cleanup(state: _InputState) -> None:
-    """Release keys/buttons we hold, restore scratch keycodes and close the display."""
+    """Release keys/buttons we hold, restore scratch keycodes and close every X connection."""
     if state.closed:
         return
     state.closed = True
+    for closer in list(state.mss_closers):
+        try:
+            closer()
+        except Exception:
+            pass
+    state.mss_closers.clear()
+    with state.lock:
+        clipboard, state.clipboard = state.clipboard, None
+    if clipboard is not None:
+        _close_quietly(clipboard)
     try:
         X = _xlib().X
         xtest = _xlib().xtest
         with state.lock:
             d = state.display
+            if state.desynced:
+                # The old connection cannot be used any more (see _InputState.desynced): release
+                # the keys and restore the keymap over a fresh one (that is server-side state).
+                _abandon_display(d)
+                try:
+                    d = _xlib().display.Display(state.display_name)
+                except Exception:
+                    return
+                state.display = d
+                state.desynced = False
             try:
                 for kc in list(state.held_keycodes):
                     xtest.fake_input(d, X.KeyRelease, kc)
@@ -800,8 +880,23 @@ def _cleanup(state: _InputState) -> None:
                     wait = state.remap_settle - (time.monotonic() - newest)
                     if wait > 0:
                         time.sleep(min(wait, 1.0))
-                    for kc, syms in state.original.items():
-                        d.change_keyboard_mapping(kc, [tuple(syms)])
+                    # Restore only keycodes that still hold our keysym: another
+                    # client (e.g. a second backend) may have bound the keycode
+                    # since, and its binding must not be clobbered.
+                    d.grab_server()
+                    try:
+                        restored = set()
+                        for kc, syms in state.original.items():
+                            ours = state.keycode_sym.get(kc)
+                            current = tuple(int(v) for v in d.get_keyboard_mapping(kc, 1)[0])
+                            if ours is not None and current[:1] == (ours,):
+                                d.change_keyboard_mapping(kc, [tuple(syms)])
+                                restored.add(kc)
+                        marks = _scratch_marks(d)
+                        if marks & restored:
+                            _set_scratch_marks(d, marks - restored)
+                    finally:
+                        d.ungrab_server()
                     state.original.clear()
                     state.bound.clear()
                     state.keycode_sym.clear()
@@ -816,7 +911,44 @@ def _cleanup(state: _InputState) -> None:
         pass
 
 
-def _make_error_handler(sink: List[Any]) -> Callable[..., None]:
+#: Root-window property listing the spare keycodes pypilot backends (in any
+#: process) have bound for unicode typing, so they leave each other's alone.
+_SCRATCH_PROP = "_PYPILOT_SCRATCH_KEYCODES"
+
+
+def _scratch_marks(d: Any) -> frozenset:
+    """Keycodes listed in :data:`_SCRATCH_PROP` (empty when unset or unreadable)."""
+    xl = _xlib()
+    try:
+        prop = d.screen().root.get_full_property(d.intern_atom(_SCRATCH_PROP), xl.Xatom.CARDINAL)
+    except xl.error.XError:
+        return frozenset()
+    if prop is None or prop.format != 32:
+        return frozenset()
+    return frozenset(int(v) for v in prop.value)
+
+
+def _set_scratch_marks(d: Any, keycodes: Any) -> None:
+    xl = _xlib()
+    root, atom = d.screen().root, d.intern_atom(_SCRATCH_PROP)
+    if keycodes:
+        root.change_property(atom, xl.Xatom.CARDINAL, 32, sorted(int(k) for k in keycodes))
+    else:
+        root.delete_property(atom)
+
+
+class _ErrorSink:
+    """Recent asynchronous X errors, numbered so callers can tell which are new."""
+
+    def __init__(self, keep: int = 64) -> None:
+        self.seq = 0
+        self.recent: "collections.deque[Tuple[int, Any]]" = collections.deque(maxlen=keep)
+
+    def since(self, seq: int) -> List[Any]:
+        return [err for n, err in list(self.recent) if n > seq]
+
+
+def _make_error_handler(sink: _ErrorSink) -> Callable[..., None]:
     """Error handler for X requests without replies (they fail asynchronously).
 
     Recent errors are kept in ``sink`` so window operations can turn them into
@@ -824,11 +956,42 @@ def _make_error_handler(sink: List[Any]) -> Callable[..., None]:
     """
 
     def handler(err: Any, request: Any = None) -> None:
-        sink.append(err)
-        if len(sink) > 64:
-            del sink[:-64]
+        sink.seq += 1
+        sink.recent.append((sink.seq, err))
 
     return handler
+
+
+def _x_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Turn raw python-xlib failures inside a backend primitive into pypilot errors:
+    a lost/closed connection -> :class:`BackendError`, a window that vanished
+    mid-operation -> :class:`WindowNotFound`, any other X error -> :class:`BackendError`."""
+
+    @functools.wraps(fn)
+    def wrapper(self: "X11Backend", *args: Any, **kwargs: Any) -> Any:
+        if self._state.desynced:
+            self._reconnect()
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as exc:
+            xe = _xlib().error
+            if isinstance(exc, (xe.ConnectionClosedError, xe.DisplayError)):
+                if self._state.closed:
+                    raise BackendError("X11 backend has been closed") from exc
+                raise BackendError(f"Lost connection to X display {self.display_name!r}: {exc}") from exc
+            if isinstance(exc, (xe.BadWindow, xe.BadDrawable)):
+                raise WindowNotFound(f"X11 window vanished during {fn.__name__}: {exc}") from exc
+            if isinstance(exc, xe.XError):
+                raise BackendError(f"X error during {fn.__name__}: {exc}") from exc
+            raise
+        except BaseException:
+            # KeyboardInterrupt (Ctrl+C) / SystemExit, typically while python-xlib waited
+            # for a reply: the connection is out of sync and would block every later call
+            # (and the exit-time cleanup). Drop it; the next call reconnects.
+            self._desync()
+            raise
+
+    return wrapper
 
 
 # --------------------------------------------------------------------------- backend
@@ -873,6 +1036,8 @@ class X11Backend(Backend):
                 f"python-xlib is required for the X11 backend ({exc}); install it with `pip install python-xlib`"
             ) from exc
         self._xl = xl
+        if screenshot_method not in ("auto", "mss", "xlib"):
+            raise ValueError("screenshot_method must be 'auto', 'mss' or 'xlib'")
         display_name = display or os.environ.get("DISPLAY")
         if not display_name:
             raise BackendUnavailable("No X display: $DISPLAY is not set and no display name was given")
@@ -880,8 +1045,6 @@ class X11Backend(Backend):
             self._d = xl.display.Display(display_name)
         except Exception as exc:
             raise BackendUnavailable(f"Cannot open X display {display_name!r}: {exc}") from exc
-        if screenshot_method not in ("auto", "mss", "xlib"):
-            raise ValueError("screenshot_method must be 'auto', 'mss' or 'xlib'")
 
         self.display_name = display_name
         self._lock = threading.RLock()
@@ -896,19 +1059,24 @@ class X11Backend(Backend):
         self._modmap_dirty = True
         self._numlock_mask = 0
         self._scratch_pool: Optional[List[int]] = None
+        self._scratch_borrow = False
+        self._foreign_scratch: frozenset = frozenset()  # keycodes bound by other pypilot backends
         self._max_scratch = max_scratch_keycodes
         self._held_keys: Dict[str, Tuple[int, Optional[int]]] = {}  # key -> (keycode, extra shift keycode)
-        self._async_errors: List[Any] = []
+        self._async_errors = _ErrorSink()
         # A closure (not a bound method) so the display does not keep ``self`` alive.
         self._d.set_error_handler(_make_error_handler(self._async_errors))
         self._screenshot_method = screenshot_method
         self._mss_local = threading.local()
-        self._mss_all: List[Any] = []
         self._mss_broken = screenshot_method == "xlib"
+        self._mss_failures = 0  # consecutive failed mss grabs
         self._restore_geometry: Dict[int, Rect] = {}
         self._iconified: set = set()  # windows we unmapped to "minimize" them without a WM
-        self._clip_native: Any = None
-        self._clip_cmds = self._detect_clipboard(clipboard_tool)
+        try:
+            self._clip_cmds = self._detect_clipboard(clipboard_tool)
+        except Exception:
+            self._d.close()
+            raise
         if accessibility is True:
             self._atspi_source: Any = "auto"
         elif accessibility:
@@ -917,7 +1085,7 @@ class X11Backend(Backend):
             self._atspi_source = None
         self._atspi_mod: Any = None
         self._atspi_checked = False
-        self._state = _InputState(self._d, self._lock, float(remap_settle))
+        self._state = _InputState(self._d, self._lock, float(remap_settle), display_name)
         self._finalizer = weakref.finalize(self, _cleanup, self._state)
 
     # =================================================================== basics
@@ -937,16 +1105,7 @@ class X11Backend(Backend):
         return self._state.closed
 
     def close(self) -> None:
-        """Release held keys/buttons, restore remapped keycodes and close the X connection."""
-        for sct in self._mss_all:
-            try:
-                sct.close()
-            except Exception:
-                pass
-        self._mss_all.clear()
-        if self._clip_native is not None:
-            self._clip_native.close()
-            self._clip_native = None
+        """Release held keys/buttons, restore remapped keycodes and close the X connections."""
         self._finalizer()
 
     def __enter__(self) -> "X11Backend":
@@ -959,10 +1118,39 @@ class X11Backend(Backend):
         if self._state.closed:
             raise BackendError("X11 backend has been closed")
 
+    def _desync(self) -> None:
+        """Drop the display connection after an interrupt left it mid-request (see ``_x_errors``)."""
+        st = self._state
+        if st.closed or st.desynced:
+            return
+        st.desynced = True
+        _abandon_display(self._d)
+
+    def _reconnect(self) -> None:
+        """Replace a connection dropped by :meth:`_desync` with a fresh one."""
+        with self._lock:
+            st = self._state
+            if st.closed:
+                raise BackendError("X11 backend has been closed")
+            if not st.desynced:
+                return
+            try:
+                d = self._xl.display.Display(self.display_name)
+            except Exception as exc:
+                raise BackendError(f"Lost connection to X display {self.display_name!r} and could not reconnect: {exc}") from exc
+            d.set_error_handler(_make_error_handler(self._async_errors))
+            self._d = st.display = d
+            self._screen = d.screen()
+            self._root = self._screen.root
+            self._keymap_dirty = True
+            self._modmap_dirty = True
+            st.desynced = False
+
     def _sync(self) -> None:
         try:
             self._d.sync()
         except self._xl.error.ConnectionClosedError as exc:
+            self._check()  # closed by close() in another thread
             raise BackendError(f"Lost connection to X display {self.display_name!r}: {exc}") from exc
 
     def _need_xtest(self) -> None:
@@ -980,16 +1168,18 @@ class X11Backend(Backend):
         try:
             g = self._root.get_geometry()
             return int(g.width), int(g.height)
-        except Exception:
+        except self._xl.error.XError:
             return int(self._screen.width_in_pixels), int(self._screen.height_in_pixels)
 
     # ==================================================================== mouse
+    @_x_errors
     def mouse_position(self) -> Point:
         self._check()
         with self._lock:
             p = self._root.query_pointer()
             return Point(int(p.root_x), int(p.root_y))
 
+    @_x_errors
     def mouse_move(self, x: int, y: int) -> None:
         self._check()
         with self._lock:
@@ -1005,6 +1195,7 @@ class X11Backend(Backend):
     def _button(self, button: Any) -> int:
         return BUTTONS[MouseButton.coerce(button)]
 
+    @_x_errors
     def mouse_down(self, button: MouseButton = MouseButton.LEFT) -> None:
         self._need_xtest()
         btn = self._button(button)
@@ -1013,6 +1204,7 @@ class X11Backend(Backend):
             self._state.held_buttons.add(btn)
             self._sync()
 
+    @_x_errors
     def mouse_up(self, button: MouseButton = MouseButton.LEFT) -> None:
         self._need_xtest()
         btn = self._button(button)
@@ -1021,6 +1213,7 @@ class X11Backend(Backend):
             self._state.held_buttons.discard(btn)
             self._sync()
 
+    @_x_errors
     def scroll(self, dx: int = 0, dy: int = 0) -> None:
         """Scroll by wheel notches (``dy > 0`` up, ``dx > 0`` right) using buttons 4-7."""
         self._need_xtest()
@@ -1054,6 +1247,9 @@ class X11Backend(Backend):
             count = self._max_kc - self._min_kc + 1
             self._keymap = [tuple(int(s) for s in syms) for syms in self._d.get_keyboard_mapping(self._min_kc, count)]
             self._keymap_dirty = False
+            # Spare keycodes other pypilot backends have bound are not real keys:
+            # they may be re-bound at any moment, so never type through them.
+            self._foreign_scratch = _scratch_marks(self._d) - set(self._state.keycode_sym)
         if self._modmap_dirty:
             self._numlock_mask = 0
             try:
@@ -1071,26 +1267,43 @@ class X11Backend(Backend):
             return self._keymap[i]
         return ()
 
-    def _lookup(self, keysym: int) -> Optional[Tuple[int, int]]:
-        """Find ``(keycode, level)`` producing ``keysym`` with level 0 (plain) or 1 (shift)."""
+    def _group_syms(self, keycode: int, group: int = 0) -> Tuple[int, int]:
+        """(plain, shifted) keysyms of ``keycode`` in XKB group ``group`` (0 or 1).
+
+        The core keymap of an XKB server lists group 1 in columns 0-1 and group 2
+        in columns 2-3 (single-group keys repeat group 1 there).
+        """
+        syms = self._syms(keycode)
+        c = 2 * group
+        return (syms[c] if len(syms) > c else 0), (syms[c + 1] if len(syms) > c + 1 else 0)
+
+    def _lookup(self, keysym: int, group: int = 0) -> Optional[Tuple[int, int]]:
+        """Find ``(keycode, level)`` producing ``keysym`` with level 0 (plain) or 1 (shift)
+        while XKB group ``group`` is active. Groups 3 and 4 cannot be read reliably
+        from the core keymap, so nothing is found for them."""
+        if group not in (0, 1):
+            return None
+        c = 2 * group
         best: Optional[Tuple[int, int]] = None
+        foreign = self._foreign_scratch
         for i, syms in enumerate(self._keymap):
             kc = i + self._min_kc
-            if not syms:
+            if len(syms) <= c or kc in foreign:
                 continue
-            if syms[0] == keysym:
+            if syms[c] == keysym:
                 # A keycode whose second column is NoSymbol also yields keysym
                 # with shift; plain is always preferred.
                 return kc, 0
-            if len(syms) > 1 and syms[1] == keysym and best is None:
+            if len(syms) > c + 1 and syms[c + 1] == keysym and best is None:
                 best = (kc, 1)
         if best is None:
             lo, up = _lower_upper(keysym)
             if up == keysym and lo != keysym:
                 # Uppercase letter on a key listing only the lowercase keysym.
                 for i, syms in enumerate(self._keymap):
-                    if syms and syms[0] == lo and (len(syms) < 2 or syms[1] == 0):
-                        return i + self._min_kc, 1
+                    if len(syms) > c and syms[c] == lo and (len(syms) <= c + 1 or syms[c + 1] == 0):
+                        if i + self._min_kc not in foreign:
+                            return i + self._min_kc, 1
         return best
 
     def _shift_keycode(self) -> int:
@@ -1106,6 +1319,7 @@ class X11Backend(Backend):
             # Keycode 8 maps to evdev KEY_RESERVED and is ignored by some
             # toolkits; use high keycodes first.
             pool = sorted((kc for kc in empty if kc > 8), reverse=True)
+            self._scratch_borrow = not pool  # no spare keycode at all: borrow a real one
             if not pool:
                 pool = [self._max_kc]
             if self._max_scratch is not None:
@@ -1114,7 +1328,13 @@ class X11Backend(Backend):
         return self._scratch_pool
 
     def _scratch_bind(self, keysym: int) -> int:
-        """Bind ``keysym`` to a spare keycode (re-using an existing binding) and return it."""
+        """Bind ``keysym`` to a spare keycode (re-using an existing binding) and return it.
+
+        Other clients -- including other :class:`X11Backend` instances, in this
+        process or another one -- may bind spare keycodes too. A keycode is only
+        taken when the server still shows it empty (or bound by us), checked and
+        changed under a server grab so two backends never share one.
+        """
         st = self._state
         kc = st.bound.get(keysym)
         if kc is not None and self._syms(kc)[:1] == (keysym,):
@@ -1122,33 +1342,63 @@ class X11Backend(Backend):
             return kc
         pool = self._pool()
         held = set(st.held_keycodes)
-        free = [k for k in pool if k not in st.keycode_sym and k not in held]
-        if free:
-            kc = free[0]
-        else:
-            candidates = [k for k in pool if k not in held]
-            if not candidates:
-                raise BackendError("No spare keycode available to type this character (all are held down)")
-            kc = min(candidates, key=lambda k: st.last_used.get(k, 0.0))
-            wait = st.remap_settle - (time.monotonic() - st.last_used.get(kc, 0.0))
+        free = [
+            k for k in pool
+            if k not in st.keycode_sym and k not in held and (self._scratch_borrow or not any(self._syms(k)))
+        ]
+        ours = sorted((k for k in pool if k in st.keycode_sym and k not in held), key=lambda k: st.last_used.get(k, 0.0))
+        if not free and not ours:
+            raise BackendError("No spare keycode available to type this character (all are in use or held down)")
+        if not free:
+            wait = st.remap_settle - (time.monotonic() - st.last_used.get(ours[0], 0.0))
             if wait > 0:
                 time.sleep(wait)
-        if kc not in st.original:
-            st.original[kc] = self._syms(kc) or (0,)
-        old = st.keycode_sym.pop(kc, None)
-        if old is not None:
-            st.bound.pop(old, None)
-        self._d.change_keyboard_mapping(kc, [(keysym, keysym)])
+        d = self._d
+        chosen: Optional[int] = None
+        current: Tuple[int, ...] = ()
+        d.grab_server()
+        try:
+            for cand in free + ours:
+                current = tuple(int(v) for v in d.get_keyboard_mapping(cand, 1)[0])
+                mine = st.keycode_sym.get(cand)
+                if mine is not None:
+                    if current[:1] == (mine,):
+                        chosen = cand
+                        break
+                    # Someone else re-bound our keycode: it is theirs now.
+                    st.keycode_sym.pop(cand, None)
+                    st.bound.pop(mine, None)
+                    st.original.pop(cand, None)
+                elif self._scratch_borrow or not any(current):
+                    chosen = cand
+                    break
+                self._set_cached_syms(cand, current)  # bound by another client
+            if chosen is None:
+                raise BackendError("No spare keycode available to type this character (all are in use by other clients)")
+            if chosen not in st.original:
+                st.original[chosen] = current or (0,)
+            old = st.keycode_sym.pop(chosen, None)
+            if old is not None:
+                st.bound.pop(old, None)
+            marks = _scratch_marks(d)
+            if chosen not in marks:
+                _set_scratch_marks(d, marks | {chosen})
+            d.change_keyboard_mapping(chosen, [(keysym, keysym)])
+        finally:
+            d.ungrab_server()
         self._sync()
-        st.bound[keysym] = kc
-        st.keycode_sym[kc] = keysym
-        st.last_used[kc] = time.monotonic()
+        st.bound[keysym] = chosen
+        st.keycode_sym[chosen] = keysym
+        st.last_used[chosen] = time.monotonic()
         # Keep our cache coherent without waiting for MappingNotify.
-        i = kc - self._min_kc
+        self._set_cached_syms(chosen, (keysym, keysym))
+        return chosen
+
+    def _set_cached_syms(self, keycode: int, syms: Tuple[int, ...]) -> None:
+        i = keycode - self._min_kc
         if 0 <= i < len(self._keymap):
-            width = max(len(self._keymap[i]), 2)
-            self._keymap[i] = (keysym, keysym) + (0,) * (width - 2)
-        return kc
+            width = max(len(self._keymap[i]), len(syms))
+            self._keymap[i] = tuple(syms) + (0,) * (width - len(syms))
 
     def _pointer_mask(self) -> int:
         try:
@@ -1156,16 +1406,26 @@ class X11Backend(Backend):
         except Exception:
             return 0
 
+    @staticmethod
+    def _group(mask: int) -> int:
+        """Active XKB group (0 = first layout) from a core event/pointer state mask."""
+        return (mask >> 13) & 3
+
     def _resolve(self, keysym: int, *, text: bool, mask: int = 0, group: int = 0) -> Tuple[int, bool]:
-        """Return ``(keycode, needs_shift)`` for ``keysym``, binding a scratch keycode if needed."""
-        hit = self._lookup(keysym) if group == 0 or not text else None
+        """Return ``(keycode, needs_shift)`` for ``keysym``, binding a scratch keycode if needed.
+
+        Character keysyms are looked up in the active XKB ``group`` (the key that
+        types "y" differs between layouts); other keys (modifiers, Return, F-keys)
+        are the same in every group.
+        """
+        if not _is_char_keysym(keysym):
+            group = 0
+        hit = self._lookup(keysym, group)
         if hit is None:
             return self._scratch_bind(keysym), False
         kc, level = hit
         need_shift = level == 1
-        syms = self._syms(kc)
-        col0 = syms[0] if syms else 0
-        col1 = syms[1] if len(syms) > 1 else 0
+        col0, col1 = self._group_syms(kc, group)
         if self._numlock_mask and mask & self._numlock_mask and _is_keypad_keysym(col1) and col0 != col1 and col0 and col1:
             need_shift = not need_shift  # NumLock selects the second keypad column
         elif text and mask & self._xl.X.LockMask:
@@ -1190,6 +1450,7 @@ class X11Backend(Backend):
         if kc in self._state.keycode_sym:
             self._state.last_used[kc] = time.monotonic()
 
+    @_x_errors
     def key_down(self, key: str) -> None:
         """Press a canonical key or single character (Shift is added for shifted characters)."""
         self._need_xtest()
@@ -1202,7 +1463,13 @@ class X11Backend(Backend):
                 self._sync()
                 return
             self._ensure_keymap()
-            kc, need_shift = self._resolve(keysym, text=False, mask=self._pointer_mask() if self._numlock_mask else 0)
+            # A character tapped without Ctrl/Alt/Super is text: honour CapsLock so
+            # key_down("A") types "A" whatever the lock state. In shortcuts the
+            # keysym's own level is used (ctrl+a must not gain a Shift).
+            text = len(key) == 1 and not any(k in self._held_keys for k in _COMMAND_MODIFIERS)
+            char = _is_char_keysym(keysym)
+            mask = self._pointer_mask() if (text or char or self._numlock_mask) else 0
+            kc, need_shift = self._resolve(keysym, text=text, mask=mask, group=self._group(mask))
             shift_kc: Optional[int] = None
             if need_shift and not any(k in self._held_keys for k in ("shift", "shift_r")):
                 shift_kc = self._shift_keycode()
@@ -1211,6 +1478,7 @@ class X11Backend(Backend):
             self._held_keys[key] = (kc, shift_kc)
             self._sync()
 
+    @_x_errors
     def key_up(self, key: str) -> None:
         self._need_xtest()
         keysym = key_to_keysym(key)
@@ -1218,21 +1486,35 @@ class X11Backend(Backend):
             rec = self._held_keys.pop(key, None)
             if rec is None:
                 self._ensure_keymap()
-                kc, _ = self._resolve(keysym, text=False)
+                mask = self._pointer_mask() if _is_char_keysym(keysym) else 0
+                kc, _ = self._resolve(keysym, text=False, group=self._group(mask))
                 shift_kc = None
             else:
                 kc, shift_kc = rec
-            # Release every outstanding press of this keycode so a repeated
-            # key_down() never leaves the key stuck.
-            self._release(kc)
-            while self._state.held_keycodes.get(kc, 0) > 0 and not any(
-                rk == kc for rk, _ in self._held_keys.values()
-            ):
-                self._release(kc)
+            self._unhold(kc)
             if shift_kc is not None:
-                self._release(shift_kc)
+                self._unhold(shift_kc)
             self._sync()
 
+    def _unhold(self, kc: int) -> None:
+        """Drop one hold of ``kc``; release the key unless another held key still needs it.
+
+        XTEST does not count presses, so a single release lifts the key: the
+        implicit Shift of ``key_down("A")`` must stay down while ``shift`` (or
+        another shifted character) is still held, and a repeated ``key_down()``
+        must never leave the key stuck.
+        """
+        if any(kc in (rk, sk) for rk, sk in self._held_keys.values()):
+            n = self._state.held_keycodes.get(kc, 0) - 1
+            if n > 0:
+                self._state.held_keycodes[kc] = n
+            else:
+                self._state.held_keycodes.pop(kc, None)
+            return
+        self._release(kc)
+        self._state.held_keycodes.pop(kc, None)
+
+    @_x_errors
     def release_all(self) -> None:
         """Release every key and mouse button this backend currently holds down."""
         self._need_xtest()
@@ -1255,6 +1537,7 @@ class X11Backend(Backend):
         if shift_kc is not None:
             self._release(shift_kc)
 
+    @_x_errors
     def type_text(self, text: str) -> None:
         """Type ``text`` exactly, independent of the keyboard layout.
 
@@ -1273,7 +1556,7 @@ class X11Backend(Backend):
         with self._lock:
             self._ensure_keymap()
             mask = self._pointer_mask()
-            group = (mask >> 13) & 3  # XKB group; group != 0 means a non-primary layout is active
+            group = self._group(mask)  # XKB group; group != 0 means a non-primary layout is active
             shift_held = any(k in self._held_keys for k in ("shift", "shift_r"))
             shift_kc: Optional[int] = None
             caps_kc: Optional[int] = None  # set while CapsLock is temporarily switched off
@@ -1318,12 +1601,11 @@ class X11Backend(Backend):
         lo, up = _lower_upper(keysym)
         if lo == up or keysym != lo:
             return False
-        hit = self._lookup(keysym) if group == 0 else None
+        hit = self._lookup(keysym, group)
         if hit is None:
             return True  # will be bound to a scratch keycode
         kc, level = hit
-        syms = self._syms(kc)
-        col1 = syms[1] if len(syms) > 1 else 0
+        col1 = self._group_syms(kc, group)[1]
         return not (level == 0 and col1 in (0, up))
 
     def _caps_lock_keycode(self) -> Optional[int]:
@@ -1338,6 +1620,7 @@ class X11Backend(Backend):
         return hit[0] if hit[0] in lock_codes else None
 
     # =================================================================== screen
+    @_x_errors
     def virtual_screen(self) -> Rect:
         self._check()
         with self._lock:
@@ -1363,6 +1646,7 @@ class X11Backend(Backend):
             pass
         return 1.0
 
+    @_x_errors
     def monitors(self) -> List[Monitor]:
         """Monitors from RandR (primary first, then left-to-right, top-to-bottom)."""
         self._check()
@@ -1419,8 +1703,15 @@ class X11Backend(Backend):
         return out
 
     def _mss(self) -> Any:
-        sct = getattr(self._mss_local, "sct", None)
-        if sct is None:
+        """This thread's mss grabber (older mss releases are bound to their thread).
+
+        Each grabber has its own X connection. It lives in a thread-local slot,
+        so it is closed as soon as its thread exits (or the backend is closed or
+        garbage collected); short-lived worker threads therefore never pile up
+        X connections.
+        """
+        holder = getattr(self._mss_local, "holder", None)
+        if holder is None:
             import mss  # hard dependency, but keep the import lazy
 
             # mss >= 10 exposes ``mss.MSS``; older releases only the ``mss.mss`` factory.
@@ -1431,9 +1722,18 @@ class X11Backend(Backend):
                 if os.environ.get("DISPLAY") != self.display_name:
                     raise
                 sct = factory()
-            self._mss_local.sct = sct
-            self._mss_all.append(sct)
-        return sct
+            holder = _MssHolder(sct)
+            with self._lock:
+                closers = self._state.mss_closers
+                closers[:] = [c for c in closers if c.alive]
+                closers.append(weakref.finalize(holder, _close_quietly, sct))
+            self._mss_local.holder = holder
+        return holder.sct
+
+    def _drop_mss(self) -> None:
+        holder = getattr(self._mss_local, "holder", None)
+        if holder is not None:
+            del self._mss_local.holder  # the finalizer closes the grabber
 
     def _grab_mss(self, r: Rect) -> Any:
         from PIL import Image
@@ -1466,13 +1766,24 @@ class X11Backend(Backend):
     def _grab(self, r: Rect) -> Any:
         if not self._mss_broken:
             try:
-                return self._grab_mss(r)
-            except Exception:
+                img = self._grab_mss(r)
+            except Exception as exc:
+                self._drop_mss()  # a fresh grabber (and connection) is made next time
+                self._check()
                 if self._screenshot_method == "mss":
-                    raise
-                self._mss_broken = True
+                    raise BackendError(f"mss screenshot failed: {exc}") from exc
+                # A one-off failure (e.g. the X server's client limit was hit
+                # momentarily) only falls back for this grab; give up on mss
+                # after repeated failures.
+                self._mss_failures += 1
+                if self._mss_failures >= 3:
+                    self._mss_broken = True
+            else:
+                self._mss_failures = 0
+                return img
         return self._grab_xlib(r)
 
+    @_x_errors
     def screenshot(self, region: Optional[Rect] = None) -> Any:
         """RGB screenshot of ``region`` (default: whole screen); off-screen parts are black."""
         from PIL import Image
@@ -1619,9 +1930,23 @@ class X11Backend(Backend):
         return out
 
     def _abs_geometry(self, win: Any) -> Rect:
+        """Root-relative rect of ``win`` *including* its X border: the box whose
+        top-left corner ``ConfigureWindow(x, y)`` positions (see :meth:`_configure_outer`)."""
         g = win.get_geometry()
         t = self._root.translate_coords(win, 0, 0)
-        return Rect(int(t.x), int(t.y), int(g.width), int(g.height))
+        bw = int(g.border_width)
+        return Rect(int(t.x) - bw, int(t.y) - bw, int(g.width) + 2 * bw, int(g.height) + 2 * bw)
+
+    @staticmethod
+    def _check_x_rect(r: Rect) -> None:
+        """X geometry is INT16 positions and CARD16 sizes; refuse anything else up front."""
+        if not (-0x8000 <= r.left <= 0x7FFF and -0x8000 <= r.top <= 0x7FFF and 0 < r.width <= 0xFFFF and 0 < r.height <= 0xFFFF):
+            raise ValueError(f"Window rect {r} is outside the X11 coordinate range (x/y -32768..32767, size 1..65535)")
+
+    def _configure_outer(self, win: Any, r: Rect, **kwargs: Any) -> None:
+        """Place ``win`` (no window manager) so that its rect including the X border is ``r``."""
+        bw = int(win.get_geometry().border_width)
+        win.configure(x=r.left, y=r.top, width=max(1, r.width - 2 * bw), height=max(1, r.height - 2 * bw), **kwargs)
 
     def _frame_extents(self, win: Any) -> Tuple[int, int, int, int]:
         ext = self._prop_list(win, "_NET_FRAME_EXTENTS")
@@ -1703,6 +2028,7 @@ class X11Backend(Backend):
         except self._xl.error.XError:
             return 0
 
+    @_x_errors
     def list_windows(self) -> List[WindowInfo]:
         """Top-level client windows, front-most first (EWMH, or a bare-X fallback)."""
         self._check()
@@ -1718,6 +2044,7 @@ class X11Backend(Backend):
                     out.append(info)
             return out
 
+    @_x_errors
     def active_window(self) -> Optional[WindowInfo]:
         self._check()
         with self._lock:
@@ -1738,7 +2065,7 @@ class X11Backend(Backend):
             raise WindowNotFound(f"Invalid X11 window handle {handle!r}") from None
         win = self._win_obj(xid)
         try:
-            win.get_geometry()
+            win.get_attributes()  # unlike GetGeometry, this fails for pixmaps and other non-windows
         except self._xl.error.XError:
             raise WindowNotFound(f"X11 window {xid:#x} does not exist") from None
         return win
@@ -1752,21 +2079,25 @@ class X11Backend(Backend):
         else:
             win.send_event(ev, event_mask=0)
 
-    def _checked_sync(self, xid: int, what: str) -> None:
-        start = len(self._async_errors)
+    def _checked_sync(self, xid: int, what: str, since: Optional[int] = None) -> None:
+        """XSync and raise for X errors reported since ``since`` (an error-sink sequence number)."""
+        if since is None:
+            since = self._async_errors.seq
         self._sync()
-        errs = self._async_errors[start:]
+        errs = self._async_errors.since(since)
         if errs:
             err = errs[-1]
             if isinstance(err, (self._xl.error.BadWindow, self._xl.error.BadDrawable)):
                 raise WindowNotFound(f"X11 window {xid:#x} disappeared during {what}")
             raise BackendError(f"X error during {what} of window {xid:#x}: {err}")
 
+    @_x_errors
     def activate_window(self, handle: Any) -> None:
         """Raise and focus a window (``_NET_ACTIVE_WINDOW``; map + raise + focus without a WM)."""
         self._check()
         X = self._xl.X
         with self._lock:
+            since = self._async_errors.seq
             win = self._handle(handle)
             supported = self._supported()
             if self._has_wm_feature("_NET_ACTIVE_WINDOW", supported):
@@ -1785,19 +2116,23 @@ class X11Backend(Backend):
                         win.set_input_focus(X.RevertToParent, X.CurrentTime)
                 except self._xl.error.XError:
                     pass
-            self._checked_sync(win.id, "activate")
+            self._checked_sync(win.id, "activate", since)
 
+    @_x_errors
     def move_window(self, handle: Any, rect: Rect) -> None:
         """Move/resize so the window's *outer* rect (including WM frame) becomes ``rect``."""
         self._check()
         r = Rect.coerce(rect)
         if r.width <= 0 or r.height <= 0:
             raise ValueError(f"Window size must be positive, got {r}")
+        self._check_x_rect(r)
         with self._lock:
+            since = self._async_errors.seq
             win = self._handle(handle)
             supported = self._supported()
             l, rr, t, b = self._frame_extents(win)
-            cw, ch = max(1, r.width - l - rr), max(1, r.height - t - b)
+            bw = int(win.get_geometry().border_width)
+            cw, ch = max(1, r.width - l - rr - 2 * bw), max(1, r.height - t - b - 2 * bw)
             if supported:
                 states = set(self._prop_list(win, "_NET_WM_STATE"))
                 maxed = {self._atom("_NET_WM_STATE_MAXIMIZED_VERT"), self._atom("_NET_WM_STATE_MAXIMIZED_HORZ")} & states
@@ -1809,10 +2144,13 @@ class X11Backend(Backend):
                 flags = 1 | (0xF << 8) | (2 << 12)  # NorthWest gravity, x/y/w/h present, pager source
                 self._client_message(win, "_NET_MOVERESIZE_WINDOW", [flags, r.left, r.top, cw, ch])
             else:
-                win.configure(x=r.left + (l if not supported else 0), y=r.top + (t if not supported else 0), width=cw, height=ch)
+                x, y = r.left + (l if not supported else 0), r.top + (t if not supported else 0)
+                self._check_x_rect(Rect(x, y, cw, ch))
+                win.configure(x=x, y=y, width=cw, height=ch)
             self._restore_geometry.pop(win.id, None)
-            self._checked_sync(win.id, "move")
+            self._checked_sync(win.id, "move", since)
 
+    @_x_errors
     def set_window_state(self, handle: Any, state: str) -> None:
         """``state`` in {"minimized", "maximized", "normal"}."""
         self._check()
@@ -1821,6 +2159,7 @@ class X11Backend(Backend):
             raise ValueError(f"Unknown window state {state!r}; expected minimized, maximized or normal")
         X = self._xl.X
         with self._lock:
+            since = self._async_errors.seq
             win = self._handle(handle)
             supported = self._supported()
             max_atoms = [self._atom("_NET_WM_STATE_MAXIMIZED_VERT"), self._atom("_NET_WM_STATE_MAXIMIZED_HORZ")]
@@ -1844,7 +2183,7 @@ class X11Backend(Backend):
                     target = max(mons, key=lambda m: (m.rect.intersect(cur).area if m.rect.intersect(cur) else 0, m.is_primary)).rect
                     if win.id not in self._restore_geometry:
                         self._restore_geometry[win.id] = cur
-                    win.configure(x=target.left, y=target.top, width=target.width, height=target.height, stack_mode=X.Above)
+                    self._configure_outer(win, target, stack_mode=X.Above)
             else:  # normal
                 if supported:
                     if ewmh_state:
@@ -1861,14 +2200,16 @@ class X11Backend(Backend):
                     self._iconified.discard(win.id)
                     prev = self._restore_geometry.pop(win.id, None)
                     if prev is not None:
-                        win.configure(x=prev.left, y=prev.top, width=prev.width, height=prev.height)
-            self._checked_sync(win.id, f"set_window_state({st})")
+                        self._configure_outer(win, prev)
+            self._checked_sync(win.id, f"set_window_state({st})", since)
 
+    @_x_errors
     def close_window(self, handle: Any) -> None:
         """Politely close a window: ``_NET_CLOSE_WINDOW``, else ``WM_DELETE_WINDOW``, else destroy it."""
         self._check()
         X = self._xl.X
         with self._lock:
+            since = self._async_errors.seq
             win = self._handle(handle)
             supported = self._supported()
             if self._has_wm_feature("_NET_CLOSE_WINDOW", supported):
@@ -1879,7 +2220,7 @@ class X11Backend(Backend):
                 win.destroy()
             self._restore_geometry.pop(win.id, None)
             self._iconified.discard(win.id)
-            self._checked_sync(win.id, "close")
+            self._checked_sync(win.id, "close", since)
 
     def launch(self, command: Any, **kwargs: Any) -> Any:
         """Start an application on *this* display (``DISPLAY`` is set in its environment)."""
@@ -1925,17 +2266,22 @@ class X11Backend(Backend):
     def _native_clipboard(self) -> Any:
         if self._clip_mode == "none":
             raise NotSupported("Clipboard support was disabled (clipboard_tool='none')")
-        if self._clip_native is None:
-            from ._x11clip import X11Clipboard
+        with self._lock:
+            self._check()
+            if self._state.clipboard is None:
+                from ._x11clip import X11Clipboard
 
-            self._clip_native = X11Clipboard(self.display_name)
-        return self._clip_native
+                # Kept in the finalizer state so it is closed (connection and
+                # serving thread) even when the backend is never closed.
+                self._state.clipboard = X11Clipboard(self.display_name)
+            return self._state.clipboard
 
     def _clip_env(self) -> Dict[str, str]:
         env = dict(os.environ)
         env["DISPLAY"] = self.display_name
         return env
 
+    @_x_errors
     def get_clipboard(self) -> str:
         """Clipboard text (empty string when the clipboard is empty or holds no text)."""
         self._check()
@@ -1954,6 +2300,7 @@ class X11Backend(Backend):
             return ""  # helpers exit non-zero when there is no text selection owner
         return proc.stdout.decode("utf-8", "replace")
 
+    @_x_errors
     def set_clipboard(self, text: str) -> None:
         self._check()
         if not isinstance(text, str):
@@ -1974,6 +2321,18 @@ class X11Backend(Backend):
             raise BackendError(f"Cannot run clipboard helper: {exc}") from exc
         if proc.returncode != 0:
             raise BackendError(f"Clipboard helper {self._clip_cmds[1][0]!r} failed with exit code {proc.returncode}")
+
+    def wait_clipboard_read(self, since: float, timeout: float) -> Optional[bool]:
+        """With the native clipboard: wait until an application fetched the text we own
+        (see :meth:`Backend.wait_clipboard_read`). Helper tools own the selection in
+        another process, so they cannot tell (None)."""
+        if self._clip_cmds is not None or self._clip_mode == "none":
+            return None
+        with self._lock:
+            clip = self._state.clipboard
+        if clip is None:
+            return None
+        return clip.wait_read(since, timeout)
 
     # ============================================================ accessibility
     def _atspi(self) -> Any:
