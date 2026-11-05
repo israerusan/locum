@@ -1,14 +1,14 @@
-# pyoilot architecture & module contracts
+# pypilot architecture & module contracts
 
 This file is the **source of truth for cross-module APIs**. Every module must
 implement exactly the public names/signatures listed for it, so modules written
 independently fit together. Adding extra helpers is fine; renaming is not.
 
-Package root: `src/pyoilot/`. Python >= 3.9 (use `from __future__ import annotations`,
+Package root: `src/pypilot/`. Python >= 3.9 (use `from __future__ import annotations`,
 `typing.Optional/List/...`, no `match`, no PEP 604 unions at runtime).
 Hard deps: `pillow`, `numpy`, `mss` (+ `python-xlib` on Linux, `comtypes` on Windows,
 `pyobjc` on macOS). Everything else is optional and imported lazily inside functions
-(raise `NotSupported`/`ImportError` with an install hint like `pip install pyoilot[llm]`).
+(raise `NotSupported`/`ImportError` with an install hint like `pip install pypilot[llm]`).
 **Importing any module must work on every OS with only hard deps installed**
 (platform imports go inside functions / try-blocks).
 
@@ -29,12 +29,12 @@ Lower layers never import higher ones (except lazily inside a function).
 
 ## Foundation (already written — do not change signatures)
 
-* `pyoilot.types`: `Point(x,y)`, `Rect(left,top,width,height)` (`.center .right .bottom .contains .intersect .union .iou .offset .inflate .as_tuple .as_ltrb .to_dict`, `Rect.coerce`, `Rect.from_ltrb`), `MouseButton` (`.coerce`), `Monitor`, `WindowInfo`, `Match(rect, confidence, text="", scale=1.0, extra={})` with `.center`, `coerce_point(any)`.
-* `pyoilot.errors`: `PyoilotError, BackendError, BackendUnavailable, NotSupported, FailSafeTriggered, ActionTimeout, ElementNotFound, AmbiguousElement, ImageNotFound, WindowNotFound, SelectorSyntaxError, PolicyViolation, WorkflowError`.
-* `pyoilot.keys`: `KEYS, MODIFIERS, normalize_key, is_modifier, parse_hotkey, SHIFTED_CHARS, char_needs_shift, split_text_tokens`.
-* `pyoilot.backends.base`: `Backend`, `AccessibleNode`, `ROLES`, `CAP_*` constants.
-* `pyoilot.backends`: `get_backend, set_backend, create_backend, register_backend`.
-* `pyoilot.backends.mock`: `MockBackend` (simulated desktop with widgets, a11y tree, rendering, event log `be.events`), `MockWindow`, `MockWidget`, `MockNode`. Use it in tests: `be = MockBackend(); w = be.add_window("T", (100,100,400,300)); b = w.add_button("OK", (10,10,80,30)); e = w.add_edit("Name", (10,50,200,28))`. Widget rects are window-relative; `widget.screen_rect` is absolute. Events: `("move",x,y)`, `("down",btn,x,y)`, `("up",btn,x,y)`, `("scroll",dx,dy,x,y)`, `("key_down",k)`, `("key_up",k)`, `("type",text)`, `("screenshot",region)`, ...
+* `pypilot.types`: `Point(x,y)`, `Rect(left,top,width,height)` (`.center .right .bottom .contains .intersect .union .iou .offset .inflate .as_tuple .as_ltrb .to_dict`, `Rect.coerce`, `Rect.from_ltrb`), `MouseButton` (`.coerce`), `Monitor`, `WindowInfo`, `Match(rect, confidence, text="", scale=1.0, extra={})` with `.center`, `coerce_point(any)`.
+* `pypilot.errors`: `PypilotError, BackendError, BackendUnavailable, NotSupported, FailSafeTriggered, ActionTimeout, ElementNotFound, AmbiguousElement, ImageNotFound, WindowNotFound, SelectorSyntaxError, PolicyViolation, WorkflowError`.
+* `pypilot.keys`: `KEYS, MODIFIERS, normalize_key, is_modifier, parse_hotkey, SHIFTED_CHARS, char_needs_shift, split_text_tokens`.
+* `pypilot.backends.base`: `Backend`, `AccessibleNode`, `ROLES`, `CAP_*` constants.
+* `pypilot.backends`: `get_backend, set_backend, create_backend, register_backend`.
+* `pypilot.backends.mock`: `MockBackend` (simulated desktop with widgets, a11y tree, rendering, event log `be.events`), `MockWindow`, `MockWidget`, `MockNode`. Use it in tests: `be = MockBackend(); w = be.add_window("T", (100,100,400,300)); b = w.add_button("OK", (10,10,80,30)); e = w.add_edit("Name", (10,50,200,28))`. Widget rects are window-relative; `widget.screen_rect` is absolute. Events: `("move",x,y)`, `("down",btn,x,y)`, `("up",btn,x,y)`, `("scroll",dx,dy,x,y)`, `("key_down",k)`, `("key_up",k)`, `("type",text)`, `("screenshot",region)`, ...
 
 ## Input layer
 
@@ -154,15 +154,15 @@ Windows: `windows(title=None, *, app=None) -> List[Window]`, `window(title=None,
 
 Clipboard: `clipboard_get() -> str`, `clipboard_set(text)`. Misc: `sleep(s)`, `wait_until(predicate, timeout=None, interval=0.1)`, `close()`, context manager (`with Desktop() as d:`).
 
-Module `pyoilot/__init__.py` exposes `Desktop`, the types/errors, `__version__`, `get_desktop()` (lazy default instance) and module-level convenience functions bound to the default desktop: `click, double_click, right_click, move, drag, scroll, type, press, hotkey, screenshot, locate, find, find_all, window, windows, wait, launch, position, size` (implemented lazily so `import pyoilot` never touches the display).
+Module `pypilot/__init__.py` exposes `Desktop`, the types/errors, `__version__`, `get_desktop()` (lazy default instance) and module-level convenience functions bound to the default desktop: `click, double_click, right_click, move, drag, scroll, type, press, hotkey, screenshot, locate, find, find_all, window, windows, wait, launch, position, size` (implemented lazily so `import pypilot` never touches the display).
 
 `compat/pyautogui.py` — drop-in subset of the PyAutoGUI API on top of Desktop: `FAILSAFE, PAUSE, size, position, onScreen, moveTo, moveRel/move, dragTo, dragRel/drag, click, doubleClick, tripleClick, rightClick, middleClick, mouseDown, mouseUp, scroll, hscroll, write/typewrite, press, keyDown, keyUp, hotkey, hold, screenshot, locateOnScreen, locateAllOnScreen, locateCenterOnScreen, pixel, pixelMatchesColor, getActiveWindow/getAllWindows/getWindowsWithTitle (minimal), FailSafeException, ImageNotFoundException, KEYBOARD_KEYS, easeInOutQuad etc tweens, sleep`.
 
 ## RPA layer: `rpa/`
-* `rpa/robot.py`: `Robot(desktop=None, name="robot", run_dir="pyoilot_runs", screenshot_on_error=True, logger=None)`; `@robot.task(name=None, retries=0, retry_delay=1.0, timeout=None, continue_on_error=False)`; `with robot.step("name", retries=0):`; `robot.run(*task_names) -> RunReport`; per-step timing, error capture with screenshot; `robot.log(msg)`; `robot.vars` dict.
+* `rpa/robot.py`: `Robot(desktop=None, name="robot", run_dir="pypilot_runs", screenshot_on_error=True, logger=None)`; `@robot.task(name=None, retries=0, retry_delay=1.0, timeout=None, continue_on_error=False)`; `with robot.step("name"):` (single attempt; `retries>0` with a plain `with` raises `TypeError`), retried steps as `for attempt in robot.step("name", retries=n, retry_delay=1.0): with attempt: ...` or `robot.step("name", retries=n).run(fn, *args)`; `robot.run(*task_names) -> RunReport`; per-step timing, error capture with screenshot; `robot.log(msg)`; `robot.vars` dict.
 * `rpa/report.py`: `StepResult`, `RunReport` (`.ok`, `.steps`, `.to_dict()`, `.save_json(path)`, `.save_html(path)`).
-* `rpa/queue.py`: `WorkQueue` (UiPath-Orchestrator-style transaction queue): add items (dict payloads), load from CSV/JSON/XLSX (openpyxl optional), `process(handler, *, retries=1)` with per-item status `new/in_progress/success/failed/business_exception`, `BusinessException` (no retry), persistence to JSON file so runs resume.
-* `rpa/flow.py`: declarative YAML/JSON workflows: `run_flow(path_or_dict, desktop=None, variables=None) -> RunReport`. Steps: `click, double_click, right_click, type, press, hotkey, set_text, wait, wait_gone, wait_image, click_image, click_text, screenshot, launch, activate_window, sleep, assert_exists, set_var, read_value, clipboard_set, log, if_exists {then, else}, for_each {items|csv, as, steps}, try {steps, catch}, call (sub-flow), repeat {times, steps}`. `${var}` interpolation (incl. `${item.field}`, `${env.NAME}`).
+* `rpa/queue.py`: `WorkQueue` (UiPath-Orchestrator-style transaction queue): add items (dict payloads), load from CSV/JSON/XLSX (openpyxl optional), `process(handler, *, retries=1)` with per-item status `new/in_progress/success/failed/business_exception`, `BusinessException` (no retry), persistence to JSON file so runs resume. Items a crashed run left `in_progress` are marked failed (`Abandoned`) on resume unless `on_abandoned="requeue"`; attempts are persisted and enforced across runs; file rows without `reference_field` get content-hash references (`<abs path>#<sha256[:16]>`).
+* `rpa/flow.py`: declarative YAML/JSON workflows: `run_flow(path_or_dict, desktop=None, variables=None) -> RunReport`. Steps: `click, double_click, right_click, type, press, hotkey, set_text, invoke, toggle, select, expand, collapse, check, uncheck, wait, wait_gone, wait_image, click_image, click_text, screenshot, launch, activate_window, sleep, assert_exists, set_var, read_value, clipboard_set, log, if_exists {then, else}, for_each {items|csv, as, steps}, try {steps, catch}, call (sub-flow), repeat {times, steps}`. `${var}` interpolation (incl. `${item.field}`, `${env.NAME}`).
 * `rpa/recorder.py`: `Recorder(desktop=None)` — `.start()`, `.stop() -> List[RecordedAction]`, uses pynput if available; enriches clicks with `selectors.selector_for(backend.element_at(x,y))` (UiPath-style selector recording, not raw coords); `.to_python() -> str`, `.to_flow() -> dict` (YAML-ready). Also `Recorder.feed(event)` for programmatic/test use without pynput.
 
 ## LLM layer: `llm/`
@@ -173,10 +173,10 @@ Module `pyoilot/__init__.py` exposes `Desktop`, the types/errors, `__version__`,
 * `llm/agent.py`: `Agent(desktop=None, *, model="claude-opus-5-5", client=None, mode="tools"|"computer_use", policy=None, audit=None, max_steps=50, system_prompt=None, on_step=None, effort="high")`; `.run(task: str) -> AgentResult(success, final_text, steps: List[AgentStep], usage)`. Anthropic SDK (`anthropic` optional import): `client.messages.create(model, max_tokens=16000, system, tools, messages, output_config={"effort": ...})` — no `temperature`, no `budget_tokens`, no forced `tool_choice`, no prefill; loop while `stop_reason == "tool_use"`; append full `response.content`; return all tool_results in one user message; handle `refusal`/`max_tokens` stop reasons. A `done`/`finish` tool lets the model declare completion with a summary. `LLMClient` protocol for model-agnostic use + `ScriptedClient` (replays canned responses; for tests/evals).
 * `llm/mcp_server.py`: dependency-free MCP server over stdio (JSON-RPC 2.0, newline-delimited): `initialize` (protocolVersion echo / "2025-06-18", capabilities.tools), `notifications/initialized`, `tools/list`, `tools/call` (content: text and `{"type":"image","data":b64,"mimeType":"image/png"}`, `isError`), `ping`. `serve(desktop=None, policy=None, stdin=sys.stdin, stdout=sys.stdout)`; `handle_message(dict) -> Optional[dict]` for tests.
 
-## CLI: `cli.py` (`pyoilot ...`, argparse)
+## CLI: `cli.py` (`pypilot ...`, argparse)
 `info`, `screenshot [-o out.png] [--region L,T,W,H] [--monitor N]`, `windows`, `tree [--window TITLE] [--depth N] [--all]`, `find SELECTOR`, `click TARGET` (selector, or `x,y`), `type TEXT`, `hotkey COMBO`, `locate IMAGE [--confidence]`, `observe [--json]`, `mcp [--policy strict|default|permissive] [--dry-run]`, `agent TASK [--model] [--max-steps] [--dry-run] [--mode tools|computer_use]`, `run FLOW.yaml [--var k=v]`, `record [-o out.py|out.yaml]`. Global `--backend NAME`.
 
 ## Testing conventions
 * `pytest`, tests in `tests/test_<module>.py`. Use `MockBackend` everywhere; never require a display except tests marked `@pytest.mark.x11` which must `pytest.skip` when `$DISPLAY` / Xvfb is unavailable.
 * Inject `sleep=lambda s: None` / tiny durations to keep tests fast (< 2s per file).
-* Run: `cd /home/user/pyoilot && python -m pytest -q tests/test_<module>.py`.
+* Run: `cd /home/user/pypilot && python -m pytest -q tests/test_<module>.py`.

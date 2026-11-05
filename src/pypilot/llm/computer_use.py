@@ -1,0 +1,678 @@
+"""Execute Anthropic *computer use* actions on a :class:`~pypilot.desktop.Desktop`.
+
+Claude's computer-use toolset (``{"type": "computer_toolset_20260801"}``) sends
+``tool_use`` blocks whose **name** is the action (``screenshot``,
+``left_click``, ``type``, ``key``, ``zoom`` ...) and which carry
+``"toolset_name": "computer"``. Several can arrive in one turn (a *batch*):
+they must run in order, stop at the first failure, and every one must be
+answered with a ``tool_result`` that echoes ``"toolset_name": "computer"``.
+:class:`ComputerUseAdapter` implements exactly that, plus the legacy shape
+(a single tool named ``computer`` with ``input.action``) for older models.
+
+Coordinates live in the pixel space of the screenshots this adapter returns.
+Screenshots are downscaled so the long edge is at most 2576 px **and** they
+cost at most 4784 visual tokens (28x28 tiles) -- the API does not downscale
+computer-use images for you -- and every coordinate is mapped back to physical
+screen pixels before acting.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+from ..errors import FailSafeTriggered, PolicyViolation
+from ..keys import normalize_key
+from ..types import Point, Rect
+from .observe import MAX_LONG_EDGE, MAX_VISUAL_TOKENS, fit_image_size
+from .._nodeinfo import node_app, target_label, window_at
+from .safety import AuditLog, Policy, keys_activate
+from .tools import ToolResult
+
+if TYPE_CHECKING:  # pragma: no cover
+    from PIL.Image import Image
+
+    from ..desktop import Desktop
+
+TOOLSET_TYPE = "computer_toolset_20260801"
+TOOLSET_NAME = "computer"
+LEGACY_TOOL_NAME = "computer"
+NOT_EXECUTED = "Not executed: an earlier computer action in this turn failed."
+
+#: Every member action of the toolset.
+ACTIONS: Tuple[str, ...] = (
+    "screenshot", "zoom", "left_click", "right_click", "middle_click", "double_click", "triple_click",
+    "left_click_drag", "mouse_move", "left_mouse_down", "left_mouse_up", "cursor_position", "scroll",
+    "type", "key", "hold_key", "wait",
+)
+READ_ONLY_ACTIONS = frozenset({"screenshot", "zoom", "cursor_position", "wait"})
+_MAX_DURATION = 300.0
+
+# xdotool keysym names (lowercased) -> pypilot canonical key names.
+_XDOTOOL_KEYS: Dict[str, str] = {
+    "return": "enter", "enter": "enter", "kp_enter": "num_enter", "linefeed": "enter",
+    "tab": "tab", "iso_left_tab": "tab", "backspace": "backspace", "escape": "escape", "esc": "escape",
+    "delete": "delete", "kp_delete": "delete", "insert": "insert", "kp_insert": "insert",
+    "home": "home", "kp_home": "home", "end": "end", "kp_end": "end",
+    "page_up": "pageup", "prior": "pageup", "kp_page_up": "pageup", "kp_prior": "pageup",
+    "page_down": "pagedown", "next": "pagedown", "kp_page_down": "pagedown", "kp_next": "pagedown",
+    "left": "left", "right": "right", "up": "up", "down": "down",
+    "kp_left": "left", "kp_right": "right", "kp_up": "up", "kp_down": "down",
+    "space": "space", "kp_space": "space",
+    "super": "cmd", "super_l": "cmd", "super_r": "cmd_r", "meta": "cmd", "meta_l": "cmd", "meta_r": "cmd_r",
+    "hyper_l": "cmd", "win": "cmd", "windows": "cmd", "cmd": "cmd", "command": "cmd",
+    "control": "ctrl", "control_l": "ctrl", "control_r": "ctrl_r", "ctrl": "ctrl", "ctrl_l": "ctrl", "ctrl_r": "ctrl_r",
+    "shift": "shift", "shift_l": "shift", "shift_r": "shift_r",
+    "alt": "alt", "alt_l": "alt", "alt_r": "alt_r", "option": "alt", "iso_level3_shift": "altgr", "mode_switch": "altgr",
+    "caps_lock": "capslock", "num_lock": "numlock", "scroll_lock": "scrolllock", "print": "printscreen",
+    "sys_req": "printscreen", "pause": "pause", "break": "pause", "menu": "menu",
+    "kp_add": "num_add", "kp_subtract": "num_subtract", "kp_multiply": "num_multiply", "kp_divide": "num_divide",
+    "kp_decimal": "num_decimal", "kp_separator": "num_decimal", "kp_equal": "=",
+    "xf86audioraisevolume": "volumeup", "xf86audiolowervolume": "volumedown", "xf86audiomute": "volumemute",
+    "xf86audioplay": "playpause", "xf86audiopause": "playpause", "xf86audionext": "nexttrack",
+    "xf86audioprev": "prevtrack", "xf86audiostop": "stop", "xf86back": "browser_back",
+    "xf86forward": "browser_forward", "xf86reload": "browser_refresh", "xf86refresh": "browser_refresh",
+    "plus": "+", "minus": "-", "equal": "=", "comma": ",", "period": ".", "slash": "/", "backslash": "\\",
+    "semicolon": ";", "apostrophe": "'", "quoteright": "'", "grave": "`", "quoteleft": "`",
+    "bracketleft": "[", "bracketright": "]", "exclam": "!", "at": "@", "numbersign": "#", "dollar": "$",
+    "percent": "%", "asciicircum": "^", "ampersand": "&", "asterisk": "*", "parenleft": "(", "parenright": ")",
+    "underscore": "_", "quotedbl": '"', "colon": ":", "less": "<", "greater": ">", "question": "?",
+    "bar": "|", "braceleft": "{", "braceright": "}", "asciitilde": "~",
+    **{f"kp_{i}": f"num{i}" for i in range(10)},
+}
+_MODIFIER_KEYS = frozenset({"ctrl", "shift", "alt", "cmd", "ctrl_r", "shift_r", "alt_r", "cmd_r", "altgr", "fn"})
+
+
+def map_key(name: str) -> str:
+    """Map one xdotool-style key name (``Return``, ``Page_Up``, ``KP_Enter``, ``super``, ``F5``, ``a``)
+    to a canonical pypilot key. Raises ``ValueError`` for unknown names."""
+    if name is None or name == "":
+        raise ValueError("Empty key name")
+    if len(name) == 1:
+        return name
+    low = name.strip().lower()
+    if low in _XDOTOOL_KEYS:
+        return _XDOTOOL_KEYS[low]
+    return normalize_key(name.strip())
+
+
+def parse_key_combo(combo: str) -> List[str]:
+    """``"ctrl+shift+t"`` / ``"alt+Tab"`` / ``"Return"`` / ``"ctrl+plus"`` -> canonical keys.
+
+    Letters combined with a modifier are lowercased (``ctrl+S`` is ``ctrl+s``,
+    so no implicit shift is added); a lone uppercase letter keeps its case.
+    """
+    if not isinstance(combo, str) or combo == "":
+        raise ValueError("Key combination must be a non-empty string")
+    s = combo.strip()
+    if s == "":
+        return ["space"]
+    if s == "+":
+        return ["+"]
+    tokens: List[str] = []
+    for part in s.split("+"):
+        if part.strip() == "":
+            if not tokens or tokens[-1] != "+":
+                tokens.append("+")
+        else:
+            tokens.append(part.strip())
+    keys = [map_key(t) for t in tokens]
+    if len(keys) > 1 and any(k in _MODIFIER_KEYS for k in keys):
+        keys = [k.lower() if len(k) == 1 and k.isalpha() else k for k in keys]
+    return keys
+
+
+def parse_key_sequence(text: str) -> List[List[str]]:
+    """xdotool ``key`` syntax: whitespace-separated combos pressed one after another."""
+    if not isinstance(text, str) or text == "":
+        raise ValueError("'text' must name the key(s) to press, e.g. \"Return\" or \"ctrl+s\"")
+    if text.strip() == "":
+        return [["space"]]
+    return [parse_key_combo(part) for part in text.split()]
+
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+class ComputerUseAdapter:
+    """Runs Claude computer-use actions against a desktop (see module docstring).
+
+    Args:
+        desktop: The :class:`~pypilot.desktop.Desktop` to drive.
+        max_long_edge: Screenshot long-edge limit; ``"auto"`` = 2576 (the model maximum).
+        policy: Safety policy (default: :class:`Policy` with default confirmations).
+        audit: Audit log (default: in-memory).
+        monitor: Monitor index shown to the model (``None`` = the whole virtual screen).
+        zoom: Offer the ``zoom`` action (adds ``configs.zoom.enabled = false`` when False).
+        max_visual_tokens: Visual-token budget per image (default 4784).
+        screenshot_after_action: Attach a fresh screenshot to every successful action result.
+    """
+
+    def __init__(
+        self,
+        desktop: "Desktop",
+        *,
+        max_long_edge: Union[int, str] = "auto",
+        policy: Optional[Policy] = None,
+        audit: Optional[AuditLog] = None,
+        monitor: Optional[int] = 0,
+        zoom: bool = True,
+        max_visual_tokens: int = MAX_VISUAL_TOKENS,
+        screenshot_after_action: bool = False,
+    ):
+        self.desktop = desktop
+        if max_long_edge == "auto" or max_long_edge is None:
+            self.max_long_edge = MAX_LONG_EDGE
+        else:
+            self.max_long_edge = int(max_long_edge)
+            if self.max_long_edge <= 0:
+                raise ValueError("max_long_edge must be positive or 'auto'")
+        self.policy = policy if policy is not None else Policy()
+        self.audit = audit if audit is not None else AuditLog()
+        self.monitor = monitor
+        self.zoom_enabled = bool(zoom)
+        self.max_visual_tokens = int(max_visual_tokens)
+        self.screenshot_after_action = bool(screenshot_after_action)
+
+    # ---------------------------------------------------------------- geometry
+    def screen_region(self) -> Rect:
+        """The screen rectangle exposed to the model."""
+        if self.monitor is None:
+            return self.desktop.virtual_rect()
+        mons = self.desktop.monitors()
+        if not mons:
+            return self.desktop.virtual_rect()
+        idx = self.monitor if 0 <= self.monitor < len(mons) else 0
+        return mons[idx].rect
+
+    def image_size(self) -> Tuple[int, int]:
+        """``(width, height)`` of the screenshots (= the model's coordinate space)."""
+        r = self.screen_region()
+        return fit_image_size(r.width, r.height, self.max_long_edge, self.max_visual_tokens)
+
+    def to_screen(self, x: float, y: float) -> Point:
+        """Screenshot coordinates -> physical screen coordinates."""
+        r = self.screen_region()
+        iw, ih = fit_image_size(r.width, r.height, self.max_long_edge, self.max_visual_tokens)
+        sx = r.left + (float(x) + 0.5) * r.width / iw - 0.5
+        sy = r.top + (float(y) + 0.5) * r.height / ih - 0.5
+        sx = min(max(int(round(sx)), r.left), r.right - 1)
+        sy = min(max(int(round(sy)), r.top), r.bottom - 1)
+        return Point(sx, sy)
+
+    def to_image(self, x: float, y: float) -> Point:
+        """Physical screen coordinates -> screenshot coordinates."""
+        r = self.screen_region()
+        iw, ih = fit_image_size(r.width, r.height, self.max_long_edge, self.max_visual_tokens)
+        ix = (float(x) - r.left + 0.5) * iw / r.width - 0.5
+        iy = (float(y) - r.top + 0.5) * ih / r.height - 0.5
+        return Point(int(round(ix)), int(round(iy)))
+
+    def _coord(self, value: Any, name: str = "coordinate") -> Point:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"'{name}' must be [x, y], got {value!r}")
+        try:
+            x, y = float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            raise ValueError(f"'{name}' must contain two numbers, got {value!r}") from None
+        iw, ih = self.image_size()
+        if not (0 <= x < iw and 0 <= y < ih):
+            raise ValueError(f"'{name}' {list(value)} is outside the screenshot bounds ({iw}x{ih})")
+        return self.to_screen(x, y)
+
+    # ------------------------------------------------------------------ images
+    def capture(self) -> "Image":
+        """A screenshot of :meth:`screen_region`, resized to :meth:`image_size`."""
+        r = self.screen_region()
+        img = self.desktop.screenshot(r)
+        size = self.image_size()
+        if img.size != size:
+            img = img.resize(size, _lanczos())
+        return img
+
+    def tool_definition(self) -> Dict[str, Any]:
+        """The ``tools`` entry: ``{"type": "computer_toolset_20260801"}`` (no name, no display size)."""
+        d: Dict[str, Any] = {"type": TOOLSET_TYPE}
+        if not self.zoom_enabled:
+            d["configs"] = {"zoom": {"enabled": False}}
+        return d
+
+    @staticmethod
+    def is_computer_block(block: Any) -> bool:
+        """Whether a ``tool_use`` block is a computer action (toolset member or legacy ``computer`` tool)."""
+        name = _get(block, "name")
+        toolset = _get(block, "toolset_name")
+        if toolset is not None:
+            return toolset == TOOLSET_NAME
+        return name == LEGACY_TOOL_NAME
+
+    # ----------------------------------------------------------------- execute
+    def execute(self, name: str, input: Optional[Dict[str, Any]] = None) -> ToolResult:
+        """Run one action; never raises (except :class:`FailSafeTriggered`, the human kill switch).
+
+        ``name`` is the member action (``left_click``...) or ``"computer"`` with
+        ``input["action"]`` (legacy shape).
+        """
+        params = dict(input or {})
+        action = name
+        if name == LEGACY_TOOL_NAME:
+            action = params.pop("action", None)
+            if not action:
+                return ToolResult.error("Legacy computer tool call is missing 'action'")
+        started = time.monotonic()
+        status = "ok"
+        result: Optional[ToolResult] = None
+        try:
+            if action not in ACTIONS:
+                result = ToolResult.error(f"Unknown computer action {action!r}. Supported: {', '.join(ACTIONS)}")
+            elif action == "zoom" and not self.zoom_enabled:
+                result = ToolResult.error("The zoom action is disabled")
+            else:
+                result = self._dispatch(action, params)
+        except FailSafeTriggered as exc:
+            status = "aborted"
+            self._audit(action, params, status, None, str(exc), started)
+            raise
+        except PolicyViolation as exc:
+            status = "blocked"
+            result = ToolResult.error(f"Blocked by policy: {exc}")
+        except Exception as exc:
+            result = ToolResult.error(f"{type(exc).__name__}: {exc}")
+        if result.is_error and status == "ok":
+            status = "error"
+        elif isinstance(result.data, dict) and result.data.get("dry_run"):
+            status = "dry_run"
+        self._audit(action, params, status, result, None, started)
+        return result
+
+    def _audit(self, action: Any, params: Dict[str, Any], status: str, result: Optional[ToolResult], error: Optional[str], started: float) -> None:
+        event: Dict[str, Any] = {
+            "event": "computer_action",
+            "tool": action,
+            "args": params,
+            "status": status,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
+        if result is not None:
+            event["result"] = result.text[:500]
+            event["image"] = bool(result.image_base64)
+        if error:
+            event["error"] = error
+        self.audit.record(event)
+
+    # -------------------------------------------------------------- dispatch
+    def _context(self, points: Sequence[Point] = (), **extra: Any) -> Dict[str, Any]:
+        ctx: Dict[str, Any] = {}
+        try:
+            aw = self.desktop.backend.active_window()
+        except Exception:
+            aw = None
+        if aw is not None:
+            ctx["app"] = aw.app
+            ctx["window_title"] = aw.title
+        if points:
+            ctx["point"] = points[-1]
+            ctx["points"] = list(points)
+            names = []
+            apps: List[str] = []
+            for p in points:
+                name, point_apps = self._describe_point(p)
+                if name:
+                    names.append(name)
+                for app in point_apps:
+                    if app and app not in apps:
+                        apps.append(app)
+            if names:
+                ctx["target"] = " -> ".join(names)
+            if apps:
+                ctx["target_app"] = apps[0]
+                ctx["target_apps"] = apps  # every app touched (both ends of a drag)
+        ctx.update({k: v for k, v in extra.items() if v is not None})
+        return ctx
+
+    def _keyboard_context(self, activates: bool, **extra: Any) -> Dict[str, Any]:
+        """Context for keyboard actions: the focused element is the target.
+
+        Its application is always reported; its name is added when the input can
+        activate it (Enter/Space, typed text), so confirmation patterns apply to
+        "Tab to the button, press Return" exactly as to clicking it.
+        """
+        ctx = self._context(**extra)
+        try:
+            node = self.desktop.backend.focused_element()
+        except Exception:
+            node = None
+        if node is None:
+            return ctx
+        try:
+            name = target_label(node)
+        except Exception:
+            name = ""
+        app = node_app(self.desktop.backend, node)
+        if app:
+            ctx["target_app"] = app
+        if activates and name:
+            ctx["target"] = name
+        return ctx
+
+    def _describe_point(self, p: Point) -> Tuple[str, List[str]]:
+        """``(label, apps)`` of what is at screen point ``p``.
+
+        ``label`` is the hit-tested node's name plus its enclosing actionable
+        control's (an unnamed icon inside a "Pay" button reads as "Pay").
+        ``apps`` holds the node's application and the front-most window's
+        application at ``p`` (both, when they differ), so the policy checks the
+        app actually under the pointer and never falls back to the active one.
+        """
+        backend = self.desktop.backend
+        try:
+            node = backend.element_at(p.x, p.y)
+        except Exception:
+            node = None
+        name = ""
+        apps: List[str] = []
+        if node is not None:
+            try:
+                name = target_label(node)
+            except Exception:
+                name = ""
+            app = node_app(backend, node)
+            if app:
+                apps.append(app)
+        w = window_at(backend, p)
+        if w is not None and w.app and w.app not in apps:
+            apps.append(w.app)
+        return name, apps
+
+    def _guard(self, action: str, params: Dict[str, Any], ctx: Dict[str, Any], description: str) -> Optional[ToolResult]:
+        """Policy check; returns the dry-run result when acting is disabled."""
+        ctx.setdefault("description", description)
+        self.policy.check(action, params, context=ctx)
+        if self.policy.dry_run and action not in READ_ONLY_ACTIONS:
+            note = f" (this would require human confirmation: {ctx['needs_confirmation']})" if ctx.get("needs_confirmation") else ""
+            return ToolResult(f"[dry-run] Would {description}{note}. Nothing was done.", data={"dry_run": True, "description": description})
+        return None
+
+    def _done(self, text: str = "OK") -> ToolResult:
+        if self.screenshot_after_action:
+            from ..vision import to_base64_png
+
+            return ToolResult(text, image_base64=to_base64_png(self.capture()))
+        return ToolResult(text)
+
+    def _modifiers(self, params: Dict[str, Any]) -> List[str]:
+        text = params.get("text")
+        if text in (None, ""):
+            return []
+        if not isinstance(text, str):
+            raise ValueError("'text' (modifier keys) must be a string such as \"shift\" or \"ctrl+shift\"")
+        keys = parse_key_combo(text)
+        bad = [k for k in keys if k not in _MODIFIER_KEYS]
+        if bad:
+            raise ValueError(f"'text' for clicks/scroll may only contain modifier keys, got {text!r}")
+        return keys
+
+    @staticmethod
+    def _duration(params: Dict[str, Any]) -> float:
+        if "duration" not in params or params["duration"] is None:
+            raise ValueError("'duration' (seconds) is required")
+        try:
+            d = float(params["duration"])
+        except (TypeError, ValueError):
+            raise ValueError(f"'duration' must be a number, got {params['duration']!r}") from None
+        if not 0 <= d <= _MAX_DURATION:
+            raise ValueError(f"'duration' must be between 0 and {_MAX_DURATION:g} seconds")
+        return d
+
+    def _dispatch(self, action: str, p: Dict[str, Any]) -> ToolResult:
+        d = self.desktop
+        if action == "screenshot":
+            self._guard(action, p, {}, "take a screenshot")
+            from ..vision import to_base64_png
+
+            img = self.capture()
+            return ToolResult(image_base64=to_base64_png(img), data={"size": img.size})
+
+        if action == "zoom":
+            region = p.get("region")
+            if not isinstance(region, (list, tuple)) or len(region) != 4:
+                raise ValueError("'region' must be [x0, y0, x1, y1] in screenshot coordinates")
+            try:
+                x0, y0, x1, y1 = (float(v) for v in region)
+            except (TypeError, ValueError):
+                raise ValueError(f"'region' must contain four numbers, got {region!r}") from None
+            iw, ih = self.image_size()
+            if not (0 <= x0 < x1 <= iw and 0 <= y0 < y1 <= ih):
+                raise ValueError(f"'region' {list(region)} must satisfy 0 <= x0 < x1 <= {iw} and 0 <= y0 < y1 <= {ih}")
+            self._guard(action, p, {}, f"zoom into {list(region)}")
+            r = self.screen_region()
+            sx, sy = r.width / float(iw), r.height / float(ih)
+            rect = Rect.from_ltrb(
+                int(round(r.left + x0 * sx)), int(round(r.top + y0 * sy)),
+                max(int(round(r.left + x1 * sx)), int(round(r.left + x0 * sx)) + 1),
+                max(int(round(r.top + y1 * sy)), int(round(r.top + y0 * sy)) + 1),
+            )
+            img = d.screenshot(rect)
+            s = min(iw / float(rect.width), ih / float(rect.height))
+            out = (max(1, min(iw, int(round(rect.width * s)))), max(1, min(ih, int(round(rect.height * s)))))
+            if img.size != out:
+                img = img.resize(out, _lanczos())
+            from ..vision import to_base64_png
+
+            return ToolResult(image_base64=to_base64_png(img), data={"size": img.size, "screen_rect": rect.to_dict()})
+
+        if action == "cursor_position":
+            self._guard(action, p, {}, "read the cursor position")
+            ip = self.to_image(*d.position())
+            return ToolResult(f"[{ip.x}, {ip.y}]", data={"x": ip.x, "y": ip.y})
+
+        if action == "wait":
+            dur = self._duration(p)
+            self._guard(action, p, {}, f"wait {dur:g}s")
+            d.sleep(dur)
+            return self._done()
+
+        if action in ("left_click", "right_click", "middle_click", "double_click", "triple_click"):
+            mods = self._modifiers(p)
+            point = self._coord(p["coordinate"]) if p.get("coordinate") is not None else None
+            button = {"right_click": "right", "middle_click": "middle"}.get(action, "left")
+            clicks = {"double_click": 2, "triple_click": 3}.get(action, 1)
+            target = point if point is not None else d.position()
+            where = f"({p['coordinate'][0]}, {p['coordinate'][1]})" if point is not None else "the current position"
+            desc = action.replace("_", " ") + f" at {where}" + (f" holding {'+'.join(mods)}" if mods else "")
+            dry = self._guard(action, p, self._context([target]), desc)
+            if dry is not None:
+                return dry
+            with d.hold(*mods) if mods else _null():
+                if point is not None:
+                    d.mouse.click(point, button=button, clicks=clicks)
+                else:
+                    d.mouse.click(None, button=button, clicks=clicks)
+            return self._done()
+
+        if action == "left_click_drag":
+            if p.get("start_coordinate") is None or p.get("coordinate") is None:
+                raise ValueError("left_click_drag needs 'start_coordinate' and 'coordinate'")
+            mods = self._modifiers(p)
+            start = self._coord(p["start_coordinate"], "start_coordinate")
+            end = self._coord(p["coordinate"])
+            desc = f"drag from {list(p['start_coordinate'])} to {list(p['coordinate'])}"
+            dry = self._guard(action, p, self._context([start, end], start_point=start, end_point=end), desc)
+            if dry is not None:
+                return dry
+            with d.hold(*mods) if mods else _null():
+                d.mouse.drag(start, end, duration=0.3)
+            return self._done()
+
+        if action == "mouse_move":
+            if p.get("coordinate") is None:
+                raise ValueError("mouse_move needs 'coordinate'")
+            point = self._coord(p["coordinate"])
+            dry = self._guard(action, p, self._context([point]), f"move the mouse to {list(p['coordinate'])}")
+            if dry is not None:
+                return dry
+            d.mouse.move(point)
+            return self._done()
+
+        if action in ("left_mouse_down", "left_mouse_up"):
+            point = self._coord(p["coordinate"]) if p.get("coordinate") is not None else None
+            target = point if point is not None else d.position()
+            verb = "press" if action == "left_mouse_down" else "release"
+            dry = self._guard(action, p, self._context([target]), f"{verb} the left mouse button")
+            if dry is not None:
+                return dry
+            if point is not None:
+                d.mouse.move(point)
+            if action == "left_mouse_down":
+                d.mouse_down("left")
+            else:
+                d.mouse_up("left")
+            return self._done()
+
+        if action == "scroll":
+            direction = str(p.get("scroll_direction") or "").lower()
+            if direction not in ("up", "down", "left", "right"):
+                raise ValueError("'scroll_direction' must be up, down, left or right")
+            try:
+                amount = int(p.get("scroll_amount", 3) if p.get("scroll_amount") is not None else 3)
+            except (TypeError, ValueError):
+                raise ValueError(f"'scroll_amount' must be an integer, got {p.get('scroll_amount')!r}") from None
+            if amount < 0 or amount > 100:
+                raise ValueError("'scroll_amount' must be between 0 and 100")
+            mods = self._modifiers(p)
+            point = self._coord(p["coordinate"]) if p.get("coordinate") is not None else None
+            target = point if point is not None else d.position()
+            dy = amount if direction == "up" else -amount if direction == "down" else 0
+            dx = amount if direction == "right" else -amount if direction == "left" else 0
+            dry = self._guard(action, p, self._context([target]), f"scroll {direction} by {amount}")
+            if dry is not None:
+                return dry
+            with d.hold(*mods) if mods else _null():
+                d.mouse.scroll(dy, dx, at=point)
+            return self._done()
+
+        if action == "type":
+            text = p.get("text")
+            if not isinstance(text, str):
+                raise ValueError("'text' (the text to type) is required")
+            shown = text if len(text) <= 60 else text[:57] + "..."
+            dry = self._guard(action, p, self._keyboard_context(True), f"type {shown!r}")
+            if dry is not None:
+                return dry
+            d.type(text)
+            return self._done()
+
+        if action == "key":
+            seq = parse_key_sequence(p.get("text"))  # type: ignore[arg-type]
+            repeat = p.get("repeat", 1)
+            try:
+                repeat = 1 if repeat is None else int(repeat)
+            except (TypeError, ValueError):
+                raise ValueError(f"'repeat' must be an integer, got {repeat!r}") from None
+            if not 1 <= repeat <= 100:
+                raise ValueError("'repeat' must be between 1 and 100")
+            combo = p.get("text")
+            activates = keys_activate(seq)
+            dry = self._guard(action, p, self._keyboard_context(activates, keys=combo), f"press {combo}" + (f" x{repeat}" if repeat > 1 else ""))
+            if dry is not None:
+                return dry
+            for _ in range(repeat):
+                for keys in seq:
+                    if len(keys) == 1:
+                        d.keyboard.press(keys[0])
+                    else:
+                        d.keyboard.hotkey(*keys)
+            return self._done()
+
+        if action == "hold_key":
+            text = p.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError("'text' (the key(s) to hold) is required")
+            keys = parse_key_combo(text)
+            dur = self._duration(p)
+            dry = self._guard(action, p, self._keyboard_context(keys_activate([keys]), keys=text), f"hold {text} for {dur:g}s")
+            if dry is not None:
+                return dry
+            with d.hold(*keys):
+                d.sleep(dur)
+            return self._done()
+
+        raise ValueError(f"Unsupported action {action!r}")  # pragma: no cover - ACTIONS is exhaustive
+
+    # ------------------------------------------------------------------ batch
+    @staticmethod
+    def make_result(block: Any, result: ToolResult) -> Dict[str, Any]:
+        """The ``tool_result`` dict answering ``block`` (echoes ``toolset_name`` for toolset members)."""
+        out: Dict[str, Any] = {"type": "tool_result", "tool_use_id": _get(block, "id")}
+        toolset = _get(block, "toolset_name")
+        if toolset is not None or _get(block, "name") != LEGACY_TOOL_NAME:
+            out["toolset_name"] = toolset or TOOLSET_NAME
+        if result.is_error:
+            out["is_error"] = True
+            out["content"] = result.text or "Error"
+        else:
+            out["content"] = result.to_anthropic_content()
+        return out
+
+    @staticmethod
+    def not_executed(block: Any) -> Dict[str, Any]:
+        """The result for an action skipped because an earlier one in the batch failed."""
+        out: Dict[str, Any] = {"type": "tool_result", "tool_use_id": _get(block, "id")}
+        toolset = _get(block, "toolset_name")
+        if toolset is not None or _get(block, "name") != LEGACY_TOOL_NAME:
+            out["toolset_name"] = toolset or TOOLSET_NAME
+        out["is_error"] = True
+        out["content"] = NOT_EXECUTED
+        return out
+
+    def run_batch(self, tool_use_blocks: Iterable[Any]) -> List[Dict[str, Any]]:
+        """Execute the computer actions of one turn **in order**, stopping at the first failure.
+
+        Returns one ``tool_result`` dict per block (same order): executed actions
+        get their result, the failing one ``is_error`` with the message, and every
+        later one ``is_error`` with :data:`NOT_EXECUTED`. All results carry
+        ``"toolset_name": "computer"``.
+        """
+        results: List[Dict[str, Any]] = []
+        failed = False
+        for block in tool_use_blocks:
+            if failed:
+                results.append(self.not_executed(block))
+                continue
+            res = self.execute(_get(block, "name"), _get(block, "input") or {})
+            results.append(self.make_result(block, res))
+            if res.is_error:
+                failed = True
+        return results
+
+    def __repr__(self) -> str:
+        return f"<ComputerUseAdapter image={self.image_size()} zoom={self.zoom_enabled} dry_run={self.policy.dry_run}>"
+
+
+class _null:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+def _lanczos() -> Any:
+    from PIL import Image
+
+    return getattr(Image, "Resampling", Image).LANCZOS
+
+
+__all__ = [
+    "ACTIONS",
+    "ComputerUseAdapter",
+    "NOT_EXECUTED",
+    "TOOLSET_NAME",
+    "TOOLSET_TYPE",
+    "map_key",
+    "parse_key_combo",
+    "parse_key_sequence",
+]

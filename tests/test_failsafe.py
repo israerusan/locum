@@ -4,11 +4,11 @@ import threading
 
 import pytest
 
-from pyoilot import failsafe as fs_mod
-from pyoilot.backends.mock import MockBackend
-from pyoilot.errors import FailSafeTriggered
-from pyoilot.failsafe import FailSafe, abort, install_kill_hotkey, is_aborted, reset_abort
-from pyoilot.types import Point
+from pypilot import failsafe as fs_mod
+from pypilot.backends.mock import MockBackend
+from pypilot.errors import FailSafeTriggered
+from pypilot.failsafe import FailSafe, abort, install_kill_hotkey, is_aborted, reset_abort
+from pypilot.types import Point
 
 
 @pytest.fixture(autouse=True)

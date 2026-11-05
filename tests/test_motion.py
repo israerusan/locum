@@ -4,8 +4,8 @@ import math
 
 import pytest
 
-from pyoilot.motion import TWEENS, Humanize, fitts_duration, get_tween, path_length, plan_path
-from pyoilot.types import Point, Rect
+from pypilot.motion import TWEENS, Humanize, fitts_duration, get_tween, path_length, plan_path
+from pypilot.types import Point, Rect
 
 EXPECTED_TWEENS = {
     "linear", "ease_in_quad", "ease_out_quad", "ease_in_out_quad", "ease_in_cubic",

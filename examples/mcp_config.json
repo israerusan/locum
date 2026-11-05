@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pypilot": {
+      "command": "pypilot",
+      "args": ["mcp", "--policy", "default", "--audit", "~/.pypilot/mcp-audit.jsonl"]
+    },
+    "pypilot-sandbox": {
+      "command": "pypilot",
+      "args": ["--backend", "mock", "mcp", "--policy", "permissive"]
+    }
+  }
+}

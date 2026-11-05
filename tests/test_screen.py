@@ -2,10 +2,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from pyoilot import ocr
-from pyoilot.backends.mock import MockBackend
-from pyoilot.screen import Screen
-from pyoilot.types import Match, Point, Rect
+from pypilot import ocr
+from pypilot.backends.mock import MockBackend
+from pypilot.screen import Screen
+from pypilot.types import Match, Point, Rect
 
 
 class FakeClock:

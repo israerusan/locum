@@ -5,11 +5,11 @@ from typing import List, Optional, Sequence
 
 import pytest
 
-from pyoilot.backends.base import AccessibleNode
-from pyoilot.backends.mock import MockBackend
-from pyoilot.errors import SelectorSyntaxError
-from pyoilot.selectors import Selector, describe_node, parse, quote, selector_for, tree_text
-from pyoilot.types import Rect
+from pypilot.backends.base import AccessibleNode
+from pypilot.backends.mock import MockBackend
+from pypilot.errors import SelectorSyntaxError
+from pypilot.selectors import describe_node, parse, quote, selector_for, tree_text
+from pypilot.types import Rect
 
 
 @pytest.fixture
@@ -514,6 +514,16 @@ def test_find_first_stops_early():
     first = parse("button").find_first([root])
     assert first.name == "n.0.0.0.0"
     assert CountingNode.calls <= 5
+
+
+def test_union_find_first_stops_early():
+    root = make_tree(width=8, depth=4)
+    CountingNode.calls = 0
+    first = parse('[name="n.7.7.7.7"], button').find_first([root])
+    assert first.name == "n.0.0.0.0"
+    assert CountingNode.calls <= 5
+    mixed = parse("button:nth(1), group > button:first").find_all([root])
+    assert [n.name for n in mixed][:2] == ["n.0.0.0.0", "n.0.0.0.1"]
 
 
 def test_deep_descendant_chain_is_not_exponential():

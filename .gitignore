@@ -5,6 +5,6 @@ dist/
 build/
 .pytest_cache/
 .venv/
-pyoilot_runs/
+pypilot_runs/
 *.log
 __pycache__/

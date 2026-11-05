@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from pyoilot.errors import ActionTimeout
-from pyoilot.wait import Deadline, retry, retry_call, wait_until, wait_while
+from pypilot.errors import ActionTimeout
+from pypilot.wait import Deadline, retry, retry_call, wait_until, wait_while
 
 
 class FakeClock:

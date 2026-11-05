@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.9", "3.12", "3.13"]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install X server and clipboard tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth xclip x11-utils
+
+      - name: Install pypilot
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Import check (core dependencies only)
+        run: python -c "import pypilot, pypilot.cli, pypilot.llm, pypilot.rpa, pypilot.compat.pyautogui; print(pypilot.__version__)"
+
+      - name: Test suite incl. X11 tests under Xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args="-screen 0 1280x800x24" python -m pytest -q
+
+      - name: Test suite without X11 tests (Windows / macOS)
+        if: runner.os != 'Linux'
+        run: python -m pytest -q -m "not x11"
+
+      - name: Smoke-test the CLI and examples on the demo desktop
+        env:
+          PYPILOT_BACKEND: mock
+        run: |
+          pypilot --version
+          pypilot info
+          pypilot windows --json
+          pypilot observe --window "Invoice Entry"
+          pypilot run examples/excel_report_flow.yaml
+          python examples/basic_automation.py
+          python examples/sap_style_data_entry.py
+          python examples/llm_agent.py < /dev/null
+          python examples/pyautogui_migration.py

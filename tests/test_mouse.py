@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from pyoilot.backends.mock import MockBackend
-from pyoilot.errors import FailSafeTriggered
-from pyoilot.failsafe import FailSafe, abort, reset_abort
-from pyoilot.motion import Humanize
-from pyoilot.mouse import Mouse
-from pyoilot.types import MouseButton, Point, Rect
+from pypilot.backends.mock import MockBackend
+from pypilot.errors import FailSafeTriggered
+from pypilot.failsafe import FailSafe, abort, reset_abort
+from pypilot.motion import Humanize
+from pypilot.mouse import Mouse
+from pypilot.types import MouseButton, Point, Rect
 
 
 class FakeClock:

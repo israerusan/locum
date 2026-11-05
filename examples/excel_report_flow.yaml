@@ -1,0 +1,56 @@
+# Fill a sales report in a spreadsheet from a CSV file, then save it.
+#
+#   pypilot run examples/excel_report_flow.yaml --report-dir runs          # real Excel
+#   pypilot --backend mock run examples/excel_report_flow.yaml             # simulated spreadsheet
+#   pypilot run examples/excel_report_flow.yaml --var data=other.csv --var start_cell=B2
+#
+# The flow drives Excel the way a person does -- Name Box to jump to a cell,
+# Tab between columns, Enter to the next row -- so it needs no COM/add-in and
+# works with any spreadsheet that has a "Name Box" (Excel on Windows/macOS;
+# adapt the selectors for LibreOffice Calc's "Name Box" combo).
+# Relative paths (the CSV, sub-flows, images) resolve against this file's folder.
+
+name: excel_report
+description: Type the rows of data/sales.csv into a workbook and save it.
+
+vars:
+  data: data/sales.csv
+  start_cell: A1
+  workbook: "*Excel*"          # window title glob
+  excel_command: excel         # what to launch when no workbook is open
+
+settings:
+  timeout: 15                  # seconds to wait for windows/elements
+  retries: 1                   # retry each failing step once
+  retry_delay: 1
+
+steps:
+  - name: Make sure a workbook is open
+    if_exists:
+      target: 'window[name%="${workbook}"]'
+      timeout: 0
+      else:
+        - launch: {command: "${excel_command}", wait_window: "${workbook}", timeout: 60}
+
+  - name: Bring the workbook to the front
+    activate_window: "${workbook}"
+
+  - name: Jump to the start cell with the Name Box
+    click: 'window[name%="${workbook}"] edit "Name Box"'
+  - type: "${start_cell}\n"
+
+  - name: Header row
+    type: "Region\tUnits\tRevenue\n"
+
+  - name: One row per CSV record
+    for_each:
+      csv: "${data}"
+      as: row
+      steps:
+        - type: "${row.region}\t${row.units}\t${row.revenue}\n"
+        - log: "row ${loop.number}/${loop.count}: ${row.region}"
+
+  - name: Save (Ctrl+S on Windows/Linux, Cmd+S on macOS)
+    hotkey: mod+s
+
+  - log: "Sales report filled from ${data}"

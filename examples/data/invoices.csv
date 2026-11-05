@@ -1,0 +1,6 @@
+invoice_no,vendor,amount,due_date,urgent
+INV-1001,ACME Corp,1250.00,2026-12-01,no
+INV-1002,Globex,880.40,2026-12-05,yes
+INV-1003,Initech,-15.00,2026-12-07,no
+INV-1004,Umbrella Ltd,4310.99,2026-12-10,no
+INV-1002,Globex,880.40,2026-12-05,yes
