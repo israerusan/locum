@@ -292,6 +292,7 @@ class Window:
             _default_timeout(self.desktop, timeout),
             _desktop_interval(self.desktop),
             message=f"Window {self.title!r} still open after {timeout}s",
+            ignore_exceptions="transient",
             sleep=_desktop_sleep(self.desktop),
             clock=_desktop_clock(self.desktop),
         )

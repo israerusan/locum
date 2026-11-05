@@ -31,6 +31,7 @@ from .errors import (
     NotSupported,
     PolicyViolation,
     SelectorSyntaxError,
+    is_transient,
 )
 from .types import Point, Rect
 from .wait import wait_until
@@ -274,6 +275,7 @@ def _desktop_interval(desktop: Any, default: float = 0.1) -> float:
 #: Errors that mean "searching again cannot help" (no accessibility API, invalid
 #: selector, emergency stop, policy refusal): scoped lookups raise them at once,
 #: like :meth:`pypilot.desktop.Desktop.find`, instead of waiting for the timeout.
+#: Kept for backward compatibility; the full rule is :func:`pypilot.errors.is_transient`.
 _FIND_FATAL = (NotSupported, SelectorSyntaxError, FailSafeTriggered, PolicyViolation)
 
 
@@ -282,7 +284,8 @@ def _poll_find(desktop: Any, probe: Callable[[], Any], timeout: float) -> Any:
 
     Transient errors (stale nodes, a busy UI) count as "not yet" and become the
     ``__cause__`` of the final :class:`ActionTimeout`; :data:`_FIND_FATAL`
-    errors propagate immediately.
+    errors -- and every error :func:`pypilot.errors.is_transient` rejects --
+    propagate immediately.
     """
     last: List[BaseException] = []
 
@@ -292,6 +295,8 @@ def _poll_find(desktop: Any, probe: Callable[[], Any], timeout: float) -> Any:
         except _FIND_FATAL:
             raise
         except Exception as exc:  # transient backend / stale tree errors
+            if not is_transient(exc):
+                raise
             last[:] = [exc]
             return None
 
@@ -1201,7 +1206,9 @@ class Element:
         or ``callable(element) -> bool``). Returns ``self``; raises :class:`ActionTimeout`.
 
         ``interval`` defaults to the desktop's ``poll_interval``; the desktop's
-        injected ``sleep``/``clock`` are used for waiting."""
+        injected ``sleep``/``clock`` are used for waiting. Only transient errors
+        raised while checking the state are retried (see :mod:`pypilot.errors`):
+        a ``TypeError``/``AttributeError`` in a ``callable`` state raises at once."""
         if interval is None:
             interval = _desktop_interval(self.desktop)
         pred = self._state_predicate(state)
@@ -1213,6 +1220,7 @@ class Element:
             timeout,
             interval,
             message=f"{self!r} did not become {label!r} within {timeout:g}s",
+            ignore_exceptions="transient",
             sleep=_desktop_sleep(self.desktop),
             clock=_desktop_clock(self.desktop),
         )
