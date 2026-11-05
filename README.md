@@ -26,8 +26,10 @@ sessions and XWayland windows only.
   see [below](#humanized-layout-independent-input)), clipboard paste,
   stuck-modifier-proof hotkeys, a corner fail-safe and a kill hotkey.
 * **RPA built in.** Robots with steps/retries/evidence screenshots and HTML
-  reports, Orchestrator-style resumable work queues with business exceptions,
-  YAML flows, and a recorder that writes selectors instead of raw coordinates.
+  reports, resumable file-backed work queues with business exceptions that
+  several worker processes on one machine can drain together (locked, leased,
+  fsynced), YAML flows, and a recorder that writes selectors instead of raw
+  coordinates.
 * **LLM-native.** Set-of-marks observations; a Claude (Anthropic) agent loop
   and computer-use adapter; tool schemas exportable in Anthropic, OpenAI and
   MCP formats (pypilot ships no OpenAI agent runtime — bring your own loop);
@@ -322,14 +324,34 @@ policy = Policy(
     dry_run=False,                              # True: describe instead of act
 )
 strict = Policy.strict()                        # no launching/clipboard, shells blocked, broad confirmations
+authorized = Policy.strict(allow=[              # default-deny: only these run without a human
+    'window "Invoice Entry - ERP" edit',
+    'window "Invoice Entry - ERP" button "Save"',
+])
 ```
 
-By default anything that looks like it commits money or data — *pay, transfer,
-wire, submit, send, delete, approve, post, purchase, release, …* (plurals and the
-German SAP labels such as *Buchen*, *Überweisen* included) — needs a human
-`confirm`; without a callback it is **blocked**. So does a click or Enter whose
-target cannot be identified (`unknown_target="confirm"`; `"block"`/`"allow"`).
-Text typed into password fields is masked in audit logs and recordings.
+The default policy is a **heuristic tripwire**, not authorization. A human
+`confirm` is needed (and without a callback the action is **blocked**) when the
+target looks like a commit — *pay, transfer, wire, submit, send, delete, approve,
+post, purchase, release, …*, their plurals and German SAP labels such as *Buchen*
+and *Überweisen* — when Ctrl/Cmd+Enter or Ctrl/Cmd+S is pressed, or when a click,
+Enter or field entry reaches a control that cannot be identified (nothing under
+the pointer, or no name, automation id, value or named child: an icon-only
+button). Keyword matching misses other languages, "Continue"/"Apply"-style
+commits and shortcuts it was not told about.
+
+For money and data actions use **allow-list mode**: with `Policy(allow=[...])` /
+`Policy.strict(allow=[...])` every consequential action (clicks, text entry,
+invoke, launching, clipboard writes, non-navigation keys) needs a human unless one
+of your rules — a selector, `"window=..."`, `"app=..."`, `"launch=..."`,
+`"keys=..."` or `"tool=..."` — matches what really receives it: the control the
+mouse actually presses (not the container around it), or the default button that
+Enter presses. A rule without `keys=` covers only typing, editing and navigation
+keys and Enter/Space on the control it names; application shortcuts such as
+Escape, F-keys or Alt+F4 need a `keys=` rule. Robots and flows are gated only when
+you pass a policy (`Robot(policy=...)`, `run_flow(..., policy=...)`); without one
+they run ungated as before. Text typed into password fields is masked in audit
+logs and recordings. Details: [`docs/LLM.md`](docs/LLM.md#6-safety-model).
 
 ### PyAutoGUI compatibility
 
@@ -358,7 +380,7 @@ the before/after.
 | Native invoke / set-value (works when covered) | — | ✓ | ✓ |
 | Humanized motion, Unicode typing  | partial | — | ✓ |
 | Robots, retries, evidence reports | — | ✓ | ✓ (code-first) |
-| Transaction queues                | — | ✓ (Orchestrator) | ✓ (local JSON, resumable) |
+| Transaction queues                | — | ✓ (Orchestrator: central, multi-machine) | ✓ (local JSON file: resumable, multi-process on one machine, leases; no network shares or multi-machine) |
 | Recorder                          | — | ✓ (Studio) | ✓ (emits Python/YAML with selectors) |
 | Visual designer, Orchestrator, enterprise governance, support | — | ✓ | — |
 | LLM tools, MCP server, computer-use adapter, agent loop | — | add-ons | ✓ built in |
