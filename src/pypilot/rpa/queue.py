@@ -33,8 +33,9 @@ status per item exactly like UiPath Orchestrator queues:
   handled the same way (``failed`` with error type ``Interrupted`` by default).
   A worker whose lease was taken over (it was considered dead) gets
   :class:`LeaseLostError` from ``complete``/``fail``/``renew`` instead of
-  overwriting the new owner's state; ``process()`` skips such items and lists
-  them in ``lost_ids``.
+  overwriting the new owner's state; the same happens when another worker
+  removed the item (``remove``/``clear``) while this one was running it.
+  ``process()`` skips such items and lists them in ``lost_ids``.
 
 Concurrency guarantees (``path=...`` with ``autosave=True``, the default):
 
@@ -49,6 +50,11 @@ Concurrency guarantees (``path=...`` with ``autosave=True``, the default):
   change, writes a temp file, ``flush`` + ``os.fsync``, ``os.replace``, and on
   POSIX fsyncs the directory. No snapshot taken outside the lock is ever
   written, so an item is claimed by exactly one worker and no update is lost.
+* If an operation or its write fails (disk full, a Windows sharing violation
+  that outlasts the retries, Ctrl+C), the exception propagates and nothing of
+  that operation is kept: claims it made are dropped (a ``next()`` that raised
+  leaves its item ``new``) and the next operation re-reads the file, so state
+  that was never written is never written later either.
 * Read-only accessors (``items``, ``get``, ``pending``, ``summary``...) show
   this instance's view as of its last operation; :meth:`WorkQueue.refresh`
   re-reads the file (``process()`` does so before returning its summary).
@@ -175,8 +181,9 @@ class LeaseLostError(PypilotError):
     Raised by :meth:`WorkQueue.complete`, :meth:`WorkQueue.fail`,
     :meth:`WorkQueue.renew` and :meth:`WorkQueue.release` instead of
     overwriting the state another worker owns: the lease expired (or this
-    worker was considered dead) and the item was reclaimed, or the item is
-    being processed by another live worker.
+    worker was considered dead) and the item was reclaimed, the item is
+    being processed by another live worker, or the item was removed from the
+    queue while this worker held it.
     """
 
 
@@ -562,6 +569,8 @@ class WorkQueue:
         self._claims: Dict[str, str] = {}  # item id -> lease_id of the claims this instance holds
         self._generation = 0
         self._disk_sig: Optional[Tuple[int, int, int]] = None
+        self._resync = False  # a transaction failed: memory may differ from the file, re-read it
+        self._gone_claims: set = set()  # ids of items we had claimed that were removed from the queue
         self._txn_depth = 0
         self._dirty = False
         self.created_at = _now()
@@ -603,18 +612,30 @@ class WorkQueue:
             assert self.path is not None
             with _file_lock(self._lock_path(self.path), self.lock_timeout):
                 self._dirty = False
-                self._txn_depth += 1
+                claims_before = dict(self._claims)
                 try:
-                    if self._refresh_locked():
-                        self._dirty = True
-                    yield
+                    self._txn_depth += 1
+                    try:
+                        if self._refresh_locked():
+                            self._dirty = True
+                        claims_before = dict(self._claims)  # recovery may end claims; that is disk truth now
+                        yield
+                    finally:
+                        self._txn_depth -= 1
+                    if self._dirty:
+                        self._write_locked(self.path)
                 except BaseException:
-                    self._disk_sig = None  # memory may be half-changed: re-read the file next time
+                    # The mutation or its write failed, so the file does not have this transaction's
+                    # changes. Memory may: forget the claims it made (a next() whose caller got the
+                    # exception must not keep the item reserved) and re-read the file next time.
+                    self._claims = claims_before
+                    self._resync = True
+                    try:
+                        self._refresh_locked()  # best effort now; otherwise the next transaction does it
+                    except Exception:
+                        self._resync = True
                     raise
                 finally:
-                    self._txn_depth -= 1
-                if self._dirty:
-                    self._write_locked(self.path)
                     self._dirty = False
 
     def refresh(self) -> "WorkQueue":
@@ -644,9 +665,14 @@ class WorkQueue:
         if st is not None:
             gen = _peek_generation(self.path)
             sig = (gen if gen is not None else -1, st.st_size, st.st_mtime_ns)
-            if gen is None or sig != self._disk_sig:
+            if gen is None or self._resync or sig != self._disk_sig:
                 self._apply_file(self._read_file(self.path))
                 self._disk_sig = sig
+        elif self._resync:
+            # A failed transaction before the file was ever written: the truth is an empty queue.
+            self._apply_file({"items": []})
+            self._disk_sig = None
+        self._resync = False
         return self._recover_abandoned()
 
     @staticmethod
@@ -690,14 +716,23 @@ class WorkQueue:
                 by_ref[fresh.reference] = fresh
         self._items, self._by_id, self._by_ref = items, by_id, by_ref
         for item_id in [i for i in self._claims if i not in by_id]:
+            self._gone_claims.add(item_id)  # removed by another worker while we held it
             del self._claims[item_id]
 
     def _write_locked(self, target: pathlib.Path) -> None:
+        previous = self._generation
         self._generation += 1
-        text = json.dumps(self.to_dict(), indent=2, ensure_ascii=False, default=str)
-        _atomic_write(target, text)
-        st = os.stat(target)
-        self._disk_sig = (self._generation, st.st_size, st.st_mtime_ns)
+        try:
+            text = json.dumps(self.to_dict(), indent=2, ensure_ascii=False, default=str)
+            _atomic_write(target, text)
+        except BaseException:
+            self._generation = previous  # nothing was written
+            raise
+        try:
+            st = os.stat(target)
+            self._disk_sig = (self._generation, st.st_size, st.st_mtime_ns)
+        except OSError:
+            self._disk_sig = None  # written, but re-read it next time to be sure
 
     # ----------------------------------------------------------------- leases
     def _owns(self, it: QueueItem) -> bool:
@@ -771,7 +806,7 @@ class WorkQueue:
         if not d > 0:
             raise ValueError("duration must be > 0")
         with self._txn():
-            it = self._item(item)
+            it = self._held_item(item)
             if not self._owns(it):
                 self._check_owner(it)
                 raise LeaseLostError(f"Item {it.id} of queue {self.name!r} is not claimed by this worker")
@@ -782,7 +817,7 @@ class WorkQueue:
     def release(self, item: Union[QueueItem, str]) -> QueueItem:
         """Give a claimed item back (``new``) without running it; the attempt does not count."""
         with self._txn():
-            it = self._item(item)
+            it = self._held_item(item)
             if not self._owns(it):
                 self._check_owner(it)
                 raise LeaseLostError(f"Item {it.id} of queue {self.name!r} is not claimed by this worker")
@@ -1088,13 +1123,27 @@ class WorkQueue:
             raise KeyError(f"Item {item!r} is not in queue {self.name!r}")
         return found
 
+    def _held_item(self, item: Union[QueueItem, str]) -> QueueItem:
+        """Like :meth:`_item`, but an item this worker had claimed that was removed meanwhile is a lost lease."""
+        item_id = item if isinstance(item, str) else item.id
+        if item_id not in self._by_id:
+            held = (item_id in self._gone_claims or item_id in self._claims
+                    or (isinstance(item, QueueItem) and item.status == IN_PROGRESS
+                        and item.worker_id == self.worker_id and item.lease_id is not None))
+            if held:
+                self._gone_claims.discard(item_id)
+                self._claims.pop(item_id, None)
+                raise LeaseLostError(f"Item {item_id} of queue {self.name!r} was removed from the queue "
+                                     "while this worker was processing it")
+        return self._item(item)
+
     def complete(self, item: Union[QueueItem, str], output: Optional[Dict[str, Any]] = None) -> QueueItem:
         """Mark ``item`` ``success`` (merging ``output`` into :attr:`QueueItem.output`).
 
         Raises :class:`LeaseLostError` if another worker owns the item now.
         """
         with self._txn():
-            it = self._item(item)
+            it = self._held_item(item)
             self._check_owner(it)
             self._end_lease(it)
             it.status = SUCCESS
@@ -1113,7 +1162,7 @@ class WorkQueue:
         Raises :class:`LeaseLostError` if another worker owns the item now.
         """
         with self._txn():
-            it = self._item(item)
+            it = self._held_item(item)
             self._check_owner(it)
             self._end_lease(it)
             is_business = isinstance(error, BusinessException) if business is None else bool(business)
@@ -1158,7 +1207,8 @@ class WorkQueue:
             it = self._item(item)
             self._items.remove(it)
             del self._by_id[it.id]
-            self._claims.pop(it.id, None)
+            if self._claims.pop(it.id, None) is not None:
+                self._gone_claims.add(it.id)
             if it.reference is not None and self._by_ref.get(it.reference) is it:
                 del self._by_ref[it.reference]
             self._touch()
@@ -1169,6 +1219,7 @@ class WorkQueue:
             self._items.clear()
             self._by_id.clear()
             self._by_ref.clear()
+            self._gone_claims.update(self._claims)
             self._claims.clear()
             self._touch()
 
@@ -1290,6 +1341,7 @@ class WorkQueue:
                     self.fail(item, exc, business=False)
                     return
                 with self._txn():
+                    self._held_item(item)
                     self._check_owner(item)
                     self._set_error(item, exc)
                     item.history.append({"time": _now(), "event": "retry", "attempt": item.attempts, "error": item.error})
