@@ -1719,3 +1719,53 @@ def test_type_text_is_paced_per_character_keeping_surrogate_pairs(api):
     assert calls == [2, 4, 2, 2]  # one SendInput per character; the emoji's two UTF-16 units together
     with pytest.raises(ValueError):
         WindowsBackend(_api=api, dpi_aware=False, type_char_delay=-1)
+
+
+def test_first_key_after_a_click_waits_for_the_app_to_handle_it(api):
+    """Windows 11 Notepad, clicked on just-typed text, lost the Ctrl of an
+    immediate Ctrl+A and typed 'a' (seen on a real machine). The first keyboard
+    event after a button release waits ``click_key_settle``; later keys do not."""
+    sleeps = []
+    nb = WindowsBackend(_api=api, dpi_aware=False, sleep=sleeps.append, click_key_settle=0.1, type_char_delay=0)
+    nb.key_down("ctrl")
+    nb.key_up("ctrl")
+    assert sleeps == []  # no click yet: no settle
+    nb.mouse_down()
+    nb.mouse_up()
+    nb.key_down("ctrl")
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= 0.1
+    nb.key_down("a")
+    nb.key_up("a")
+    nb.key_up("ctrl")
+    assert len(sleeps) == 1  # only the first key after the click waits
+    nb.mouse_down()
+    nb.mouse_up()
+    nb.type_text("x")
+    assert len(sleeps) == 2  # type_text settles too
+    off = []
+    nb2 = WindowsBackend(_api=api, dpi_aware=False, sleep=off.append, click_key_settle=0, type_char_delay=0)
+    nb2.mouse_down()
+    nb2.mouse_up()
+    nb2.key_down("a")
+    nb2.key_up("a")
+    assert off == []
+    with pytest.raises(ValueError):
+        WindowsBackend(_api=api, dpi_aware=False, click_key_settle=-1)
+
+
+def test_key_presses_are_paced(api):
+    """Key-by-key typing is a burst too: Windows 11 Notepad dropped runs of it."""
+    sleeps = []
+    nb = WindowsBackend(_api=api, dpi_aware=False, sleep=sleeps.append, type_char_delay=0.05, click_key_settle=0)
+    nb.key_down("a")
+    nb.key_up("a")
+    assert sleeps == []  # the first press never waits
+    nb.key_down("b")
+    nb.key_up("b")
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= 0.05
+    fast = []
+    nb2 = WindowsBackend(_api=api, dpi_aware=False, sleep=fast.append, type_char_delay=0, click_key_settle=0)
+    for k in "abc":
+        nb2.key_down(k)
+        nb2.key_up(k)
+    assert fast == []

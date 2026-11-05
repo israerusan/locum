@@ -178,6 +178,55 @@ def _same_text(actual: str, expected: str) -> bool:
     return bool(a and e and a & e)
 
 
+def _norm_newlines(s: str) -> str:
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _common_prefix(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _common_suffix(a: str, b: str, limit: int) -> int:
+    n = min(len(a), len(b), limit)
+    i = 0
+    while i < n and a[-1 - i] == b[-1 - i]:
+        i += 1
+    return i
+
+
+def _typed_into(before: str, after: str, text: str) -> bool:
+    """Whether ``after`` is ``before`` with ``text`` typed at one place (replacing a selection or not)."""
+    if len(after) < len(text):
+        return False
+    p = _common_prefix(before, after)
+    s = _common_suffix(before, after, len(before))
+    # after = before[:a] + text + before[len(before) - k:], a <= p, k <= s, a + k <= len(before)
+    for a in range(min(p, len(after) - len(text)) + 1):
+        k = len(after) - a - len(text)
+        if 0 <= k <= s and a + k <= len(before) and after[a:a + len(text)] == text:
+            return True
+    return False
+
+
+def _repair_candidates(before: str, after: str, text: str) -> set:
+    """What the field should hold if ``text`` was meant to be *inserted* (no selection) but came out garbled.
+
+    The insertion point must lie where ``before`` and ``after`` still agree
+    around it; every position consistent with that yields a candidate. One
+    distinct candidate = safe to repair; several = ambiguous; none = the
+    edit was not a plain insertion (a selection was replaced, the app
+    reformatted), which is not repaired.
+    """
+    p = _common_prefix(before, after)
+    s = _common_suffix(before, after, len(before))
+    lo, hi = max(0, len(before) - s), min(p, len(before))
+    return {before[:k] + text + before[k:] for k in range(lo, hi + 1)}
+
+
 def _desktop_sleep(desktop: Any) -> Callable[[float], Any]:
     fn = getattr(desktop, "sleep", None)
     return fn if callable(fn) else time.sleep
@@ -790,7 +839,8 @@ class Element:
     def _typing_mode(self, mode: Optional[str]) -> str:
         return mode or getattr(self.desktop, "typing_mode", None) or "auto"
 
-    def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: bool = True) -> "Element":
+    def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: bool = True,
+                 _typing_mode: Optional[str] = None) -> "Element":
         """Replace (``clear=True``) or extend the element's text.
 
         ``native="auto"`` uses the accessibility set-value action and verifies
@@ -832,7 +882,7 @@ class Element:
             elif mode is True:
                 raise NotSupported(f"{self!r} does not support setting its value natively")
         kb = self.desktop.keyboard
-        typing_mode = self._typing_mode(None)
+        typing_mode = self._typing_mode(_typing_mode)
         if any(c in typed for c in "\r\n\t"):
             # Typed, these would be Enter/Tab key presses: paste them literally instead.
             if not _safe(lambda: self.backend.has(CAP_CLIPBOARD), False):
@@ -876,14 +926,80 @@ class Element:
         except ActionTimeout:
             self._raise_mismatch(target, last[0])
 
-    def type(self, text: str, **kw: Any) -> "Element":
-        """Focus the element (if needed) and type ``text`` (keyword args go to ``Keyboard.type``)."""
+    def type(self, text: str, *, verify: bool = True, **kw: Any) -> "Element":
+        """Focus the element (if needed) and type ``text`` (keyword args go to ``Keyboard.type``).
+
+        With ``verify=True`` (the default) a text field (``edit``/``document``
+        whose value is readable and not a password) is read before and after
+        typing. The result must be the old text with ``text`` inserted at one
+        place (or replacing a selection). Some apps drop or garble synthesized
+        keystrokes while busy -- Windows 11 Notepad repeats a later character
+        in place of earlier ones -- so a mismatch is **repaired** when the
+        intended result is unambiguous (the field was empty, or there is only
+        one place the text can have gone): the field is set to it with
+        :meth:`set_text`, which is verified in turn. Otherwise
+        :class:`ActionTimeout` is raised naming both values instead of
+        reporting success. Pass ``verify=False`` for fields that reformat
+        their input (masks, autocomplete). Text containing ``\\t``/``\\n``
+        is not verified unless pasted (``mode="clipboard"``): typed, those
+        are Tab/Enter key presses whose effect is up to the app.
+        """
         self._guard()
         self._check_writable()
         self._ensure_focus()
         kw["mode"] = self._typing_mode(kw.get("mode"))
+        # Typed (not pasted), \t and \n are Tab/Enter *key presses* that may move focus,
+        # submit a form or be swallowed: the field is not expected to hold them, so such
+        # text is not verified (and never "repaired" into literal tabs/newlines).
+        presses_keys = kw["mode"] != "clipboard" and any(c in text for c in "\t\r\n")
+        before = self._value_for_verify() if verify and text and not presses_keys else None
         self.desktop.keyboard.type(text, **kw)
+        if before is not None:
+            self._verify_typed(before, text)
         return self
+
+    #: fields longer than this are not read back by :meth:`type` (cost of the round trip)
+    TYPE_VERIFY_MAX_CHARS = 200_000
+
+    def _value_for_verify(self) -> Optional[str]:
+        """The field's current text if :meth:`type` can verify it, else ``None``."""
+        from ._nodeinfo import is_password
+
+        if self.role not in ("edit", "document") or _safe(lambda: is_password(self._node), True):
+            return None
+        v = _safe(lambda: self.value, None)
+        if not isinstance(v, str) or len(v) > self.TYPE_VERIFY_MAX_CHARS:
+            return None
+        return v
+
+    def _verify_typed(self, before: str, text: str) -> None:
+        b, t = _norm_newlines(before), _norm_newlines(text)
+        last: List[Optional[str]] = [None]
+
+        def holds() -> bool:
+            v = _safe(lambda: self.value, None)
+            last[0] = v
+            return v is None or _typed_into(b, _norm_newlines(v), t)
+
+        try:
+            wait_until(holds, 1.0, _desktop_interval(self.desktop) or 0.05,
+                       sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
+            return
+        except ActionTimeout:
+            pass
+        after = _norm_newlines(last[0] or "")
+        intended = _repair_candidates(b, after, t)
+        if len(intended) != 1:
+            raise ActionTimeout(
+                f"{self!r} holds {last[0]!r} after typing {text!r} into {before!r}: the app dropped or "
+                "garbled keystrokes and the intended text is ambiguous, so it was not repaired; use "
+                "set_text(), mode='clipboard', or verify=False if the field reformats its input"
+            )
+        # Native set-value first; if the app needs keystrokes, paste rather than retype
+        # (the same keystroke path just failed).
+        can_paste = bool(_safe(lambda: self.backend.has(CAP_CLIPBOARD), False))
+        self.set_text(intended.pop(), clear=True, verify=True,
+                      _typing_mode="clipboard" if can_paste else None)
 
     def clear(self) -> "Element":
         return self.set_text("", clear=True)

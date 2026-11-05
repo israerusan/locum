@@ -1625,7 +1625,15 @@ class WindowsBackend(Backend):
             pasted passwords and bank data are not kept there).
         respect_swapped_buttons: when the user swapped mouse buttons, map
             ``"left"`` to the *primary* button (as users expect).
-        sleep: sleep function used only for clipboard retries.
+        type_char_delay: seconds between characters in :meth:`type_text`, and the
+            minimum gap between consecutive :meth:`key_down` presses.
+        click_key_settle: minimum seconds between a mouse button release and the
+            next keyboard event. Applications handle a click asynchronously;
+            Windows 11 Notepad, clicked on text that was just typed, loses the
+            Ctrl of an immediately following Ctrl+A and types ``a`` (verified on
+            a real machine; 50 ms was already enough). Only the first key after a
+            click waits, so typing and repeated clicks keep full speed.
+        sleep: sleep function for clipboard retries and input pacing.
 
     Raises:
         BackendUnavailable: not running on Windows.
@@ -1646,6 +1654,7 @@ class WindowsBackend(Backend):
         clipboard_history: bool = False,
         respect_swapped_buttons: bool = True,
         type_char_delay: float = 0.01,
+        click_key_settle: float = 0.1,
         sleep: Callable[[float], None] = time.sleep,
         _api: Any = None,
     ) -> None:
@@ -1682,6 +1691,11 @@ class WindowsBackend(Backend):
         if type_char_delay < 0:
             raise ValueError("type_char_delay must be >= 0")
         self._type_char_delay = float(type_char_delay)
+        if click_key_settle < 0:
+            raise ValueError("click_key_settle must be >= 0")
+        self._click_key_settle = float(click_key_settle)
+        self._last_button_up: Optional[float] = None
+        self._last_key_down: Optional[float] = None
         self._lock = threading.RLock()
         self._held: Dict[str, _Held] = {}
         self._buttons_down: Dict[MouseButton, INPUT] = {}
@@ -1805,9 +1819,19 @@ class WindowsBackend(Backend):
                 _down, up, data = _BUTTON_FLAGS[phys]
                 ev = mouse_input(0, 0, data, up)
             self._send([ev])
+            self._last_button_up = time.monotonic()
             # Forgotten only once released: if Windows rejected the release (secure
             # desktop, locked workstation) release_all()/close() can retry it.
             self._buttons_down.pop(logical, None)
+
+    def _settle_after_click(self) -> None:
+        """Before the first keyboard event after a click, let the app finish handling the click."""
+        last, self._last_button_up = self._last_button_up, None
+        if last is None or self._click_key_settle <= 0:
+            return
+        remaining = self._click_key_settle - (time.monotonic() - last)
+        if remaining > 0:
+            self._sleep(remaining)
 
     def scroll(self, dx: int = 0, dy: int = 0) -> None:
         """Wheel notches: ``dy > 0`` scrolls up, ``dx > 0`` scrolls right (one event per notch)."""
@@ -1926,10 +1950,27 @@ class WindowsBackend(Backend):
     def key_down(self, key: str) -> None:
         """Press a canonical key name or a single character (adding Shift/AltGr as the layout needs)."""
         self._check()
+        self._settle_after_click()
+        self._pace_key()
         with self._lock:
             name, press, release = self._plan(key)
             self._send(press)
             self._held[name] = _Held(press, release)
+            self._last_key_down = time.monotonic()
+
+    def _pace_key(self) -> None:
+        """Keep key presses at least ``type_char_delay`` apart.
+
+        Key-by-key typing (``mode="keys"``) is a burst of presses just like a
+        unicode burst; Windows 11 Notepad intermittently dropped whole runs of
+        them (about 1 in 6 runs of a 30-symbol string on a real machine).
+        """
+        last = self._last_key_down
+        if last is None or self._type_char_delay <= 0:
+            return
+        remaining = self._type_char_delay - (time.monotonic() - last)
+        if remaining > 0:
+            self._sleep(remaining)
 
     def key_up(self, key: str) -> None:
         self._check()
@@ -1978,6 +2019,7 @@ class WindowsBackend(Backend):
         self._check()
         if not text:
             return
+        self._settle_after_click()
         groups: List[List[INPUT]] = []
         for token in split_text_tokens(text):
             if token in ("enter", "tab"):

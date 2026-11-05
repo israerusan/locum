@@ -2801,6 +2801,10 @@ class MacOSBackend(Backend):
                 return subprocess.Popen(["open", "-a", " ".join(parts)], **kwargs)
             if parts and parts[0].endswith(".app") and os.path.isdir(parts[0]):
                 return subprocess.Popen(["open", "-a", parts[0], "--args", *parts[1:]], **kwargs)
+            if parts:
+                # Pass the POSIX-split argv on: the base class splits strings by the
+                # *host* platform's rules, which differ when this runs off macOS (tests).
+                return super().launch(parts, **kwargs)
         return super().launch(command, **kwargs)
 
     # ------------------------------------------------------------------- clipboard

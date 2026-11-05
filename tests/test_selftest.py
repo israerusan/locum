@@ -28,7 +28,9 @@ def test_selftest_refuses_to_type_into_a_non_empty_editor(tmp_path):
     st.run()
     status = {c.name: c.status for c in st.checks}
     assert status["accessibility tree + selector"] == "FAIL"
-    assert status["unicode typing"] == "SKIP" and status["set_text (native)"] == "SKIP"
+    assert status["unicode typing (raw keystrokes)"] == "SKIP"
+    assert status["unicode typing (Element.type, verified)"] == "SKIP"
+    assert status["set_text (native)"] == "SKIP"
     assert not any(e[0] == "type" for e in be.events)
     assert st.editor is None
 

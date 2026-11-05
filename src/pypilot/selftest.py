@@ -182,16 +182,42 @@ class SelfTest:
         return f"editor = {ed.role} {ed.name!r} at {ed.bounds} (fresh, empty); tree saved ({len(tree.splitlines())} lines)"
 
     def c_type_unicode(self) -> str:
+        """Raw keystroke typing (``Desktop.type``): nothing verifies or repairs it."""
         ed = self._editor()
         ed.click()
         self.d.hotkey("ctrl+a")
         self.d.press("delete")
+        self._settle()
         self.d.type(UNICODE_TEXT)
-        self.d.sleep(0.5)
-        got = self._editor_text()
-        if UNICODE_TEXT not in got:
+        got = self._wait_editor_text(UNICODE_TEXT)
+        if got != UNICODE_TEXT:
             raise AssertionError(f"typed {UNICODE_TEXT!r} but the editor contains {got!r}")
         return "typed text read back exactly (incl. emoji/CJK)"
+
+    def c_type_verified(self) -> str:
+        """``Element.type`` reads the field back and repairs dropped/garbled keystrokes."""
+        ed = self._editor()
+        ed.set_text("")  # setup must not depend on the keystroke path under test
+        if self._wait_editor_text("") != "":
+            raise AssertionError(f"could not empty the test editor before typing: {self._editor_text()!r}")
+        ed.click()
+        self._settle()
+        repaired: List[bool] = []
+        orig = ed.set_text
+
+        def spy(*a: Any, **kw: Any) -> Any:  # set_text is only called by type() to repair
+            repaired.append(True)
+            return orig(*a, **kw)
+
+        ed.set_text = spy  # type: ignore[method-assign]
+        try:
+            ed.type(UNICODE_TEXT)
+        finally:
+            del ed.set_text
+        got = self._wait_editor_text(UNICODE_TEXT)
+        if got != UNICODE_TEXT:
+            raise AssertionError(f"Element.type left {got!r}, expected {UNICODE_TEXT!r}")
+        return "exact" + (" (keystrokes were garbled; repaired via read-back)" if repaired else "")
 
     def c_clipboard(self) -> str:
         ed = self._editor()
@@ -216,10 +242,10 @@ class SelfTest:
         ed.focus()
         self.d.hotkey("ctrl+a")
         self.d.press("delete")
+        self._settle()
         self.d.type(SYMBOLS_TEXT, mode="keys")
-        self.d.sleep(0.5)
-        got = self._editor_text()
-        if SYMBOLS_TEXT not in got:
+        got = self._wait_editor_text(SYMBOLS_TEXT)
+        if got != SYMBOLS_TEXT:
             raise AssertionError(f"key-by-key typing of symbols gave {got!r} (keyboard layout mapping problem)")
         return "every symbol typed key-by-key through the active keyboard layout"
 
@@ -332,6 +358,24 @@ class SelfTest:
             pass
         return (ed.value or "").replace("\r\n", "\n")
 
+    def _wait_editor_text(self, expected: str, timeout: float = 2.0) -> str:
+        """Poll the editor until it reads ``expected`` (apps process keystrokes asynchronously)."""
+        deadline = time.monotonic() + (0 if self.d.backend.name == "mock" else timeout)
+        got = self._editor_text()
+        while got != expected and time.monotonic() < deadline:
+            self.d.sleep(0.1)
+            got = self._editor_text()
+        return got
+
+    def _settle(self) -> None:
+        """Let the editor finish redrawing/loading before keystrokes are sent to it."""
+        if self.d.backend.name == "mock":
+            return
+        try:
+            self.d.wait_until_stable(self._win().rect, stable_for=0.4, timeout=3)
+        except Exception:
+            self.d.sleep(0.5)
+
     # ------------------------------------------------------------------- main
     def run(self) -> List[Check]:
         from .backends.base import CAP_ACCESSIBILITY, CAP_CLIPBOARD, CAP_KEYBOARD, CAP_MOUSE, CAP_SCREENSHOT, CAP_WINDOWS
@@ -351,7 +395,8 @@ class SelfTest:
             self.run_check("window list", self.c_windows, needs=CAP_WINDOWS)
             if self.run_check("launch editor", self.c_launch_editor, needs=CAP_WINDOWS):
                 self.run_check("accessibility tree + selector", self.c_accessibility, needs=CAP_ACCESSIBILITY)
-                self.run_check("unicode typing", self.c_type_unicode, needs=CAP_KEYBOARD)
+                self.run_check("unicode typing (raw keystrokes)", self.c_type_unicode, needs=CAP_KEYBOARD)
+                self.run_check("unicode typing (Element.type, verified)", self.c_type_verified, needs=CAP_KEYBOARD)
                 self.run_check("hotkeys + clipboard", self.c_clipboard, needs=CAP_CLIPBOARD)
                 self.run_check("symbols via keyboard layout", self.c_symbols, needs=CAP_KEYBOARD)
                 self.run_check("set_text (native)", self.c_set_text, needs=CAP_ACCESSIBILITY)
