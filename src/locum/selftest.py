@@ -29,7 +29,9 @@ import json
 import os
 import platform
 import re
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from typing import Any, Callable, Dict, List, Optional
@@ -58,6 +60,8 @@ class SelfTest:
         self.editor_window: Any = None
         #: True when the editor window already existed (the user's own Notepad): it is never closed
         self.editor_preexisting = False
+        #: the empty file TextEdit edits on macOS; deleted after the run
+        self.temp_doc: Optional[str] = None
         self.editor: Any = None
         self.env: Dict[str, Any] = {}
         #: how long to wait for an app's "save changes?" prompt after closing the editor
@@ -155,6 +159,8 @@ class SelfTest:
 
     def c_launch_editor(self) -> str:
         cmd, title = _editor_for_platform(self.d.backend.name)
+        if isinstance(cmd, list) and cmd[-1].endswith(".txt"):
+            self.temp_doc = cmd[-1]
         try:
             before = {w.handle for w in self.d.windows()}
         except Exception:
@@ -175,8 +181,9 @@ class SelfTest:
         # Windows 11 Notepad reopens the user's previous tabs. Never type into
         # them: open a fresh tab (Ctrl+N; a plain new document elsewhere) and
         # only continue if the editor we land in is empty.
-        self.d.hotkey("ctrl+n")
-        self.d.sleep(1.0)
+        if self.d.backend.name != "macos":  # TextEdit already opened an empty file of ours
+            self.d.hotkey("mod+n")
+            self.d.sleep(1.0)
         tree = self.d.tree(window=win, max_depth=12)
         with open(self.path("02_editor_tree.txt"), "w", encoding="utf-8") as fh:
             fh.write(tree)
@@ -250,8 +257,8 @@ class SelfTest:
     def c_clipboard(self) -> str:
         ed = self._editor()
         ed.focus()
-        self.d.hotkey("ctrl+a")
-        self.d.hotkey("ctrl+c")
+        self.d.hotkey("mod+a")
+        self.d.hotkey("mod+c")
         got = ""
         for _ in range(20):
             got = self.d.clipboard_get()
@@ -268,7 +275,7 @@ class SelfTest:
     def c_symbols(self) -> str:
         ed = self._editor()
         ed.focus()
-        self.d.hotkey("ctrl+a")
+        self.d.hotkey("mod+a")
         self.d.press("delete")
         self._settle()
         self.d.type(SYMBOLS_TEXT, mode="keys")
@@ -372,7 +379,7 @@ class SelfTest:
         try:
             self.editor_window.activate()
             self.editor.focus()
-            self.d.hotkey("ctrl+a")
+            self.d.hotkey("mod+a")
             self.d.press("delete")
             if sys.platform == "win32":
                 self.d.hotkey("ctrl+w")  # Windows 11 Notepad: close the (now empty) test tab
@@ -467,6 +474,8 @@ class SelfTest:
                     self.d.move(start_pos)
                 except Exception:
                     pass
+            if self.temp_doc is not None:  # TextEdit autosaves into it
+                shutil.rmtree(os.path.dirname(self.temp_doc), ignore_errors=True)
             self.write_report()
         return self.checks
 
@@ -504,7 +513,11 @@ def _editor_for_platform(backend: str = "") -> Any:
     if sys.platform == "win32" or backend in ("mock", "windows"):
         return "notepad.exe", re.compile(r"(?i)notepad|bloc de notas|editor")
     if sys.platform == "darwin":
-        return ["open", "-n", "-a", "TextEdit"], re.compile(r"(?i)untitled|sin título|textedit")
+        # Without a document TextEdit shows its Open panel (iCloud document browser)
+        # instead of a new window: open an empty file of our own (removed afterwards).
+        path = os.path.join(tempfile.mkdtemp(prefix="locum_selftest_"), "locum selftest.txt")
+        open(path, "w").close()
+        return ["open", "-n", "-a", "TextEdit", path], re.compile(re.escape("locum selftest"))
     for cmd, pat in (("gedit", "gedit|untitled"), ("mousepad", "mousepad|untitled"), ("kate", "kate|untitled")):
         import shutil
 

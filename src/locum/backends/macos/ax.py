@@ -85,6 +85,9 @@ def map_ax_role(ax_role: Optional[str], subrole: Optional[str] = "") -> str:
 # Thin wrapper over the HIServices accessibility API
 # =============================================================================
 
+#: Identifiers Interface Builder assigns automatically ("_NS:136"); they change between
+#: builds and launches, so they are not used as automation ids.
+_GENERATED_ID_RE = re.compile(r"^_NS:\d+$")
 _AX_POINT_RE = re.compile(r"x:\s*(-?[\d.]+)\s+y:\s*(-?[\d.]+)")
 _AX_SIZE_RE = re.compile(r"w:\s*(-?[\d.]+)\s+h:\s*(-?[\d.]+)")
 
@@ -206,8 +209,9 @@ class _AXApi:
                     if typ == kAXValueCGRectType:
                         return (float(out.origin.x), float(out.origin.y),
                                 float(out.size.width), float(out.size.height))
-                    if typ == kAXValueCFRangeType:
-                        return (int(out.location), int(out.length))
+                    if typ == kAXValueCFRangeType:  # pyobjc returns CFRange as a plain tuple
+                        loc, length = (out.location, out.length) if hasattr(out, "location") else out
+                        return (int(loc), int(length))
             text = str(val)
             m = _AX_POINT_RE.search(text)
             if m:
@@ -442,7 +446,8 @@ class AXNode(AccessibleNode):
 
     @property
     def automation_id(self) -> str:
-        return str(self._attrs().get("AXIdentifier") or "")
+        ident = str(self._attrs().get("AXIdentifier") or "")
+        return "" if _GENERATED_ID_RE.match(ident) else ident
 
     @property
     def class_name(self) -> str:

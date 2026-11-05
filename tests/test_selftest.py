@@ -80,3 +80,25 @@ def test_selftest_never_closes_a_notepad_window_that_was_already_open(tmp_path):
     assert status["close editor without saving"] == (
         "PASS", "closed the test tab; left your existing Notepad window open")
     assert users.exists
+
+
+def test_selftest_opens_textedit_on_an_empty_file_of_its_own(monkeypatch):
+    import os
+
+    monkeypatch.setattr(selftest.sys, "platform", "darwin")
+    cmd, title = selftest._editor_for_platform("macos")
+    path = cmd[-1]
+    try:
+        assert cmd[:4] == ["open", "-n", "-a", "TextEdit"] and os.path.getsize(path) == 0
+        assert title.search(os.path.basename(path))  # no Open panel: the window is named after the file
+    finally:
+        os.remove(path)
+        os.rmdir(os.path.dirname(path))
+
+
+def test_selftest_uses_the_platform_shortcut_key():
+    import inspect
+
+    src = inspect.getsource(selftest.SelfTest)
+    for key in "anc":  # Ctrl+A moves to the line start on macOS instead of selecting all
+        assert f'hotkey("ctrl+{key}")' not in src and f'hotkey("mod+{key}")' in src

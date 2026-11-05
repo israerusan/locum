@@ -25,6 +25,22 @@ from .constants import (
 from .windowing import _plausible_record, _record_bounds, pair_ax_windows
 
 
+#: Folders searched for ``<name>.app`` when deciding whether a string names an app.
+APP_FOLDERS = (
+    "/Applications", "/Applications/Utilities", "/System/Applications",
+    "/System/Applications/Utilities", "/System/Library/CoreServices", "~/Applications",
+)
+
+
+def _find_app_bundle(name: str) -> Optional[str]:
+    """Path of the installed ``<name>.app`` bundle, or None."""
+    for folder in APP_FOLDERS:
+        path = os.path.join(os.path.expanduser(folder), name + ".app")
+        if os.path.isdir(path):
+            return path
+    return None
+
+
 class _WindowsMixin:
     # --------------------------------------------------------------------- windows
     def _window_records(self, options: int, relative: int = kCGNullWindowID) -> List[Dict[str, Any]]:
@@ -182,6 +198,16 @@ class _WindowsMixin:
             num = int(handle)
         except (TypeError, ValueError):
             raise WindowNotFound(f"Invalid macOS window handle: {handle!r}") from None
+        # kCGWindowListOptionIncludingWindow leaves out minimized windows, so a window
+        # could not be restored, moved or closed once minimized; describing the id does.
+        describe = getattr(self._q, "CGWindowListCreateDescriptionFromArray", None)
+        if describe is not None:
+            try:
+                for rec in describe([num]) or []:
+                    if int(rec.get("kCGWindowNumber", -1)) == num:
+                        return dict(rec)
+            except Exception:
+                pass
         for rec in self._window_records(kCGWindowListOptionIncludingWindow, num):
             if int(rec.get("kCGWindowNumber", -1)) == num:
                 return rec
@@ -444,8 +470,12 @@ class _WindowsMixin:
                 parts = shlex.split(stripped)
             except ValueError:
                 parts = []
-            if (parts and "/" not in stripped and not any(c in stripped for c in "\"'\\")
-                    and shutil.which(parts[0]) is None):
+            plain = bool(parts) and "/" not in stripped and not any(c in stripped for c in "\"'\\")
+            # The default APFS volume is case-insensitive, so which("Mail") finds
+            # /usr/bin/mail (likewise Calendar, Script Editor, Shortcuts): a capitalised
+            # name that is an installed app opens the app; "mail" stays the command.
+            if plain and (shutil.which(parts[0]) is None
+                          or (parts[0][:1].isupper() and _find_app_bundle(stripped) is not None)):
                 return subprocess.Popen(["open", "-a", " ".join(parts)], **kwargs)
             if parts and parts[0].endswith(".app") and os.path.isdir(parts[0]):
                 return subprocess.Popen(["open", "-a", parts[0], "--args", *parts[1:]], **kwargs)

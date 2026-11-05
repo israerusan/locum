@@ -1610,3 +1610,165 @@ def test_pair_ax_windows_unique_frame_beats_title_mismatch():
     recs = [_rec(21, 1, 0, 25, 800, 600, "SAP Easy Access"), _rec(22, 1, 900, 25, 400, 300, "Log")]
     wins = [((0.0, 25.0, 800.0, 600.0), "SAP Easy Access - User menu", None)]
     assert macos.pair_ax_windows(recs, wins) == {0: 21}
+
+
+# =============================================================================
+# first live run on a real Mac: async cursor, minimized windows, launch names,
+# CFRange values, full-resolution capture, clipboard snapshot, caps lock, ids
+# =============================================================================
+
+
+class AsyncCursorQuartz(FakeQuartz):
+    """Like the WindowServer: a posted move is applied later, not by CGEventPost."""
+
+    def CGEventPost(self, tap, ev):
+        self.posted.append(ev)
+
+
+def test_click_right_after_move_uses_the_posted_point():
+    be, q, _ = make_backend()
+    async_q = AsyncCursorQuartz()
+    be._q = async_q
+    be.mouse_move(200, 100)
+    assert async_q.pos == (0.0, 0.0)  # the real cursor has not caught up yet
+    assert be.mouse_position() == Point(200, 100)
+    be.mouse_down(MouseButton.LEFT)
+    be.mouse_up(MouseButton.LEFT)
+    assert [e.pt for e in async_q.posted] == [(100.0, 50.0)] * 3
+
+
+def test_cursor_is_read_back_once_the_posted_point_is_stale(monkeypatch):
+    be, q, _ = make_backend()
+    be.mouse_move(200, 100)
+    q.pos = (300.0, 200.0)  # the user moved the mouse afterwards
+    monkeypatch.setattr(be, "CURSOR_SETTLE", 0.0)
+    assert be.mouse_position() == Point(600, 400)
+
+
+def test_minimized_window_is_found_by_id():
+    be, q, appkit, ax, win = _window_setup()
+    # kCGWindowListOptionIncludingWindow omits minimized windows; describing the id does not
+    q.CGWindowListCopyWindowInfo = lambda options, relative: (
+        [] if options == macos.kCGWindowListOptionIncludingWindow else list(q.windows))
+    q.CGWindowListCreateDescriptionFromArray = lambda ids: [w for w in q.windows if w["kCGWindowNumber"] in ids]
+    be.set_window_state(7, "normal")
+    assert win.attrs["AXMinimized"] is False
+    be.close_window(7)
+    assert win.attrs["AXCloseButton"].performed == ["AXPress"]
+    with pytest.raises(WindowNotFound):
+        be.close_window(999)
+
+
+def test_launch_prefers_installed_apps_over_case_insensitive_commands(monkeypatch):
+    from locum.backends.macos import windows_mixin
+
+    calls = []
+
+    class FakePopen:
+        def __init__(self, args, **kw):
+            calls.append(args)
+
+    monkeypatch.setattr(macos.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(macos.shutil, "which", lambda name: "/usr/bin/" + name.lower())  # APFS: which("Mail")
+    apps = {"Mail", "Script Editor"}
+    monkeypatch.setattr(windows_mixin, "_find_app_bundle",
+                        lambda name: f"/System/Applications/{name}.app" if name in apps else None)
+    be, _, _ = make_backend()
+    be.launch("Mail")
+    be.launch("Script Editor")
+    be.launch("mail")  # lower case: the command
+    be.launch("Say hello")  # no such app: the command
+    assert calls == [["open", "-a", "Mail"], ["open", "-a", "Script Editor"], ["mail"], ["Say", "hello"]]
+
+
+def test_cfrange_values_are_unpacked_from_plain_tuples():
+    class AXValueRef:
+        pass
+
+    mod = SimpleNamespace(
+        AXUIElementCreateSystemWide=lambda: object(),
+        AXUIElementSetMessagingTimeout=lambda el, t: 0,
+        AXValueGetType=lambda v: macos.kAXValueCFRangeType,
+        AXValueGetValue=lambda v, typ, out: (True, (2, 5)),  # pyobjc's CFRange shape
+    )
+    assert macos._AXApi(mod)._convert(AXValueRef()) == (2, 5)
+
+
+def test_screenshot_captures_full_resolution_before_mss(monkeypatch):
+    from PIL import Image
+
+    be, q, _ = make_backend()
+    monkeypatch.setattr(be, "_grab_points_cg", lambda x, y, w, h: Image.new("RGB", (w * 2, h * 2), (1, 2, 3)))
+    monkeypatch.setattr(be, "_mss", lambda: pytest.fail("mss captures one pixel per point on macOS"))
+    assert be._grab_points(0, 0, 10, 5).size == (20, 10)
+
+    def no_quartz(x, y, w, h):
+        raise BackendError("no CGWindowListCreateImage")
+
+    shot = SimpleNamespace(size=(10, 5), bgra=b"\x03\x02\x01\x00" * 50)
+    monkeypatch.setattr(be, "_grab_points_cg", no_quartz)
+    monkeypatch.setattr(be, "_mss", lambda: SimpleNamespace(grab=lambda region: shot))
+    img = be._grab_points(0, 0, 10, 5)
+    assert img.size == (10, 5) and img.getpixel((0, 0)) == (1, 2, 3)
+
+
+class FakePasteboardItem:
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+
+    def init(self):
+        return self
+
+    def types(self):
+        return list(self.data)
+
+    def dataForType_(self, t):
+        return self.data.get(t)
+
+    def setData_forType_(self, data, t):
+        self.data[t] = data
+        return True
+
+
+def test_clipboard_snapshot_keeps_every_item_and_type():
+    be, _, appkit = make_backend()
+    pb = appkit.pasteboard
+    pb.items = [FakePasteboardItem({"public.png": b"\x89PNG", "public.utf8-plain-text": b"pic"}),
+                FakePasteboardItem({"public.file-url": b"file:///tmp/a.txt"})]
+    pb.pasteboardItems = lambda: pb.items
+    written = []
+    pb.writeObjects_ = lambda objs: written.extend(objs) or True
+    appkit.NSPasteboardItem = SimpleNamespace(alloc=lambda: FakePasteboardItem())
+    appkit.NSData = SimpleNamespace(dataWithBytes_length_=lambda data, n: bytes(data[:n]))
+
+    saved = be.save_clipboard()
+    be.set_clipboard("typed text")
+    be.restore_clipboard(saved)
+    assert [w.data for w in written] == [{"public.png": b"\x89PNG", "public.utf8-plain-text": b"pic"},
+                                         {"public.file-url": b"file:///tmp/a.txt"}]
+    be.restore_clipboard("plain")  # a text snapshot still works
+    assert be.get_clipboard() == "plain"
+
+
+def test_capslock_toggles_the_lock_state(monkeypatch):
+    from locum.backends.macos import input_mixin
+
+    toggles = []
+    monkeypatch.setattr(input_mixin, "toggle_caps_lock", lambda: toggles.append(1) or True)
+    be, q, _ = make_backend()
+    be.key_down("capslock")
+    be.key_up("capslock")
+    assert toggles == [1] and q.posted == []  # a synthetic key event would not change the state
+    monkeypatch.setattr(input_mixin, "toggle_caps_lock", lambda: False)
+    be.key_down("capslock")
+    be.key_up("capslock")
+    assert len(q.posted) == 2  # no IOKit: the key event is still sent
+
+
+def test_generated_interface_builder_ids_are_not_automation_ids():
+    be, q, appkit, ax, els = _tree_setup()
+    els["ok"].attrs["AXIdentifier"] = "_NS:136"
+    els["field"].attrs["AXIdentifier"] = "_NS:abc"  # not the generated pattern
+    root = be.accessibility_roots()[0]
+    ok, field = root.children()[:2]
+    assert ok.automation_id == "" and field.automation_id == "_NS:abc"

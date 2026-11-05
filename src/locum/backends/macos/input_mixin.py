@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import warnings
 from typing import Optional, Tuple
 
@@ -31,9 +32,53 @@ from .keys import KeySpec, KeyboardLayoutMap, NAMED_KEYCODES, resolve_key, split
 from .events import _BUTTON_EVENTS, _sign
 
 
+def toggle_caps_lock() -> bool:
+    """Flip the Caps Lock state through IOKit's HID system; False when that is unavailable."""
+    import ctypes
+
+    try:
+        iokit = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib")
+        iokit.IOServiceMatching.restype = ctypes.c_void_p
+        iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        iokit.IOServiceGetMatchingService.restype = ctypes.c_uint32
+        iokit.IOServiceGetMatchingService.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        iokit.IOServiceOpen.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                                        ctypes.POINTER(ctypes.c_uint32)]
+        iokit.IOHIDGetModifierLockState.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_bool)]
+        iokit.IOHIDSetModifierLockState.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_bool]
+        service = iokit.IOServiceGetMatchingService(0, iokit.IOServiceMatching(b"IOHIDSystem"))
+        if not service:
+            return False
+        conn = ctypes.c_uint32(0)
+        task = ctypes.c_uint32.in_dll(libc, "mach_task_self_").value
+        try:
+            if iokit.IOServiceOpen(service, task, 1, ctypes.byref(conn)) != 0:  # kIOHIDParamConnectType
+                return False
+            state = ctypes.c_bool(False)
+            if iokit.IOHIDGetModifierLockState(conn, 1, ctypes.byref(state)) != 0:  # kIOHIDCapsLockState
+                return False
+            return iokit.IOHIDSetModifierLockState(conn, 1, not state.value) == 0
+        finally:
+            if conn.value:
+                iokit.IOServiceClose(conn)
+            iokit.IOObjectRelease(service)
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
 class _InputMixin:
+    #: Seconds a posted cursor position is trusted over reading the cursor back: the
+    #: WindowServer applies posted events asynchronously, so a read right after a move
+    #: still returns the old position (and a click posted there lands in the wrong place).
+    CURSOR_SETTLE = 0.25
+    _last_posted: Optional[Tuple[float, float, float]] = None
+
     # ----------------------------------------------------------------------- mouse
     def _cursor_points(self) -> Tuple[float, float]:
+        last = self._last_posted
+        if last is not None and time.monotonic() - last[2] < self.CURSOR_SETTLE:
+            return (last[0], last[1])
         ev = self._q.CGEventCreate(None)
         loc = self._q.CGEventGetLocation(ev)
         return (float(loc.x), float(loc.y))
@@ -59,6 +104,7 @@ class _InputMixin:
             q.CGEventSetIntegerValueField(ev, kCGMouseEventDeltaY, int(round(delta[1])))
         q.CGEventSetFlags(ev, self._current_flags())
         q.CGEventPost(kCGHIDEventTap, ev)
+        self._last_posted = (float(pt[0]), float(pt[1]), time.monotonic())
 
     def mouse_position(self) -> Point:
         x, y = self._cursor_points()
@@ -204,6 +250,10 @@ class _InputMixin:
         self._require_trust()
         with self._lock:
             spec = self._resolve(key)
+            if spec.kind != "media" and spec.keycode == NAMED_KEYCODES["capslock"] and toggle_caps_lock():
+                # a synthetic Caps Lock key event never changes the lock state
+                self._pressed_keys[key] = KeySpec("handled", spec.keycode, 0)
+                return
             if spec.kind == "modifier":
                 self._held_mods[key] = spec.flags
                 self._post_key(spec.keycode, True, self._current_flags(), flags_changed=True)
@@ -219,6 +269,8 @@ class _InputMixin:
         self._require_trust()
         with self._lock:
             spec = self._pressed_keys.pop(key, None) or self._resolve(key)
+            if spec.kind == "handled":
+                return
             if spec.kind == "modifier":
                 self._held_mods.pop(key, None)
                 self._post_key(spec.keycode, False, self._current_flags(), flags_changed=True)

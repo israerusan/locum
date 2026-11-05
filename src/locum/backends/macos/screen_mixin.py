@@ -104,16 +104,21 @@ class _ScreenMixin:
         return sct
 
     def _grab_points(self, x: int, y: int, w: int, h: int) -> Any:
+        """Capture a region given in points, at the display's full pixel resolution.
+
+        Quartz comes first: mss on macOS captures with
+        ``kCGWindowImageNominalResolution`` (one pixel per point), so on a Retina
+        display its image would have to be upscaled. mss is the fallback."""
         from PIL import Image
 
         try:
-            shot = self._mss().grab({"left": int(x), "top": int(y), "width": int(w), "height": int(h)})
-            return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        except Exception as mss_exc:
+            return self._grab_points_cg(x, y, w, h)
+        except Exception as cg_exc:
             try:
-                return self._grab_points_cg(x, y, w, h)
-            except Exception as cg_exc:
-                raise BackendError(f"Screen capture failed (mss: {mss_exc}; Quartz: {cg_exc})") from cg_exc
+                shot = self._mss().grab({"left": int(x), "top": int(y), "width": int(w), "height": int(h)})
+                return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+            except Exception as mss_exc:
+                raise BackendError(f"Screen capture failed (Quartz: {cg_exc}; mss: {mss_exc})") from mss_exc
 
     def _grab_points_cg(self, x: int, y: int, w: int, h: int) -> Any:
         from PIL import Image
