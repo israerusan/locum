@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import math
 import os
 import pathlib
 import re
@@ -164,8 +165,8 @@ class Desktop:
             self.backend = backend
             self._owns_backend = False
 
-        if default_timeout is None or float(default_timeout) < 0:
-            raise ValueError("default_timeout must be >= 0")
+        if default_timeout is None or not math.isfinite(float(default_timeout)) or float(default_timeout) < 0:
+            raise ValueError(f"default_timeout must be a finite number >= 0, got {default_timeout!r}")
         mode = (typing_mode or "auto").lower()
         if mode not in TYPING_MODES:
             raise ValueError(f"typing_mode must be one of {', '.join(TYPING_MODES)}, got {typing_mode!r}")
@@ -240,8 +241,8 @@ class Desktop:
 
     def _timeout(self, timeout: Optional[float]) -> float:
         t = self.default_timeout if timeout is None else float(timeout)
-        if t < 0:
-            raise ValueError("timeout must be >= 0")
+        if not math.isfinite(t) or t < 0:
+            raise ValueError(f"timeout must be a finite number >= 0, got {timeout!r}")
         return t
 
     def wait_until(self, predicate: Callable[[], Any], timeout: Optional[float] = None, interval: float = 0.1, **kw: Any) -> Any:

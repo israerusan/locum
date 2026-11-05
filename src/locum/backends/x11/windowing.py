@@ -436,9 +436,21 @@ class _WindowsMixin:
             self._checked_sync(win.id, "close", since)
 
     def launch(self, command: Any, **kwargs: Any) -> Any:
-        """Start an application on *this* display (``DISPLAY`` is set in its environment)."""
-        if "env" not in kwargs:
-            env = dict(os.environ)
+        """Start an application on *this* display (``DISPLAY`` is set in its environment).
+
+        Without ``env`` the child inherits this process's environment with
+        ``DISPLAY`` pointing at the display this backend drives. A caller-supplied
+        ``env`` is used as given, but ``DISPLAY`` (and ``XAUTHORITY``, needed to
+        authenticate to it) are added when it lacks them -- previously any ``env``
+        dropped ``DISPLAY`` and the child could not open a window at all. An
+        explicit ``DISPLAY`` in ``env`` is respected (a deliberate other display).
+        """
+        env = dict(os.environ) if kwargs.get("env") is None else dict(kwargs["env"])
+        if kwargs.get("env") is None:
             env["DISPLAY"] = self.display_name
-            kwargs["env"] = env
+        else:
+            env.setdefault("DISPLAY", self.display_name)
+            if "XAUTHORITY" in os.environ:
+                env.setdefault("XAUTHORITY", os.environ["XAUTHORITY"])
+        kwargs["env"] = env
         return super().launch(command, **kwargs)

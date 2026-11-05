@@ -66,7 +66,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Pattern, Sequence, Tuple, Union
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Pattern, Sequence, Tuple, Union
 
 from ..errors import PolicyViolation
 from ..types import Point, Rect, coerce_point
@@ -185,6 +185,43 @@ def launch_program(command: Any) -> str:
             if flag in ("-a", "-b"):
                 return name
     return tokens[0]
+
+
+#: ``launch`` options that never change *which* program runs: guarded launches accept them.
+SAFE_LAUNCH_OPTIONS = frozenset({
+    "wait_window", "timeout",                                   # Desktop.launch's own arguments
+    "stdin", "stdout", "stderr", "close_fds", "bufsize",
+    "text", "universal_newlines", "encoding", "errors",
+    "creationflags", "startupinfo", "start_new_session",
+})
+#: Options that let a launch run something other than the program the policy checked:
+#: ``shell=True`` makes ``"notepad.exe & powershell ..."`` run PowerShell through
+#: ``cmd.exe``; ``executable`` replaces the binary; ``preexec_fn`` runs code in the child.
+#: A guarded launch never accepts them (``shell=False`` is fine).
+FORBIDDEN_LAUNCH_OPTIONS = frozenset({"shell", "executable", "preexec_fn"})
+
+
+def check_launch_options(options: Mapping[str, Any], policy: Optional["Policy"] = None) -> None:
+    """Refuse launch options that would run something other than the program the policy approved.
+
+    Authorization looks at the command (:func:`launch_program`); it is only
+    meaningful if the process started is that program. Options in
+    :data:`SAFE_LAUNCH_OPTIONS` are always accepted; :data:`FORBIDDEN_LAUNCH_OPTIONS`
+    never are (unless falsy, e.g. ``shell=False``); anything else -- ``env`` (its
+    ``PATH`` decides which binary a bare name resolves to), ``cwd`` (relative
+    paths), ``pass_fds`` ... -- needs an explicit ``Policy(launch_options=[...])``.
+    Raises :class:`PolicyViolation`.
+    """
+    extra = getattr(policy, "launch_options", frozenset()) if policy is not None else frozenset()
+    bad = []
+    for key, value in options.items():
+        if key in FORBIDDEN_LAUNCH_OPTIONS:
+            if value:
+                bad.append(f"{key}={value!r} (never allowed: it can run a program the policy did not check)")
+        elif key not in SAFE_LAUNCH_OPTIONS and key not in extra:
+            bad.append(f"{key}=... (not allowed unless the policy opts in: Policy(launch_options=[{key!r}]))")
+    if bad:
+        raise PolicyViolation("launch refused: " + "; ".join(bad))
 
 
 class _CardNumber:
@@ -713,6 +750,11 @@ class Policy:
         max_actions_per_minute: Sliding-window rate limit for actions.
         region: Pointer actions must land inside this screen rectangle.
         read_only_tools: Names treated as read-only (default :data:`READ_ONLY_TOOLS`).
+        launch_options: Extra ``subprocess.Popen`` options that guarded launches
+            (``launch_app``, ``GuardedDesktop.launch``) may pass, beyond
+            :data:`SAFE_LAUNCH_OPTIONS` -- e.g. ``["cwd", "env"]``. ``shell``,
+            ``executable`` and ``preexec_fn`` are never allowed (see
+            :func:`check_launch_options`).
         clock: Monotonic clock (injectable for tests).
     """
 
@@ -735,7 +777,15 @@ class Policy:
         read_only_tools: Iterable[str] = READ_ONLY_TOOLS,
         clock: Callable[[], float] = time.monotonic,
         allow: Optional[Iterable[Any]] = None,
+        launch_options: Iterable[str] = (),
     ):
+        launch_options = frozenset(launch_options)
+        forbidden = launch_options & FORBIDDEN_LAUNCH_OPTIONS
+        if forbidden:
+            raise ValueError(f"launch_options may not include {', '.join(sorted(forbidden))}: "
+                             "they can run a program the policy did not check")
+        #: Extra ``launch`` options (beyond :data:`SAFE_LAUNCH_OPTIONS`) guarded launches accept.
+        self.launch_options = launch_options
         if isinstance(allow, (str, dict, AllowRule)):
             allow = [allow]
         #: Allow rules (allow-list mode), or ``None`` in the default heuristic mode.
@@ -1812,6 +1862,7 @@ class GuardedDesktop(_GuardedProxy):
 
     # ------------------------------------------------------------------ system
     def launch(self, command: Any, **kw: Any) -> Any:
+        check_launch_options(kw, self.policy)  # before the gate: never ask a human about a refused launch
         ctx = self._base_ctx()
         ctx.update(command=command, target=" ".join(map(str, command)) if isinstance(command, (list, tuple)) else str(command))
         if not self._gate("launch_app", {"command": command}, ctx, f"launch {command!r}"):
@@ -2095,6 +2146,9 @@ __all__ = [
     "node_matches_selector",
     "target_identity",
     "launch_program",
+    "check_launch_options",
+    "SAFE_LAUNCH_OPTIONS",
+    "FORBIDDEN_LAUNCH_OPTIONS",
     "check_activation_combo",
     "combo_acts_on_target",
     "pressed_control",

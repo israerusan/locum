@@ -46,8 +46,9 @@ def _check_timeout(timeout: Optional[float]) -> Optional[float]:
     if timeout is None:
         return None
     timeout = float(timeout)
-    if math.isnan(timeout) or timeout < 0:
-        raise ValueError(f"timeout must be >= 0 or None, got {timeout!r}")
+    # inf would silently wait forever: unbounded waits must be asked for with None.
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(f"timeout must be a finite number >= 0, or None to wait forever; got {timeout!r}")
     return timeout
 
 
@@ -89,8 +90,8 @@ def wait_until(
         ActionTimeout: if the deadline passes without a truthy result.
     """
     timeout = _check_timeout(timeout)
-    if interval < 0:
-        raise ValueError("interval must be >= 0")
+    if not math.isfinite(float(interval)) or interval < 0:
+        raise ValueError(f"interval must be a finite number >= 0, got {interval!r}")
     if backoff <= 0:
         raise ValueError("backoff must be > 0")
     only_transient = isinstance(ignore_exceptions, str)

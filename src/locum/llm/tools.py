@@ -52,7 +52,7 @@ from ..types import Match, Point, Rect, WindowInfo
 from .observe import Observation, ObservedElement, observe
 from .._nodeinfo import ancestors, is_password, node_app, owning_window, target_label, window_at
 from .safety import (
-    AuditLog, Policy, check_activation_combo, is_text_input, keys_activate, keys_may_move_focus, split_typed_text,
+    AuditLog, Policy, check_activation_combo, check_launch_options, is_text_input, keys_activate, keys_may_move_focus, split_typed_text,
     pressed_control, target_identity, typed_text_activates,
 )
 
@@ -706,7 +706,11 @@ class DesktopToolkit:
         find_timeout: Seconds selector/text targets wait for their element.
         feedback: Append the focused element/active window to action results.
         launch_kwargs: Extra ``subprocess.Popen`` options for ``launch_app``
-            (the MCP server uses this to keep children off its stdio).
+            (the MCP server uses this to keep children off its stdio). Only
+            options that cannot change *which* program runs are accepted
+            (:data:`~locum.llm.safety.SAFE_LAUNCH_OPTIONS`); ``shell``,
+            ``executable`` and ``preexec_fn`` raise :class:`PolicyViolation`, and
+            ``cwd``/``env`` need ``Policy(launch_options=[...])``.
 
     Element ids refer to the most recent observation (:attr:`last_observation`);
     ``x``/``y`` arguments are pixels of the most recent screenshot and are mapped
@@ -737,6 +741,9 @@ class DesktopToolkit:
         #: Extra keyword arguments for ``Desktop.launch`` in the ``launch_app`` tool
         #: (``subprocess.Popen`` options, e.g. ``{"stdout": subprocess.DEVNULL}``).
         self.launch_kwargs: Dict[str, Any] = dict(launch_kwargs or {})
+        # Fail at construction, not on the first launch: options such as shell=True or
+        # executable= would let an allow-listed command run something else.
+        check_launch_options(self.launch_kwargs, self.policy)
         self.last_observation: Optional[Observation] = None
         self._local = threading.local()
         self.registry = ToolRegistry()
@@ -1799,6 +1806,7 @@ class DesktopToolkit:
         timeout = min(max(float(timeout), 0.0), 120.0)
 
         def run() -> str:
+            check_launch_options(self.launch_kwargs, self.policy)  # launch_kwargs/policy may change after init
             res = self.desktop.launch(command, wait_window=wait_window, timeout=timeout, **self.launch_kwargs)
             if wait_window is not None:
                 return f"Launched {command!r}; window {getattr(res, 'title', wait_window)!r} is open."
