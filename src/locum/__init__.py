@@ -50,7 +50,15 @@ if TYPE_CHECKING:  # pragma: no cover
     from .motion import Humanize
     from .window import Window
 
-__version__ = "0.1.0"
+try:  # written by the build from the git tag (hatch-vcs); never edited by hand
+    from ._version import __version__
+except ImportError:  # pragma: no cover - a source tree that was never built/installed
+    try:
+        from importlib.metadata import version as _dist_version
+
+        __version__ = _dist_version("locum")
+    except Exception:
+        __version__ = "0.0.0+unknown"
 
 # Heavy names resolved on first attribute access (PEP 562) so that
 # ``import locum`` stays cheap and side-effect free.

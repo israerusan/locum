@@ -11,3 +11,6 @@ __pycache__/
 
 # local agent worktrees / tool state
 .claude/
+
+# generated from the git tag at build/install time (hatch-vcs)
+src/locum/_version.py

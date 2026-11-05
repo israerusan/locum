@@ -35,6 +35,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags: the version is derived from them (hatch-vcs)
 
       - uses: actions/setup-python@v5
         with:
@@ -93,6 +95,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags: the version is derived from them (hatch-vcs)
 
       - uses: actions/setup-python@v5
         with:
