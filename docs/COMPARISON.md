@@ -24,7 +24,7 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 | Selector generation | — | Studio "Indicate element" | `pypilot inspect`, `selector_for(node)`, the recorder |
 | Native actions (invoke / set value / toggle / expand) | — | ✓ ("simulate" input) | ✓ with automatic mouse fallback |
 | Template matching | ✓ (confidence needs OpenCV), no masks, single scale | ✓ image activities | NCC via FFT in numpy (OpenCV optional), **alpha masks**, multi-scale, multi-monitor, NMS for `locate_all`, color search |
-| OCR | — | ✓ (several engines, some paid) | pluggable: Tesseract, RapidOCR, EasyOCR; `find_text` / `click_text` with fuzzy matching |
+| OCR | — | ✓ (several engines, some paid) | pluggable: Tesseract (`pypilot[ocr]` installs pytesseract), RapidOCR and EasyOCR (separate optional installs); `find_text` / `click_text` with fuzzy matching |
 | Waiting | `time.sleep` | element-exists / wait activities | everything waits with timeouts: `find`, `wait(state=...)`, `wait_image`, `wait_until_stable`, `wait_for_change` |
 | Error messages | generic | good, Studio debugging | "No element matching `button "Sav"`; did you mean: `button "Save" #save`" |
 
@@ -33,7 +33,7 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 | | PyAutoGUI | UiPath | pypilot |
 |---|---|---|---|
 | Mouse paths | tweens | instant / simulated | tweens + humanized Bézier paths with jitter/overshoot and Fitts's-law timing |
-| Unicode typing | limited (keymap-dependent) | ✓ | ✓ layout-independent (SendInput Unicode, XTEST spare keycodes, Quartz) + clipboard mode |
+| Unicode typing | limited (keymap-dependent) | ✓ | ✓ layout-independent injection (SendInput Unicode, XTEST spare keycodes, Quartz), paced per character; some apps can still drop keystrokes under load, so `Element.type` reads text fields back and repairs them; clipboard mode pastes |
 | Hotkeys | ✓ | ✓ | ✓, portable `mod+s` (ctrl/cmd), modifiers always released in `finally` |
 | HiDPI / multi-monitor | partial | ✓ | ✓ physical-pixel coordinate space on every backend |
 | Fail-safe | top-left corner | — (Orchestrator stop) | all corners + global abort flag + kill hotkey |
@@ -78,6 +78,11 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 
 ## Honest gaps (today)
 
+* Alpha (0.1): APIs may still change.
+* Validation depth differs by platform: Windows is exercised by the self-test
+  on a real Windows 11 machine; Linux/X11 is tested under Xvfb; the macOS
+  backend is tested only against a fake Quartz/AX API and has not yet been
+  validated on a real Mac.
 * No visual designer, no central orchestrator or credential vault.
 * Native Wayland sessions cannot be driven (Wayland forbids it by design;
   XWayland apps and X11 sessions work).

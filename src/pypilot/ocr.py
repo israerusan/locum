@@ -1,11 +1,13 @@
 """Optical character recognition with pluggable engines.
 
 Engines are tiny adapters with a single method, ``read(image) -> List[OCRWord]``.
-Three are built in and imported lazily (none is a hard dependency):
+Three adapters are built in and imported lazily (none is a hard dependency).
+The ``pypilot[ocr]`` extra installs only `pytesseract`; the other engines are
+optional, separate installs:
 
-* ``"tesseract"`` -- `pytesseract` + the Tesseract binary (``pip install pypilot[ocr]``)
-* ``"rapidocr"``  -- `rapidocr` / `rapidocr-onnxruntime` (pure pip, no system deps)
-* ``"easyocr"``   -- `easyocr` (PyTorch)
+* ``"tesseract"`` -- `pytesseract` (``pip install pypilot[ocr]``) + the Tesseract binary (system install)
+* ``"rapidocr"``  -- ``pip install rapidocr-onnxruntime`` (or ``rapidocr``; pure pip, no system deps)
+* ``"easyocr"``   -- ``pip install easyocr`` (pulls in PyTorch)
 
 ``get_ocr_engine()`` without a name picks the configured default (see
 :func:`set_default_ocr_engine` or the ``PYPILOT_OCR_ENGINE`` environment

@@ -2,8 +2,16 @@
 
 **Desktop automation for Python that understands the screen.** One library for
 mouse/keyboard input, screenshots and template matching, accessibility
-selectors, RPA robots, and first-class LLM-agent control — on Windows, macOS
-and Linux.
+selectors, RPA robots, and LLM-agent control. Windows is the most-validated
+platform; macOS and Linux (X11) backends exist but have been tested less (see
+below). **Native Wayland is not supported**: on Linux, pypilot drives X11
+sessions and XWayland windows only.
+
+| Platform | Backend | How it is tested today |
+|----------|---------|------------------------|
+| Windows 10/11 | SendInput + **UI Automation** | unit tests against a fake Win32/UIA API; validated on a real Windows 11 machine by the built-in self-test |
+| macOS 12+ | Quartz events + **AX API** | unit tests against a fake Quartz/AX API only — **not yet validated on a real Mac** |
+| Linux (X11 / XWayland) | XTEST + **AT-SPI** | unit tests plus X11 tests under Xvfb in CI; native Wayland input/capture **not supported** |
 
 * **Selectors, not coordinates.** `d.click('button "Save"')` finds the element
   through UI Automation / AX / AT-SPI, survives window moves, DPI and theme
@@ -13,20 +21,23 @@ and Linux.
   cross-correlation, multi-scale, multi-monitor, **alpha channel = mask**, OCR
   hooks, wait-for-change / wait-until-stable.
 * **Input that behaves like a person** (optional): Fitts's-law timing,
-  Bézier mouse paths with overshoot, layout-independent Unicode typing,
-  clipboard paste, stuck-modifier-proof hotkeys, a corner fail-safe and a kill
-  hotkey.
+  Bézier mouse paths with overshoot, Unicode keystroke injection that does not
+  depend on the keyboard layout (with read-back verification for text fields,
+  see [below](#humanized-layout-independent-input)), clipboard paste,
+  stuck-modifier-proof hotkeys, a corner fail-safe and a kill hotkey.
 * **RPA built in.** Robots with steps/retries/evidence screenshots and HTML
   reports, Orchestrator-style resumable work queues with business exceptions,
   YAML flows, and a recorder that writes selectors instead of raw coordinates.
-* **LLM-native.** Set-of-marks observations, a ready-made tool registry
-  (Anthropic / OpenAI / MCP schemas), an agent loop for Claude, an adapter for
-  Claude's computer-use toolset, a zero-dependency MCP server, and a safety
-  policy with human confirmation, dry-run and audit logs.
+* **LLM-native.** Set-of-marks observations; a Claude (Anthropic) agent loop
+  and computer-use adapter; tool schemas exportable in Anthropic, OpenAI and
+  MCP formats (pypilot ships no OpenAI agent runtime — bring your own loop);
+  a zero-dependency MCP server; and a safety policy with human confirmation,
+  dry-run and audit logs.
 * **A drop-in PyAutoGUI layer** (`import pypilot.compat.pyautogui as pyautogui`)
   so existing scripts move over with one line.
 
-> Status: 0.1 — APIs follow [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+> Status: **0.1 alpha** — usable, tested, but APIs may still change between
+> releases. The design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 > See [`docs/COMPARISON.md`](docs/COMPARISON.md) and [`docs/LLM.md`](docs/LLM.md).
 
 ---
@@ -36,7 +47,7 @@ and Linux.
 ```bash
 pip install pypilot                 # core: pillow, numpy, mss (+ python-xlib / comtypes / pyobjc per OS)
 pip install "pypilot[llm]"          # + anthropic SDK for the Agent
-pip install "pypilot[ocr]"          # + pytesseract (install the Tesseract binary too)
+pip install "pypilot[ocr]"          # + pytesseract only (install the Tesseract binary too)
 pip install "pypilot[record]"       # + pynput: live recorder and global kill hotkey
 pip install "pypilot[yaml]"         # + PyYAML for YAML flows (JSON flows need nothing)
 pip install "pypilot[all]"          # everything above
@@ -154,9 +165,12 @@ d.click_image(needle, timeout=2)                      # wait for it, then click 
 
 `locate_all` (non-max suppression), `scales=(0.8, 1.0, 1.25)` for DPI
 differences, `grayscale=True`, `region=`, `d.wait_until_stable()` and
-`d.wait_for_change()` are all there. With an OCR engine installed
-(`pypilot[ocr]`), `d.find_text("Total")`, `d.click_text("Submit")` and
-`d.read_text(region)` work on any pixels.
+`d.wait_for_change()` are all there. With an OCR engine installed,
+`d.find_text("Total")`, `d.click_text("Submit")` and `d.read_text(region)` work
+on any pixels. `pypilot[ocr]` installs only `pytesseract` (plus the Tesseract
+binary from your OS); RapidOCR (`pip install rapidocr-onnxruntime`) and EasyOCR
+(`pip install easyocr`) are optional, separate installs that pypilot picks up
+when present.
 
 ### Humanized, layout-independent input
 
@@ -169,6 +183,16 @@ d.press("backspace")
 with d.hold("shift"):
     d.press("tab")
 ```
+
+How reliable is typing? `d.type()` injects Unicode keystrokes (no keymap
+lookup, so the keyboard layout does not matter), paced per character. That
+does not make it infallible: some applications drop or garble synthesized
+keystrokes while busy — seen intermittently with Windows 11 Notepad. For text
+fields, `d.find("edit#vendor").type("…")` (`Element.type`, `verify=True` by
+default) reads the field back afterwards and repairs a garbled result, or
+raises instead of reporting success; `set_text()` sets the value natively and
+verifies it; `d.type(text, mode="clipboard")` pastes instead of typing. Use one
+of those when the exact text matters.
 
 `Desktop(humanize=True)` (or `Humanize(speed=..., jitter=..., seed=...)`) makes
 every move human-like; `pause=` mirrors PyAutoGUI's `PAUSE`. Moving the mouse
@@ -330,7 +354,7 @@ the before/after.
 | Accessibility selectors (UIA/AX/AT-SPI) | — | ✓ (Windows-first) | ✓ |
 | UiPath-style XML selectors        | — | ✓ | ✓ (compatible subset) |
 | Template matching w/ alpha masks, multi-scale | confidence needs OpenCV | ✓ | ✓ (numpy; OpenCV optional) |
-| OCR                               | — | ✓ | pluggable (Tesseract, RapidOCR, EasyOCR) |
+| OCR                               | — | ✓ | pluggable: Tesseract via `pypilot[ocr]`; RapidOCR / EasyOCR as separate installs |
 | Native invoke / set-value (works when covered) | — | ✓ | ✓ |
 | Humanized motion, Unicode typing  | partial | — | ✓ |
 | Robots, retries, evidence reports | — | ✓ | ✓ (code-first) |
@@ -346,17 +370,20 @@ support. pypilot does not replace that; it is a **code-first, free,
 LLM-native** library for developers who want UiPath-grade robustness inside
 plain Python. Full write-up: [`docs/COMPARISON.md`](docs/COMPARISON.md).
 
-## Platform support
+## Platform details
+
+How each platform is tested is in the table at the top; this is what each
+backend uses.
 
 | Platform | Input | Screenshots | Windows | Accessibility | Notes |
 |----------|-------|-------------|---------|---------------|-------|
 | Windows 10/11 | SendInput (Unicode, DPI-aware, multi-monitor) | mss / GDI | Win32 | **UI Automation** (comtypes) | run as the same integrity level as the target app (UAC); text pypilot puts on the clipboard is kept out of Clipboard History (Win+V) and cloud sync (`WindowsBackend(clipboard_history=True)` allows it) |
-| macOS 12+ | Quartz events | Quartz (Retina-aware) | Quartz / AppKit | **AX API** | needs Accessibility + Screen Recording permission |
+| macOS 12+ | Quartz events | Quartz (Retina-aware) | Quartz / AppKit | **AX API** | needs Accessibility + Screen Recording permission; not yet validated on a real Mac |
 | Linux X11 | XTEST (Unicode via spare keycodes) | mss / XGetImage | EWMH | **AT-SPI** (PyGObject) | native X11 clipboard (xclip/xsel optional) |
 | Linux Wayland | XWayland apps only | XWayland only | XWayland only | AT-SPI works | see below |
 | Any (tests, CI, evals) | `MockBackend` / `DemoBackend` | ✓ | ✓ | ✓ | deterministic, no display |
 
-**Wayland, honestly:** Wayland deliberately prevents applications from
+**Wayland:** Wayland deliberately prevents applications from
 injecting input into, or capturing, other applications. The X11 backend works
 inside an X11 session and with XWayland windows; native Wayland windows cannot
 be driven or captured through it. Use an X11 session (“GNOME on Xorg”) for

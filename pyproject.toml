@@ -5,12 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "pypilot"
 version = "0.1.0"
-description = "Cross-platform desktop automation for Python: input, vision, accessibility selectors, RPA workflows, and first-class LLM agent control."
+description = "Desktop automation for Python (Windows first; macOS and Linux/X11 backends): input, vision, accessibility selectors, RPA workflows, and LLM agent control."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = ["automation", "rpa", "desktop", "gui", "pyautogui", "llm", "agent", "mcp", "computer-use"]
 classifiers = [
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Operating System :: Microsoft :: Windows",
   "Operating System :: MacOS",
@@ -26,6 +27,8 @@ dependencies = [
   "comtypes>=1.2; sys_platform == 'win32'",
   "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
   "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
+  # AppKit: clipboard (NSPasteboard), media keys, double-click interval, running apps.
+  "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
