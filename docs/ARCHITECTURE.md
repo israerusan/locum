@@ -22,7 +22,7 @@ desktop.py  (Desktop facade)  +  compat/pyautogui.py                 │
 element.py  window.py  selectors.py  wait.py                         │
 mouse.py  keyboard.py  motion.py  failsafe.py  screen.py  vision.py  ocr.py
 backends/base.py (Backend, AccessibleNode)   types.py  keys.py  errors.py
-backends/{mock,x11,windows}.py   backends/macos/ (package)
+backends/mock.py   backends/{windows,macos,x11}/ (packages: one module per concern, backend.py composes mixins)
 ```
 
 Lower layers never import higher ones (except lazily inside a function).
