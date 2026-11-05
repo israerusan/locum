@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "locum"
+version = "0.1.0"
+description = "Desktop automation for Python (Windows first; macOS and Linux/X11 backends): input, vision, accessibility selectors, RPA workflows, and LLM agent control."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "israerusan" }]
+keywords =["automation", "rpa", "desktop", "gui", "pyautogui", "llm", "agent", "mcp", "computer-use"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Desktop Environment",
+]
+dependencies = [
+  "pillow>=9.0",
+  "numpy>=1.22",
+  "mss>=9.0",
+  "python-xlib>=0.33; sys_platform == 'linux'",
+  "comtypes>=1.2; sys_platform == 'win32'",
+  "pyobjc-framework-Quartz>=9.0; sys_platform == 'darwin'",
+  "pyobjc-framework-ApplicationServices>=9.0; sys_platform == 'darwin'",
+  # AppKit: clipboard (NSPasteboard), media keys, double-click interval, running apps.
+  "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
+]
+
+[project.urls]
+Homepage = "https://github.com/israerusan/locum"
+Repository = "https://github.com/israerusan/locum"
+Issues = "https://github.com/israerusan/locum/issues"
+Documentation = "https://github.com/israerusan/locum/blob/main/docs/LLM.md"
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40"]
+ocr = ["pytesseract>=0.3.10"]
+record = ["pynput>=1.7"]
+yaml = ["pyyaml>=6.0"]
+all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0"]
+dev = ["pytest>=7", "pyyaml>=6.0"]
+
+[project.scripts]
+locum = "locum.cli:main"
+
+[tool.hatch.build.targets.sdist]
+# An explicit list: never ship stray local folders (agent worktrees, venvs, run output).
+include = ["src/locum", "tests", "docs", "examples", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/locum"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "x11: requires a real X11 display (run under Xvfb)",
+]

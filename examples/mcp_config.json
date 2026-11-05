@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "locum": {
+      "command": "locum",
+      "args": ["mcp", "--policy", "default", "--audit", "~/.locum/mcp-audit.jsonl"]
+    },
+    "locum-sandbox": {
+      "command": "locum",
+      "args": ["--backend", "mock", "mcp", "--policy", "permissive"]
+    }
+  }
+}

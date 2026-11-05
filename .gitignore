@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.venv/
+locum_runs/
+*.log
+__pycache__/
+
+# local agent worktrees / tool state
+.claude/

@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      # fail-fast stays off: GitHub's macOS runners are sometimes never assigned
+      # (the job sits queued with zero steps, then is cancelled). That is runner
+      # availability, not a code failure, and it must not cancel or hide the
+      # Linux / Windows results.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.9", "3.12", "3.13"]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install X server and clipboard tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth xclip x11-utils
+
+      - name: Install locum
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Import check (core dependencies only)
+        run: python -c "import locum, locum.cli, locum.llm, locum.rpa, locum.compat.pyautogui; print(locum.__version__)"
+
+      - name: Test suite incl. X11 tests under Xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args="-screen 0 1280x800x24" python -m pytest -q
+
+      - name: Test suite without X11 tests (Windows / macOS)
+        if: runner.os != 'Linux'
+        run: python -m pytest -q -m "not x11"
+
+      - name: Smoke-test the CLI and examples on the demo desktop
+        env:
+          LOCUM_BACKEND: mock
+        run: |
+          locum --version
+          locum info
+          locum windows --json
+          locum observe --window "Invoice Entry"
+          locum run examples/excel_report_flow.yaml
+          python examples/basic_automation.py
+          python examples/sap_style_data_entry.py
+          python examples/llm_agent.py < /dev/null
+          python examples/pyautogui_migration.py
+
+  # Non-blocking: drives the runner's REAL desktop (not the mock backend) with the
+  # built-in self-test. It only types into a Notepad window it opens itself and
+  # refuses to type into an editor that already contains text. Hosted runners'
+  # interactive sessions vary, so a failure here is a signal to read the uploaded
+  # report, not a reason to block the PR.
+  windows-native-selftest:
+    name: windows-native-selftest (real desktop, non-blocking)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install locum
+        run: python -m pip install .
+
+      # Step-level continue-on-error as well as job-level: job-level alone keeps
+      # the workflow run green but still records this job's check run as failed,
+      # which would leave the PR showing a red X. With it on the step, a
+      # self-test failure becomes a warning annotation plus the uploaded report.
+      - name: Self-test against the runner's real desktop
+        id: selftest
+        continue-on-error: true
+        run: python -m locum.selftest --yes --out selftest-report
+
+      - name: Flag a failed self-test (non-blocking)
+        if: steps.selftest.outcome == 'failure'
+        shell: bash
+        run: echo "::warning title=windows-native-selftest::The real-desktop self-test reported failures; see the windows-native-selftest-report artifact."
+
+      - name: Upload self-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-selftest-report
+          path: selftest-report
+          if-no-files-found: warn
