@@ -1772,3 +1772,107 @@ def test_generated_interface_builder_ids_are_not_automation_ids():
     root = be.accessibility_roots()[0]
     ok, field = root.children()[:2]
     assert ok.automation_id == "" and field.automation_id == "_NS:abc"
+
+
+# =============================================================================
+# adversarial review of d47d6a1: clipboard snapshot, cursor cache, app arguments
+# =============================================================================
+
+
+def _snapshot_setup(items):
+    be, _, appkit = make_backend()
+    pb = appkit.pasteboard
+    pb.items = items
+    pb.pasteboardItems = lambda: pb.items
+    pb.written = []
+    pb.writeObjects_ = lambda objs: pb.written.extend(objs) or True
+    appkit.NSPasteboardItem = SimpleNamespace(alloc=lambda: FakePasteboardItem())
+    appkit.NSData = SimpleNamespace(dataWithBytes_length_=lambda data, n: bytes(data[:n]))
+    return be, pb, appkit
+
+
+def test_snapshot_refuses_unavailable_data_instead_of_saving_a_partial_copy():
+    be, pb, _ = _snapshot_setup([FakePasteboardItem({"public.png": None, "public.utf8-plain-text": b"x"})])
+    with pytest.raises(BackendError, match="unavailable"):
+        be.save_clipboard()
+
+
+def test_snapshot_refuses_an_oversized_clipboard(monkeypatch):
+    be, pb, _ = _snapshot_setup([FakePasteboardItem({"public.mpeg-4": b"\0" * 2048})])
+    monkeypatch.setattr(type(be), "CLIPBOARD_SNAPSHOT_MAX", 1024)
+    with pytest.raises(BackendError, match="more than"):
+        be.save_clipboard()
+
+
+def test_snapshot_retries_then_refuses_a_clipboard_that_keeps_changing():
+    be, pb, _ = _snapshot_setup([FakePasteboardItem({"public.utf8-plain-text": b"a"})])
+    counter = iter(range(100))
+    pb.changeCount = lambda: next(counter)  # changes between every read
+    with pytest.raises(BackendError, match="kept changing"):
+        be.save_clipboard()
+    stable = iter([5, 5])
+    pb.changeCount = lambda: next(stable)
+    assert be.save_clipboard() == {"items": [[("public.utf8-plain-text", b"a")]]}
+
+
+def test_clipboard_mode_typing_never_overwrites_a_clipboard_it_cannot_save():
+    """A failed snapshot must stop clipboard typing *before* the paste replaces the user's data."""
+    from locum.keyboard import Keyboard
+
+    be, pb, _ = _snapshot_setup([FakePasteboardItem({"public.png": None})])
+    pb.value = "user data"
+    kb = Keyboard(be, sleep=lambda s: None)
+    with pytest.raises(BackendError):
+        kb.type("pasted", mode="clipboard")
+    assert pb.value == "user data"
+
+
+def test_restore_checks_every_type_before_touching_the_pasteboard():
+    be, pb, appkit = _snapshot_setup([])
+
+    class Refusing(FakePasteboardItem):
+        def setData_forType_(self, data, t):
+            return t != "com.example.private"
+
+    appkit.NSPasteboardItem = SimpleNamespace(alloc=lambda: Refusing())
+    pb.value = "still here"
+    with pytest.raises(BackendError, match="com.example.private"):
+        be.restore_clipboard({"items": [[("public.utf8-plain-text", b"t"), ("com.example.private", b"p")]]})
+    assert pb.value == "still here" and pb.written == []  # nothing was cleared or written
+
+
+def test_cached_cursor_yields_to_a_real_pointer_move():
+    """The posted point bridges WindowServer lag only while the cursor still reads its old spot."""
+    be, q, _ = make_backend()
+    async_q = AsyncCursorQuartz()
+    be._q = async_q
+    be.mouse_move(200, 100)  # posted, not yet applied: cursor still reads (0, 0)
+    assert be.mouse_position() == Point(200, 100)
+    async_q.pos = (300.0, 200.0)  # the user moves the pointer elsewhere within 250 ms
+    assert be.mouse_position() == Point(600, 400)
+    be.mouse_down(MouseButton.LEFT)
+    assert async_q.posted[-1].pt == (300.0, 200.0)  # the click goes where the pointer really is
+
+
+def test_launch_splits_app_name_from_arguments_and_documents(monkeypatch):
+    from locum.backends.macos import windows_mixin
+
+    calls = []
+    monkeypatch.setattr(macos.subprocess, "Popen", lambda args, **kw: calls.append(args))
+    monkeypatch.setattr(macos.shutil, "which", lambda name: None)
+    apps = {"TextEdit", "Preview", "Microsoft Excel"}
+    monkeypatch.setattr(windows_mixin, "_find_app_bundle",
+                        lambda name: f"/Applications/{name}.app" if name in apps else None)
+    be, _, _ = make_backend()
+    be.launch("TextEdit --args -ApplePersistenceIgnoreState YES")
+    be.launch("Preview /tmp/report.pdf")
+    be.launch("Microsoft Excel -n")
+    be.launch("Microsoft Excel")
+    be.launch("Setapp Tool")  # not in the usual folders: Launch Services resolves it
+    assert calls == [
+        ["open", "-a", "TextEdit", "--args", "-ApplePersistenceIgnoreState", "YES"],
+        ["open", "-a", "Preview", "/tmp/report.pdf"],
+        ["open", "-a", "Microsoft Excel", "--args", "-n"],
+        ["open", "-a", "Microsoft Excel"],
+        ["open", "-a", "Setapp Tool"],
+    ]

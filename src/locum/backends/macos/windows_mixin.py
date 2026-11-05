@@ -41,6 +41,26 @@ def _find_app_bundle(name: str) -> Optional[str]:
     return None
 
 
+def _split_app_prefix(parts: List[str]) -> Tuple[Optional[str], List[str]]:
+    """``(app name, remaining words)`` for the longest leading words naming an installed app."""
+    for k in range(len(parts), 0, -1):
+        name = " ".join(parts[:k])
+        if _find_app_bundle(name) is not None:
+            return name, list(parts[k:])
+    return None, list(parts)
+
+
+def _open_app_argv(app: str, rest: List[str]) -> List[str]:
+    """``open`` command line for ``app``: documents as-is, options after ``--args``."""
+    if not rest:
+        return ["open", "-a", app]
+    if rest[0] == "--args":
+        return ["open", "-a", app, "--args", *rest[1:]]
+    if any(r.startswith("-") for r in rest):
+        return ["open", "-a", app, "--args", *rest]
+    return ["open", "-a", app, *rest]
+
+
 class _WindowsMixin:
     # --------------------------------------------------------------------- windows
     def _window_records(self, options: int, relative: int = kCGNullWindowID) -> List[Dict[str, Any]]:
@@ -470,13 +490,20 @@ class _WindowsMixin:
                 parts = shlex.split(stripped)
             except ValueError:
                 parts = []
-            plain = bool(parts) and "/" not in stripped and not any(c in stripped for c in "\"'\\")
-            # The default APFS volume is case-insensitive, so which("Mail") finds
-            # /usr/bin/mail (likewise Calendar, Script Editor, Shortcuts): a capitalised
-            # name that is an installed app opens the app; "mail" stays the command.
-            if plain and (shutil.which(parts[0]) is None
-                          or (parts[0][:1].isupper() and _find_app_bundle(stripped) is not None)):
-                return subprocess.Popen(["open", "-a", " ".join(parts)], **kwargs)
+            unquoted = bool(parts) and not any(c in stripped for c in "\"'\\") and "/" not in parts[0]
+            if unquoted:
+                # "Preview /tmp/report.pdf", "TextEdit --args -X": the longest leading run of
+                # words that names an installed app is the app; the rest are its documents
+                # (or, after --args / when they look like options, its arguments). The
+                # default APFS volume is case-insensitive, so which("Mail") finds
+                # /usr/bin/mail (likewise Calendar, Script Editor, Shortcuts): a capitalised
+                # name that is an installed app opens the app; "mail" stays the command.
+                app, rest = _split_app_prefix(parts)
+                if app is not None and (shutil.which(parts[0]) is None or parts[0][:1].isupper()):
+                    return subprocess.Popen(_open_app_argv(app, rest), **kwargs)
+                if "/" not in stripped and shutil.which(parts[0]) is None:
+                    # Not in the usual folders and not a command: let Launch Services find it.
+                    return subprocess.Popen(["open", "-a", " ".join(parts)], **kwargs)
             if parts and parts[0].endswith(".app") and os.path.isdir(parts[0]):
                 return subprocess.Popen(["open", "-a", parts[0], "--args", *parts[1:]], **kwargs)
             if parts:

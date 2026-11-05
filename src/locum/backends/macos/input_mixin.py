@@ -72,16 +72,35 @@ class _InputMixin:
     #: WindowServer applies posted events asynchronously, so a read right after a move
     #: still returns the old position (and a click posted there lands in the wrong place).
     CURSOR_SETTLE = 0.25
-    _last_posted: Optional[Tuple[float, float, float]] = None
+    #: ``(x, y, posted_at, from_x, from_y)``: the last posted point and where the
+    #: cursor read before it was posted (``from`` is None when it could not be read).
+    _last_posted: Optional[Tuple[float, float, float, Optional[float], Optional[float]]] = None
 
     # ----------------------------------------------------------------------- mouse
-    def _cursor_points(self) -> Tuple[float, float]:
-        last = self._last_posted
-        if last is not None and time.monotonic() - last[2] < self.CURSOR_SETTLE:
-            return (last[0], last[1])
+    def _read_cursor(self) -> Tuple[float, float]:
         ev = self._q.CGEventCreate(None)
         loc = self._q.CGEventGetLocation(ev)
         return (float(loc.x), float(loc.y))
+
+    def _cursor_points(self) -> Tuple[float, float]:
+        """Where the cursor is, bridging the WindowServer's lag after a posted event.
+
+        The posted point is trusted only while Quartz still reports the position the
+        cursor had *before* that event (the event has not been applied yet). If the
+        cursor reads anywhere else -- the user, a remote-desktop client or another tool
+        moved it -- that real position wins and the cached point is dropped, so a click
+        never goes to a stale spot.
+        """
+        actual = self._read_cursor()
+        last = self._last_posted
+        if last is not None:
+            x, y, at, fx, fy = last
+            pending = (fx is not None and abs(actual[0] - fx) < 0.5 and abs(actual[1] - fy) < 0.5
+                       and not (abs(actual[0] - x) < 0.5 and abs(actual[1] - y) < 0.5))
+            if pending and time.monotonic() - at < self.CURSOR_SETTLE:
+                return (x, y)
+            self._last_posted = None  # applied, overtaken by a real move, or too old
+        return actual
 
     def _current_flags(self) -> int:
         flags = 0
@@ -103,8 +122,13 @@ class _InputMixin:
             q.CGEventSetIntegerValueField(ev, kCGMouseEventDeltaX, int(round(delta[0])))
             q.CGEventSetIntegerValueField(ev, kCGMouseEventDeltaY, int(round(delta[1])))
         q.CGEventSetFlags(ev, self._current_flags())
+        try:
+            before: Tuple[Optional[float], Optional[float]] = self._read_cursor()
+        except Exception:
+            before = (None, None)
+        # (While earlier events are still pending, Quartz still reads the original origin.)
         q.CGEventPost(kCGHIDEventTap, ev)
-        self._last_posted = (float(pt[0]), float(pt[1]), time.monotonic())
+        self._last_posted = (float(pt[0]), float(pt[1]), time.monotonic(), before[0], before[1])
 
     def mouse_position(self) -> Point:
         x, y = self._cursor_points()
