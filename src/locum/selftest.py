@@ -56,6 +56,8 @@ class SelfTest:
         self.log = log
         self.checks: List[Check] = []
         self.editor_window: Any = None
+        #: True when the editor window already existed (the user's own Notepad): it is never closed
+        self.editor_preexisting = False
         self.editor: Any = None
         self.env: Dict[str, Any] = {}
         #: how long to wait for an app's "save changes?" prompt after closing the editor
@@ -153,10 +155,19 @@ class SelfTest:
 
     def c_launch_editor(self) -> str:
         cmd, title = _editor_for_platform(self.d.backend.name)
+        try:
+            before = {w.handle for w in self.d.windows()}
+        except Exception:
+            before = set()
         self.editor_window = self.d.launch(cmd, wait_window=title, timeout=25)
+        # Windows 11 Notepad opens a new tab in an already-open window instead of a new
+        # window: that window is the user's (other documents, maybe sensitive ones) and
+        # must not be closed -- only the test tab is.
+        self.editor_preexisting = self.editor_window.handle in before
         self.editor_window.activate()
         self.d.sleep(1.0)
-        return f"{self.editor_window.title!r} pid={self.editor_window.pid} rect={self.editor_window.rect.as_tuple()}"
+        note = " (your existing Notepad window: only the test tab will be closed)" if self.editor_preexisting else ""
+        return f"{self.editor_window.title!r} pid={self.editor_window.pid} rect={self.editor_window.rect.as_tuple()}{note}"
 
     def c_accessibility(self) -> str:
         win = self._win()
@@ -328,6 +339,19 @@ class SelfTest:
     def c_close_editor(self) -> str:
         win = self._win()
         self._discard_test_text()
+        if self.editor_preexisting:
+            self.editor_window = None
+            return "closed the test tab; left your existing Notepad window open"
+        # Ctrl+W closes the test tab; on a clean machine it is Notepad's only tab, so
+        # the window closes with it and there is nothing left to close.
+        deadline = time.monotonic() + (0 if self.d.backend.name == "mock" else 1.5)
+        while True:
+            if not win.exists:
+                self.editor_window = None
+                return "closed with its only tab"
+            if time.monotonic() >= deadline:
+                break
+            self.d.sleep(0.1)
         win.close()
         note = "no save prompt"
         try:
@@ -426,6 +450,8 @@ class SelfTest:
             if self.editor_window is not None:  # best effort cleanup after a failure
                 try:
                     self._discard_test_text()
+                    if self.editor_preexisting:
+                        raise _Skip("the user's own window: never closed")
                     self.editor_window.close()
                     btn = self.d.find(f'button[name~="{DONT_SAVE}"]', timeout=self.save_prompt_timeout)
                     btn.click()

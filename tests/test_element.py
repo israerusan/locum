@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from _stub_desktop import StubDesktop
@@ -223,7 +225,8 @@ def test_set_text_typing_fallback(env):
     assert w["name"].value == "new"
     kinds = [ev[0] for ev in be.events]
     assert "type" in kinds and "a11y_set_value" not in kinds
-    assert ("key_down", "ctrl") in be.events and ("key_down", "a") in be.events
+    mod = "cmd" if sys.platform == "darwin" else "ctrl"  # select-all is cmd+a on macOS
+    assert ("key_down", mod) in be.events and ("key_down", "a") in be.events
     assert ("key_down", "backspace") in be.events
     e.set_text("er", native=False, clear=False)
     assert w["name"].value == "newer"

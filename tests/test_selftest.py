@@ -43,3 +43,40 @@ def test_selftest_restores_clipboard_and_mouse(tmp_path):
     selftest.SelfTest(d, str(tmp_path / "st"), log=lambda m: None).run()
     assert d.clipboard_get() == "user clipboard"
     assert tuple(d.position()) == (123, 456)
+
+
+def test_selftest_close_when_ctrl_w_closed_the_only_tab(tmp_path):
+    """On a clean machine the test tab is Notepad's only tab: Ctrl+W closes the
+    window itself (seen on GitHub's Windows Server runner), which is a pass."""
+    d = selftest._mock_desktop()
+    be = d.backend
+    st = selftest.SelfTest(d, str(tmp_path / "st"), log=lambda m: None)
+    orig = st._discard_test_text
+
+    def discard_and_close_window():
+        orig()
+        if st.editor_window is not None:
+            be.close_window(st.editor_window.handle)
+
+    st._discard_test_text = discard_and_close_window
+    st.run()
+    status = {c.name: (c.status, c.detail) for c in st.checks}
+    assert status["close editor without saving"] == ("PASS", "closed with its only tab")
+    assert not any(c.status == "FAIL" for c in st.checks)
+
+
+def test_selftest_never_closes_a_notepad_window_that_was_already_open(tmp_path):
+    """Windows 11 Notepad opens the test tab inside the user's open window (seen
+    live: a window holding the user's own documents). Only the tab may close."""
+    d = selftest._mock_desktop()
+    be = d.backend
+    be.launch("notepad.exe")                 # the user's Notepad, open before the test
+    be.launch = lambda command, **kw: None   # launching again only adds a tab to it
+    users = [w for w in d.windows() if "Notepad" in w.title][0]
+    st = selftest.SelfTest(d, str(tmp_path / "st"), log=lambda m: None)
+    st.run()
+    status = {c.name: (c.status, c.detail) for c in st.checks}
+    assert st.editor_preexisting is True
+    assert status["close editor without saving"] == (
+        "PASS", "closed the test tab; left your existing Notepad window open")
+    assert users.exists
