@@ -82,6 +82,16 @@ that is exactly one ``${...}`` keeps the value's type (lists stay lists).
 
 Errors carry the step path, e.g. ``steps[3].for_each.steps[1]``; invalid
 documents are rejected *before* anything runs, with every problem listed.
+
+Safety policy (opt-in): ``run_flow(doc, desktop, policy=Policy.strict(allow=[...]),
+confirm=..., audit=...)`` runs the flow on a
+:class:`~pypilot.llm.safety.GuardedDesktop`, so every step that acts (clicks,
+typing, ``set_text``, ``invoke``/``toggle``/..., keys, ``launch``,
+``clipboard_set``, ``activate_window``) is checked against the policy first;
+a refused or declined action fails its step with
+:class:`~pypilot.errors.PolicyViolation` and is never retried. **Without a
+policy, flows are not gated** (the default, as before). A flow document cannot
+declare its own allow rules: authorization comes from the caller.
 """
 
 from __future__ import annotations
@@ -99,7 +109,7 @@ import traceback as _tb
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from ..errors import FailSafeTriggered, WorkflowError
+from ..errors import FailSafeTriggered, PolicyViolation, WorkflowError
 from ..types import Point, Rect
 from .report import FAILED, PASSED, RunReport, StepResult
 
@@ -650,7 +660,15 @@ class FlowRunner:
         run_dir: Optional[pathlib.Path] = None,
         screenshot_on_error: bool = False,
         logger: Optional[logging.Logger] = None,
+        policy: Any = None,
+        confirm: Any = None,
+        audit: Any = None,
     ):
+        if policy is not None:
+            from ..llm.safety import GuardedDesktop
+
+            desktop = GuardedDesktop(desktop, policy, confirm=confirm, audit=audit)
+        #: The desktop steps act on (a :class:`~pypilot.llm.safety.GuardedDesktop` when a policy is given).
         self.desktop = desktop
         self.report = report
         self.vars: Dict[str, Any] = variables if variables is not None else {}
@@ -1297,7 +1315,7 @@ class FlowRunner:
                 raise
             except Exception as exc:
                 last = exc
-                if attempt < attempts:
+                if attempt < attempts and not isinstance(exc, PolicyViolation):  # a refusal is never retried
                     for s in self.report.steps[mark:]:
                         if s.status == FAILED:
                             s.handled = True
@@ -1391,6 +1409,9 @@ def run_flow(
     screenshot_on_error: Optional[bool] = None,
     raise_on_error: bool = False,
     logger: Optional[logging.Logger] = None,
+    policy: Any = None,
+    confirm: Any = None,
+    audit: Any = None,
 ) -> RunReport:
     """Validate and run a flow; returns the :class:`RunReport` (``report.ok`` tells success).
 
@@ -1405,6 +1426,11 @@ def run_flow(
         screenshot_on_error: Save a screenshot when a step fails (default: the document's
             ``settings.screenshot_on_error``, else ``True`` when ``run_dir`` is set).
         raise_on_error: Raise the :class:`FlowStepError` instead of returning a failed report.
+        policy: A :class:`~pypilot.llm.safety.Policy` every acting step must pass
+            (``None``, the default: steps are not gated).
+        confirm: Confirmation callback for actions the policy sends to a human
+            (default: the policy's ``confirm``; none = such actions are blocked).
+        audit: :class:`~pypilot.llm.safety.AuditLog` for the policy decisions.
 
     Raises:
         WorkflowError: The document is invalid (all problems are listed), before anything runs.
@@ -1434,7 +1460,10 @@ def run_flow(
     base = pathlib.Path(base_dir).expanduser() if base_dir is not None else (
         file_path.parent if file_path is not None else pathlib.Path.cwd())
     vars_: Dict[str, Any] = {}
-    runner = FlowRunner(desktop, report, vars_, run_dir=evidence_dir, screenshot_on_error=shots, logger=logger)
+    runner = FlowRunner(desktop, report, vars_, run_dir=evidence_dir, screenshot_on_error=shots, logger=logger,
+                        policy=policy, confirm=confirm, audit=audit)
+    if policy is not None:
+        report.metadata["policy"] = "allow-list" if getattr(policy, "allow", None) is not None else "heuristic"
     settings = dict(doc.get("settings") or {})
     scope = _Scope(base_dir=base, flows=dict(doc.get("flows") or {}), settings=settings)
     error: Optional[BaseException] = None

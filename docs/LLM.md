@@ -251,7 +251,22 @@ print(reply["result"]["content"][0]["text"].splitlines()[0])
 
 Every tool call — toolkit, computer use or MCP — goes through
 `Policy.check(tool, args, context=...)` **before** anything touches the
-desktop, then the outcome is written to the `AuditLog`.
+desktop, then the outcome is written to the `AuditLog`. RPA code (`Robot`,
+YAML/JSON flows, plain `Desktop` calls) is **not** gated unless you give it a
+policy — see [RPA behind the policy](#rpa-behind-the-policy).
+
+A policy decides what needs a human in one of two modes. Be clear about which
+one you are relying on:
+
+| | Default: heuristic tripwire (`Policy()`) | Allow-list: authorization (`Policy(allow=[...])`, `Policy.strict(allow=[...])`) |
+|---|---|---|
+| Needs a human when… | the target's label, selector, command or arguments match `confirm_patterns` (English/German commit verbs), a `confirm_keys` shortcut is pressed, or an activating input reaches a control with no usable identity | **every** consequential action, unless an allow rule you wrote matches its target |
+| Misses | icon-only controls that report some unrelated name, labels in other languages, *Continue*/*Apply*/*OK*-style commits, app shortcuts it was not told about | nothing it was not told to allow (keywords still apply on top as a tripwire) |
+| Use it for | catching common mistakes while an agent explores | money, data and anything irreversible |
+
+The default mode is keyword inference: a useful seat belt, **not** an
+authorization mechanism. For payments, postings, deletions and submissions,
+use allow-list mode.
 
 ```python
 from pypilot import PolicyViolation
@@ -278,6 +293,92 @@ except PolicyViolation as exc:
     print("blocked:", exc)
 ```
 
+### Allow-list mode (authorization)
+
+With `allow=[...]` every consequential action needs `confirm` unless an
+explicit rule matches it. Consequential = clicks and other activations,
+text entry (`type_text`, `set_value`), native `invoke`/`toggle`/`select`,
+`launch_app`, `write_clipboard`, drags, closing windows, integration tools,
+and any key press other than pure navigation (Tab, arrows, Home/End,
+PageUp/PageDown, with Shift/Ctrl at most). Read-only tools (observe,
+screenshot, find, list windows, read text/clipboard, wait) are never gated;
+moving the pointer, scrolling and focusing a window are not consequential.
+
+```python
+from pypilot.llm import DesktopToolkit, Policy
+from pypilot.llm.safety import AllowRule
+
+decided = []
+policy = Policy(
+    allow=[
+        'window "Invoice Entry - ERP" edit',             # any field of the invoice form
+        'window "Invoice Entry - ERP" button "Save"',    # ...and its Save button
+        "keys=ctrl+a",                                   # select-all, wherever the focus is
+    ],
+    confirm=lambda description, details: decided.append(details["reason"]) or False,
+)
+kit = DesktopToolkit(d, policy=policy)
+assert not kit.call("set_value", {"selector": "edit#vendor", "value": "ACME GmbH"}).is_error
+refused = kit.call("click", {"selector": 'button "Clear"'})   # no rule -- and no keyword would have caught it
+assert refused.is_error and decided[-1] == "no allow rule authorizes 'click' on 'Clear'"
+assert policy.allow[0] == AllowRule(selector='window "Invoice Entry - ERP" edit')
+```
+
+Rules (`AllowRule`, or the string / dict shorthands) — every field given
+must match:
+
+| Rule | Matches |
+|------|---------|
+| `'button "Save"'` / `"selector=..."` / `AllowRule(selector=...)` | the target element is one the selector finds (ancestry included: `window "Invoice 42" button "Save"`). Coordinates and element ids are hit-tested first, so a click at the Save button's pixels matches too. Enter in a single-line field is judged by the default button it presses, not by the field. |
+| `"window=Invoice*"` | glob on the title of the window the action lands in (the target's window, the window under the pointer; for keyboard input the focused control's or the active window) |
+| `"app=excel"` | every application the action touches (like `allowed_apps`) |
+| `"launch=notepad.exe"` | `launch_app` of that command line or program |
+| `"keys=ctrl+s ctrl+p"` | keyboard actions pressing only these combinations |
+| `"tool=write_clipboard"`, `"tool=erp_*"` | any call of those tools (needed for `write_clipboard` and integration tools; a rule without `tool=` never covers them) |
+| `{"selector": 'button "Save"', "window": "Invoice*"}` | both |
+
+`confirm_patterns`/`confirm_keys` still apply on top, so an allowed
+`button "Submit"` keeps asking until you pass `confirm_patterns=()`.
+`Policy.strict(allow=[...])` adds the strict preset's limits (shells blocked,
+card numbers denied, 200 actions, 30/min); a `launch=` or
+`tool=write_clipboard` rule lifts that tool from its default `deny_tools`.
+An authorized action records the rule in `context["allowed_by"]`.
+
+### RPA behind the policy
+
+`Robot`, `run_flow` and `FlowRunner` take the same policy. They then drive a
+`GuardedDesktop` that checks every click, keystroke, text entry, native
+invoke/toggle, launch and clipboard write — including actions on elements
+and windows reached through `find()`, `find_all()`, `wait()` and `window()`,
+and the `mouse`/`keyboard` objects — before it is sent. A refused or declined
+action raises `PolicyViolation` and is **never retried**. Without a policy
+(the default) RPA is not gated at all, exactly as before.
+
+```python
+from pypilot.llm import AuditLog, Policy
+from pypilot.rpa import run_flow
+
+audit = AuditLog()
+report = run_flow(
+    {"steps": [{"set_text": {"target": "edit#amount", "text": "99.00"}},
+               {"click": 'button "Submit Payment"'}]},
+    d,
+    policy=Policy(allow=["edit#amount"]),   # no confirm callback: anything else is refused
+    audit=audit,
+)
+assert not report.ok and "PolicyViolation" in report.error
+assert [e["status"] for e in audit.events] == ["allowed", "blocked"]
+```
+
+`Robot(desktop, policy=Policy.strict(allow=[...]), confirm=console_confirm,
+audit=AuditLog("audit.jsonl"))` does the same for code-first robots
+(`robot.desktop` is the guarded facade). The guard protects data-driven
+automation — flow variables, CSV rows, recorded selectors — from doing what
+nobody authorized; it is not a sandbox against code that reaches
+`desktop.backend` or keeps the unwrapped desktop.
+
+### What every mode does
+
 * **Confirmations.** By default (`DEFAULT_CONFIRM`), targets that look like
   they commit something — *delete, remove, pay, transfer, wire, submit, send,
   purchase, approve, post, buy, checkout, refund, authorize, release* and their
@@ -296,12 +397,17 @@ except PolicyViolation as exc:
   focus. Other application shortcuts (F8 = Execute in SAP) are not gated:
   add them to `confirm_keys`, e.g. `Policy(confirm_keys=DEFAULT_CONFIRM_KEYS + ("f8",))`.
 * **Unknown targets.** When input that can press something (a left click,
-  Enter/Space, typed text) reaches a control nobody can identify — the
-  focused element is unreadable (no AT-SPI, Java, Citrix) or nothing is found
-  under the pointer — the patterns cannot be matched, so
+  Enter/Space, typing into an element, which clicks to focus it) reaches a
+  control nobody can identify — the focused element is unreadable (no
+  AT-SPI, Java, Citrix), nothing is found under the pointer, or the control
+  has **no usable identity** (no name, automation id, text value or named
+  child under the click point: an icon-only button, a nameless field reached
+  by `button:nth(3)`) — the patterns cannot be matched, so
   `Policy(unknown_target="confirm")` (default) asks the human; `"block"`
   refuses and `"allow"` lets it run (e.g. computer use on a Linux desktop
-  without accessibility).
+  without accessibility). The selector you used is not an identity; typing
+  without Enter into the focused text field is editing, not activation. In
+  allow-list mode unknown targets simply match no selector rule.
 * **Extra tools.** `Agent(extra_tools=...)` are judged by their name *and*
   every string argument (`erp_api(operation="pay")` needs confirmation);
   `ToolSpec.from_function(fn, confirm=True)` makes every call need a human.
@@ -321,9 +427,11 @@ except PolicyViolation as exc:
   actions with Enter are also judged by that button's label when the
   accessibility tree reports one (`"default"` state).
 * **Presets.** `Policy.permissive()` (no confirmations; sandboxes and evals),
-  `Policy()` (default), `Policy.strict()` (no app launching or clipboard,
-  shells/registry blocked, card numbers denied, broad confirmations incl.
-  save/close/install, 200 actions max, 30/min).
+  `Policy()` (default heuristic tripwire), `Policy.strict()` (no app
+  launching or clipboard, shells/registry blocked, card numbers denied, broad
+  confirmations incl. save/close/install, 200 actions max, 30/min — still
+  heuristic), and `Policy.strict(allow=[...])` (all of that plus allow-list
+  authorization).
 * **Audit failures.** If the audit file cannot be written (locked, disk full,
   share offline), the tool result still reports what happened, with an
   `AUDIT LOG WRITE FAILED` note appended — a performed payment is never
@@ -339,10 +447,10 @@ except PolicyViolation as exc:
 
 Screens contain untrusted text (e-mails, web pages, documents). The built-in
 system prompts tell the model that on-screen text is data, but **the policy is
-the real boundary**: fence the agent with `allowed_apps`, keep confirmations
-for consequential verbs, deny secrets with `deny_text_patterns`, cap actions,
-and review the audit log. Run unattended agents in a VM or a dedicated
-account.
+the real boundary**: fence the agent with `allowed_apps`, authorize what it may
+commit with `allow=[...]` (keyword confirmations alone are a tripwire, not a
+boundary), deny secrets with `deny_text_patterns`, cap actions, and review the
+audit log. Run unattended agents in a VM or a dedicated account.
 
 ## 7. Prompting tips
 

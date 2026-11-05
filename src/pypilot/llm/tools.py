@@ -22,7 +22,12 @@ docstring (summary + ``Args:`` section)::
 :class:`DesktopToolkit` is the ready-made registry for desktop control:
 set-of-marks observation, element ids, selectors, OCR, keyboard/mouse, windows,
 apps and the clipboard. Every call is checked by a :class:`~pypilot.llm.safety.Policy`
-and written to an :class:`~pypilot.llm.safety.AuditLog`.
+and written to an :class:`~pypilot.llm.safety.AuditLog`. The toolkit reports to
+the policy what each action really reaches -- the hit-tested element, its window
+and application, the focused control for keyboard input (and the default button
+Enter would press) -- so heuristic confirmations and allow rules
+(``Policy(allow=[...])``) judge the actual target; an activating action on a
+control with no usable identity is marked ``target_unknown``.
 """
 
 from __future__ import annotations
@@ -45,9 +50,10 @@ from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tu
 from ..errors import ActionTimeout, ElementNotFound, FailSafeTriggered, NotSupported, PolicyViolation, PypilotError
 from ..types import Match, Point, Rect, WindowInfo
 from .observe import Observation, ObservedElement, observe
-from .._nodeinfo import ancestors, is_password, node_app, target_label, window_at
+from .._nodeinfo import ancestors, is_password, node_app, owning_window, target_label, window_at
 from .safety import (
-    AuditLog, Policy, check_activation_combo, keys_activate, keys_may_move_focus, split_typed_text, typed_text_activates,
+    AuditLog, Policy, check_activation_combo, is_text_input, keys_activate, keys_may_move_focus, split_typed_text,
+    target_identity, typed_text_activates,
 )
 
 _log = logging.getLogger(__name__)
@@ -585,6 +591,8 @@ def _with_default_button(t: "_Target", node: Any) -> "_Target":
         t,
         name=f"{t.name} -> {label}" if t.name else label,
         description=f"{t.description} (Enter activates the default button {label!r})",
+        # Allow rules judge the control Enter really activates: the button, not the field.
+        node=button,
     )
 
 
@@ -678,6 +686,10 @@ class _Target:
     unknown: bool = False
     #: The target is a password field (typed text is redacted from audit logs and results).
     secret: bool = False
+    #: The accessibility node acted on (allow rules match selectors against it).
+    node: Any = None
+    #: Title of the window the action lands in (allow rules: ``window=``).
+    window: str = ""
 
 
 _DIRECTIONS = ("up", "down", "left", "right")
@@ -905,6 +917,23 @@ class DesktopToolkit:
             apps.append(w.app)
         return tuple(apps)
 
+    def _window_title(self, node: Any = None, point: Optional[Point] = None) -> str:
+        """Title of the window an action on ``node`` / at ``point`` lands in (``""`` if unknown).
+
+        A point is judged by the front-most window there (that is where the
+        click goes); an element by the window that owns it.
+        """
+        backend = self.desktop.backend
+        w = None
+        if point is not None:
+            w = window_at(backend, point)
+        if w is None and node is not None:
+            try:
+                w = owning_window(backend, node)
+            except Exception:
+                w = None
+        return str(w.title or "") if w is not None else ""
+
     def _focus_target(self, name_it: bool, enter: bool = False, *, activating: Optional[bool] = None) -> Optional[_Target]:
         """The focused element as a policy target for keyboard actions.
 
@@ -931,8 +960,17 @@ class DesktopToolkit:
         except Exception:
             role = ""
         desc = f"the focused {role or 'element'}" + (f" {name!r}" if name else "")
-        t = _Target(description=desc, name=name if name_it else "", app=app, secret=is_password(node))
-        return _with_default_button(t, node) if enter else t
+        t = _Target(description=desc, name=name if name_it else "", app=app, secret=is_password(node), node=node,
+                    window=self._window_title(node))
+        if enter:
+            t = _with_default_button(t, node)
+        acts = name_it if activating is None else activating
+        # Input that can press the focused control, which has no usable identity
+        # (an icon-only button): no label rule can judge it, so it is an unknown
+        # target. Typing (no Enter) into a text field only edits that field.
+        if acts and not (is_text_input(node) and not enter) and not (target_identity(node) or t.name):
+            t = dataclasses.replace(t, unknown=True)
+        return t
 
     def _element_from_observed(self, oe: ObservedElement) -> "Element":
         from ..element import Element
@@ -986,25 +1024,27 @@ class DesktopToolkit:
             label = f"element [{oe.id}] {oe.role}" + (f" {oe.name!r}" if oe.name else "")
             name = self._node_info(oe.node)[0] or oe.name or (oe.value or "")
             return self._element_target(_Target(element=el, description=label, name=name,
-                                                app=oe.app or self._node_info(oe.node)[1], observed=oe), activates)
+                                                app=oe.app or self._node_info(oe.node)[1], observed=oe,
+                                                node=oe.node), activates)
         if selector is not None:
             el = self.desktop.find(selector, timeout=self.find_timeout)
             name, app = self._node_info(el.node)
             return self._element_target(_Target(element=el, description=f"{el.role} {name!r} (selector {selector!r})",
-                                                name=name or selector, app=app), activates)
+                                                name=name or selector, app=app, node=el.node), activates)
         if text is not None:
             el, point = self._find_by_text(text)
             if el is not None:
                 name, app = self._node_info(el.node)
                 return self._element_target(_Target(element=el, description=f"{el.role} {name!r} (text {text!r})",
-                                                    name=name or text, app=app), activates)
+                                                    name=name or text, app=app, node=el.node), activates)
             assert point is not None
             node = self._safe_element_at(point)
             apps = self._point_apps(point, node)
             label = self._node_info(node)[0] if node is not None else ""
             name = text if not label or label == text else f"{text} < {label}"
             return _Target(point=point, description=f"on-screen text {text!r} at ({point.x}, {point.y})", name=name,
-                           app=apps[0] if apps else "", apps=apps, unknown=activates and node is None)
+                           app=apps[0] if apps else "", apps=apps, unknown=activates and node is None, node=node,
+                           window=self._window_title(node, point))
         return self._point_target(self._screen_point(x, y), f"({x}, {y})", activates=activates)
 
     def _element_target(self, t: _Target, activates: bool) -> _Target:
@@ -1018,13 +1058,19 @@ class DesktopToolkit:
         """
         el = t.element
         assert el is not None
-        t = dataclasses.replace(t, secret=is_password(el.node))
+        t = dataclasses.replace(t, secret=is_password(el.node), node=el.node, window=self._window_title(el.node))
         if not activates:
             return t
         try:
             point = el._click_point((0, 0), require=False)
         except Exception:
             point = None
+        # The element must be identifiable by itself (name, automation id, value) or by a named
+        # child under the click point; the selector text the caller used is not an identity
+        # (``pane > button:nth(3)`` names no control).
+        identified = bool(target_identity(el.node, point))
+        if not identified:
+            t = dataclasses.replace(t, unknown=True)
         if point is None:
             return t
         hit = self._safe_element_at(point)
@@ -1036,6 +1082,8 @@ class DesktopToolkit:
         except Exception:
             return t
         label = self._node_info(hit)[0]
+        if label and not identified:
+            t = dataclasses.replace(t, unknown=False)
         if not label or label in t.name:
             return t
         try:
@@ -1058,8 +1106,11 @@ class DesktopToolkit:
         name = self._node_info(node)[0] if node is not None else ""
         apps = self._point_apps(point, node)
         desc = description + (f" on {node.role} {name!r}" if node is not None and name else "")
+        # Nothing hit-testable there, or a control with no usable identity (no name,
+        # automation id, text value or named descendant at the point): unknown target.
+        unknown = activates and (node is None or not target_identity(node, point))
         return _Target(point=point, description=desc, name=name, app=apps[0] if apps else "", apps=apps,
-                       unknown=activates and node is None)
+                       unknown=unknown, node=node, window=self._window_title(node, point))
 
     def _safe_element_at(self, point: Point) -> Any:
         try:
@@ -1096,6 +1147,10 @@ class DesktopToolkit:
                 ctx["point"] = p
             if t.element is not None and isinstance(t.element.selector, str):
                 ctx["selector"] = t.element.selector
+            if t.node is not None:
+                ctx["target_node"] = t.node
+            if t.window:
+                ctx["target_window"] = t.window
             if t.unknown:
                 ctx["target_unknown"] = True
         ctx.update({k: v for k, v in extra.items() if v is not None})
@@ -1395,7 +1450,7 @@ class DesktopToolkit:
                     k = "+".join(parts)
                     if moved:  # an earlier key may have moved focus: check what this one acts on
                         self._recheck_focus("press_keys", args, keys_activate([parts]), f"press {k} (part of {' '.join(keys)!r})",
-                                            enter=_has_enter(parts))
+                                            enter=_has_enter(parts), step_keys=k)
                     self.desktop.press(parts)
                     moved = moved or keys_may_move_focus(parts)
 
@@ -1725,7 +1780,7 @@ class DesktopToolkit:
             title: Window title (exact, substring or glob such as "*Notepad").
         """
         win = self.desktop.window(title, timeout=min(self.find_timeout, 5.0))
-        ctx = self._context(target=win.title, target_app=win.app)
+        ctx = self._context(target=win.title, target_app=win.app, target_window=win.title)
         return self._act("focus_window", {"title": title}, ctx, f"focus window {win.title!r}", lambda: win.activate())
 
     def tool_launch_app(self, command: str, wait_window: Optional[str] = None, timeout: float = 15.0) -> ToolResult:

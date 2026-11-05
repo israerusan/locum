@@ -47,6 +47,15 @@ Features:
 * Steps (or :meth:`Robot.screenshot`) used outside :meth:`Robot.run` start an
   implicit run; the next :meth:`Robot.run` (or :meth:`Robot.start`) adopts it,
   and :meth:`Robot.finish` ends it.
+* **Safety policy (opt-in).** ``Robot(policy=Policy.strict(allow=[...]),
+  confirm=..., audit=...)`` makes :attr:`Robot.desktop` a
+  :class:`~pypilot.llm.safety.GuardedDesktop`: every click, keystroke, text
+  entry, launch and clipboard write -- including actions on elements and
+  windows reached through ``find()``/``window()`` -- is checked against the
+  policy first and raises :class:`~pypilot.errors.PolicyViolation` (never
+  retried) when it is refused or declined. **Without a policy nothing is
+  gated** (the default, as before): the LLM safety layer does not apply to
+  plain robot code.
 """
 
 from __future__ import annotations
@@ -64,7 +73,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Union
 
 from .. import failsafe as _failsafe
-from ..errors import ActionTimeout, FailSafeTriggered
+from ..errors import ActionTimeout, FailSafeTriggered, PolicyViolation
 from .queue import TASK_DEADLINE_ATTR as _DEADLINE_ATTR
 from .queue import BusinessException
 from .report import FAILED, PASSED, SKIPPED, RunReport, StepResult
@@ -364,6 +373,13 @@ class Robot:
             directory at the end of :meth:`run` / :meth:`finish`.
         sleep: Sleep function for retry delays (default: the desktop's sleep, which honours the abort flag).
         clock: Monotonic clock used for durations and timeouts.
+        policy: A :class:`~pypilot.llm.safety.Policy` that every desktop action
+            of the robot must pass (see the module docstring). ``None``
+            (default): actions are not gated.
+        confirm: Confirmation callback for actions the policy sends to a human
+            (default: the policy's own ``confirm``; none = such actions are blocked).
+        audit: :class:`~pypilot.llm.safety.AuditLog` for the policy decisions
+            (default: an in-memory log, :attr:`audit`).
 
     Attributes:
         vars: Free-form dict shared by all tasks (survives across runs).
@@ -382,8 +398,20 @@ class Robot:
         save_reports: bool = True,
         sleep: Optional[Callable[[float], Any]] = None,
         clock: Callable[[], float] = time.monotonic,
+        policy: Any = None,
+        confirm: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
+        audit: Any = None,
     ):
         self._desktop = desktop
+        self.policy = policy
+        self.confirm = confirm
+        if policy is not None and audit is None:
+            from ..llm.safety import AuditLog
+
+            audit = AuditLog()
+        #: Audit log of the policy decisions (``None`` without a policy).
+        self.audit = audit
+        self._guarded: Any = None
         self.name = str(name)
         self.run_dir = pathlib.Path(run_dir).expanduser()
         self.screenshot_on_error = bool(screenshot_on_error)
@@ -404,12 +432,23 @@ class Robot:
     # ----------------------------------------------------------------- plumbing
     @property
     def desktop(self) -> "Desktop":
-        """The desktop this robot drives (created on first access when not given)."""
+        """The desktop this robot drives (created on first access when not given).
+
+        With a ``policy`` this is a :class:`~pypilot.llm.safety.GuardedDesktop`
+        over it, so every action is checked first.
+        """
         if self._desktop is None:
             from ..desktop import Desktop
 
             self._desktop = Desktop()
-        return self._desktop
+        if self.policy is None:
+            return self._desktop
+        if self._guarded is None or self._guarded.unwrapped is not _unguarded(self._desktop) \
+                or self._guarded.policy is not self.policy:
+            from ..llm.safety import GuardedDesktop
+
+            self._guarded = GuardedDesktop(self._desktop, self.policy, confirm=self.confirm, audit=self.audit)
+        return self._guarded
 
     @desktop.setter
     def desktop(self, value: "Desktop") -> None:
@@ -679,7 +718,8 @@ class Robot:
 
     @staticmethod
     def _retryable(exc: BaseException) -> bool:
-        return (isinstance(exc, Exception) and not isinstance(exc, (BusinessException, FailSafeTriggered))
+        # A refused/declined action is a decision, not a glitch: retrying would ask the human again.
+        return (isinstance(exc, Exception) and not isinstance(exc, (BusinessException, FailSafeTriggered, PolicyViolation))
                 and not _is_deadline(exc))
 
     def _handle_retry(self, frame: _Frame, mark: int, attempt: int, attempts: int, exc: BaseException, delay: float) -> None:
@@ -893,6 +933,12 @@ class Robot:
 
     def __repr__(self) -> str:
         return f"<Robot {self.name!r} tasks={list(self.tasks)} run_dir={str(self.run_dir)!r}>"
+
+
+def _unguarded(desktop: Any) -> Any:
+    """The real desktop behind a guarded one (or ``desktop`` itself)."""
+    inner = getattr(type(desktop), "unwrapped", None)
+    return desktop.unwrapped if inner is not None else desktop
 
 
 def _wants_argument(fn: Callable[..., Any], what: str = "Task") -> bool:

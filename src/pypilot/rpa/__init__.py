@@ -8,6 +8,14 @@
 
 Importing this package only needs the core dependencies; PyYAML, openpyxl and
 pynput are imported lazily when a feature needs them.
+
+Safety: robots and flows are **not** checked by the LLM safety policy unless
+you pass one -- ``Robot(policy=...)``, ``run_flow(..., policy=...)`` or
+``FlowRunner(..., policy=...)`` -- which makes them drive a
+:class:`~pypilot.llm.safety.GuardedDesktop` (every action checked first;
+refusals raise :class:`~pypilot.errors.PolicyViolation` and are never retried).
+Use ``Policy(allow=[...])`` / ``Policy.strict(allow=[...])`` for authorization
+by explicit rules; the default ``Policy()`` is only a keyword tripwire.
 """
 
 from __future__ import annotations
