@@ -231,6 +231,8 @@ def _poll_find(desktop: Any, probe: Callable[[], Any], timeout: float) -> Any:
         raise
 
 
+_TEXT_ENTRY_ROLES = frozenset({"edit", "document", "combobox", "spinbutton"})
+
 class Element:
     """A UI element (accessibility node) bound to a desktop.
 
@@ -288,8 +290,17 @@ class Element:
 
     @property
     def text(self) -> str:
-        """``value`` if the element has one, else ``name``."""
+        """The element's text content.
+
+        For text-entry controls (``edit``, ``document``, ``combobox``,
+        ``spinbutton`` or anything in the ``editable`` state) this is always
+        the ``value`` -- an empty field gives ``""``, never its label, so
+        ``el.text == ""`` reliably means "empty". For other elements it is the
+        ``value`` if non-empty, else the ``name`` (a label's or button's text).
+        """
         v = self.value
+        if self.role in _TEXT_ENTRY_ROLES or "editable" in self.states:
+            return v or ""
         return v if v not in (None, "") else self.name
 
     @property

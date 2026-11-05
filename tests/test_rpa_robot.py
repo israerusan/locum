@@ -431,3 +431,11 @@ def test_report_json_roundtrip_and_counts(tmp_path):
     assert "FAILED" in rep.summary()
     with pytest.raises(ValueError):
         StepResult(name="x", status="weird")
+
+
+def test_report_timestamps_near_epoch_do_not_crash():
+    """Windows raises OSError [Errno 22] for naive fromtimestamp() near 1970 west of UTC."""
+    from pypilot.rpa import report as rep
+
+    for ts in (0.0, 1.5, 86399.0):
+        assert rep._iso(ts).startswith(("1969-12-31", "1970-01-0"))

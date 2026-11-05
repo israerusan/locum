@@ -311,7 +311,8 @@ class FailSafe:
         if self.in_corner(pos):
             raise FailSafeTriggered(
                 f"Fail-safe triggered: mouse moved to screen corner ({pos[0]}, {pos[1]}). "
-                "Disable with Desktop(failsafe=False) / FailSafe.enabled = False (not recommended)."
+                "Move the mouse away from the corner to continue; every action is blocked while it "
+                "stays there. Disable with Desktop(failsafe=False) / FailSafe.enabled = False (not recommended)."
             )
 
     def __repr__(self) -> str:

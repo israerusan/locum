@@ -1645,6 +1645,7 @@ class WindowsBackend(Backend):
         clipboard_retry_delay: float = 0.01,
         clipboard_history: bool = False,
         respect_swapped_buttons: bool = True,
+        type_char_delay: float = 0.01,
         sleep: Callable[[float], None] = time.sleep,
         _api: Any = None,
     ) -> None:
@@ -1678,6 +1679,9 @@ class WindowsBackend(Backend):
         self._pid_names: Dict[int, str] = {}
         self._respect_swap = respect_swapped_buttons
         self._sleep = sleep
+        if type_char_delay < 0:
+            raise ValueError("type_char_delay must be >= 0")
+        self._type_char_delay = float(type_char_delay)
         self._lock = threading.RLock()
         self._held: Dict[str, _Held] = {}
         self._buttons_down: Dict[MouseButton, INPUT] = {}
@@ -1962,28 +1966,31 @@ class WindowsBackend(Backend):
                 raise first
 
     def type_text(self, text: str) -> None:
-        """Type ``text`` layout-independently (``KEYEVENTF_UNICODE``); newlines/tabs as Enter/Tab keys."""
+        """Type ``text`` layout-independently (``KEYEVENTF_UNICODE``); newlines/tabs as Enter/Tab keys.
+
+        Characters are sent one at a time (a surrogate pair stays in one
+        ``SendInput`` call) with ``type_char_delay`` seconds between them:
+        modern apps such as Windows 11 Notepad drop or garble long bursts of
+        ``KEYEVENTF_UNICODE`` input (verified on a real machine), while a
+        10 ms pace is reliable and still ~100 characters per second. Use
+        clipboard typing for very long text.
+        """
         self._check()
         if not text:
             return
-        events: List[INPUT] = []
-        buf: List[str] = []
-
-        def flush() -> None:
-            if buf:
-                events.extend(unicode_inputs("".join(buf)))
-                buf.clear()
-
+        groups: List[List[INPUT]] = []
         for token in split_text_tokens(text):
             if token in ("enter", "tab"):
-                flush()
                 d, u = self._vk_events(*vk_for_key(token))
-                events += [d, u]
+                groups.append([d, u])
             else:
-                buf.append(token)
-        flush()
-        with self._lock:
-            self._send(events)
+                groups.append(unicode_inputs(token))
+        delay = self._type_char_delay
+        for i, events in enumerate(groups):
+            if i and delay > 0:
+                self._sleep(delay)
+            with self._lock:
+                self._send(events)
 
     # =================================================================== screen
     def virtual_screen(self) -> Rect:

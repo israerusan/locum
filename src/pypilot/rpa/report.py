@@ -36,7 +36,9 @@ PathLike = Union[str, "os.PathLike[str]"]
 def _iso(ts: Optional[float]) -> Optional[str]:
     if ts is None:
         return None
-    return _dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="milliseconds")
+    # Convert from UTC: Windows rejects fromtimestamp() for local times before 1970
+    # (e.g. ts near 0 west of UTC), which raised OSError [Errno 22].
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).astimezone().isoformat(timespec="milliseconds")
 
 
 def _jsonable(value: Any) -> Any:
@@ -425,7 +427,7 @@ def _render_html(report: RunReport, *, thumbnail_size: int = 480) -> str:
         extra = {k: v for k, v in rec.items() if k not in ("time", "level", "message", "path", "robot")}
         extra_text = json.dumps(_jsonable(extra), ensure_ascii=False) if extra else ""
         when = rec.get("time")
-        when_text = _dt.datetime.fromtimestamp(when).strftime("%H:%M:%S.%f")[:-3] if isinstance(when, (int, float)) else ""
+        when_text = _dt.datetime.fromtimestamp(when, tz=_dt.timezone.utc).astimezone().strftime("%H:%M:%S.%f")[:-3] if isinstance(when, (int, float)) else ""
         log_rows.append(
             "<tr>"
             f'<td class="num">{_esc(when_text)}</td>'

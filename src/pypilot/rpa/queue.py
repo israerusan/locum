@@ -110,7 +110,7 @@ def _now() -> float:
 def _iso(ts: Optional[float]) -> Optional[str]:
     if ts is None:
         return None
-    return _dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def _jsonable(value: Any) -> Any:

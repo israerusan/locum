@@ -50,6 +50,20 @@ accessibility selectors, install PyGObject with AT-SPI (`python3-gi gir1.2-atspi
 on Debian/Ubuntu). On **macOS** grant your terminal/IDE *Accessibility* and
 *Screen Recording* permission (System Settings → Privacy & Security).
 
+## Check it on your machine
+
+Before automating real work, run the self-test. It opens a fresh, empty
+editor tab (Notepad / TextEdit / gedit), types into it, uses the clipboard and
+moves that window, then cleans up and restores your clipboard and mouse. It
+refuses to type into an editor that already contains text:
+
+```bash
+python -m pypilot.selftest          # report in ./pypilot_selftest_<timestamp>/
+```
+
+Don't touch the mouse or keyboard while it runs (about a minute); slam the
+mouse into a screen corner to abort.
+
 ## 60-second quickstart
 
 pypilot ships with a simulated desktop (an ERP form, a spreadsheet and a text

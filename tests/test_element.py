@@ -46,7 +46,7 @@ def test_properties(env):
     assert e.selector == "#name"
     assert e.node is not None and e.desktop is d
     assert "set_value" in e.actions
-    assert e.text == "Name"
+    assert e.text == ""  # empty text field: never its label
     w["name"].value = "Bob"
     assert e.value == "Bob" and e.text == "Bob"
     assert el(d, "checkbox").is_checked is False

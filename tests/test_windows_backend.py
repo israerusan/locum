@@ -1701,3 +1701,21 @@ def test_failed_release_stays_tracked_for_retry(be, api):
     assert kb.pressed == ["shift"] and "shift" in be._held
     api.send_limit, api.last_error = None, 0
     assert kb.release_all() == ["shift"] and not be._held
+
+
+def test_type_text_is_paced_per_character_keeping_surrogate_pairs(api):
+    """Windows 11 Notepad garbles long KEYEVENTF_UNICODE bursts (seen on a real
+    machine: 'Hello pypilot \\ude80\\ude80...'). Each character must be its own
+    SendInput call -- a surrogate pair together -- with a pause in between."""
+    sleeps = []
+    nb = WindowsBackend(_api=api, dpi_aware=False, sleep=sleeps.append, type_char_delay=0.01)
+    calls = []
+    orig = api.SendInput
+    api.SendInput = lambda n, arr, size: (calls.append(n), orig(n, arr, size))[1]
+    nb.type_text("a😀\nb")
+    ks = keys_of(api)
+    assert [k[2] for k in ks if k[3] & KEYEVENTF_UNICODE and not k[3] & KEYEVENTF_KEYUP] == [ord("a"), 0xD83D, 0xDE00, ord("b")]
+    assert sleeps == [0.01, 0.01, 0.01]  # 4 groups: 'a', the emoji pair, Enter, 'b'
+    assert calls == [2, 4, 2, 2]  # one SendInput per character; the emoji's two UTF-16 units together
+    with pytest.raises(ValueError):
+        WindowsBackend(_api=api, dpi_aware=False, type_char_delay=-1)
