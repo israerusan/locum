@@ -18,8 +18,13 @@ Keystrokes are only sent once focus is *proven*
 whatever control has keyboard focus, so before sending any they require
 affirmative proof that the keystrokes will reach this element: the element
 reports the ``focused`` state, or the backend's ``focused_element()`` is the
-element, one of its descendants (the inner edit of a combo box) or an ancestor
-that owns its keyboard input (a grid and its cells). A backend that cannot
+element, one of its descendants (the inner edit of a combo box) or -- only
+after a click on the element -- an ancestor that owns its keyboard input (a
+grid and its cells). A focused window, pane or web document that merely
+*contains* the element is not proof before that click: UI Automation and macOS
+report the container as focused when nothing inside it is, so the element is
+focused (natively, then by click) instead of typing into the container. A
+backend that cannot
 tell -- it reports no states and no focused element, or reading them raised --
 is **not** proof: the action raises :class:`~pypilot.errors.ElementNotFound`
 instead of typing into whichever field (or window) already had focus. (Earlier
@@ -818,17 +823,24 @@ class Element:
         except Exception:
             return None
 
-    def _has_focus(self) -> Optional[bool]:
+    def _has_focus(self, allow_ancestor: bool = True) -> Optional[bool]:
         """Whether keystrokes would reach this element (``None`` = the backend cannot tell).
 
         ``True`` is affirmative proof: the element reports ``focused``, or the
         backend's focused element is the element, a descendant (the inner edit
-        of a combo box) or an ancestor (a grid that owns its cells' keyboard
-        input). ``False`` means it is known not to have focus: another control
-        has it, or the element reports states without ``focused`` while the
-        backend reports no focused element. A backend error while reading the
-        states or the focused element is never turned into evidence either
-        way: without other proof the answer is ``None``.
+        of a combo box) or -- only with ``allow_ancestor`` -- an ancestor (a
+        grid that owns its cells' keyboard input). ``False`` means it is known
+        not to have focus: another control has it (with ``allow_ancestor``
+        off, that includes a containing window/pane/document), or the element
+        reports states without ``focused`` while the backend reports no
+        focused element. A backend error while reading the states or the
+        focused element is never turned into evidence either way: without
+        other proof the answer is ``None``.
+
+        The ancestor rule is only meaningful *after a click* has physically
+        targeted this element: UI Automation and macOS report the window or
+        web document as focused when nothing inside has focus, so before that
+        an ancestor being focused proves nothing about where keystrokes go.
         """
         states = self._read_states()
         if states is not None and "focused" in states:
@@ -841,7 +853,7 @@ class Element:
         if f is not None:
             if _same(f, self._node) or any(_same(a, self._node) for a in self._ancestors(f)):
                 return True
-            if any(_same(a, f) for a in self._ancestors(self._node)):
+            if allow_ancestor and any(_same(a, f) for a in self._ancestors(self._node)):
                 return True
             return False
         if not f_known or not states:  # a read failed, or nothing was reported at all
@@ -906,11 +918,17 @@ class Element:
         """
         self._guard()
         require = _require_focus(self.desktop, require_focus)
-        if self._has_focus() is True:
+        # Already focused (own "focused" state, read first and cheaply) or focus is
+        # on a descendant (the inner edit of a combo box): do not refocus. A
+        # focused *ancestor* (window, pane, web document) is no proof here --
+        # UIA/macOS report the container when nothing inside is focused.
+        if self._has_focus(allow_ancestor=False) is True:
             return
         self._check_enabled()
         if _safe(lambda: self._node.focus(), False):
-            state = self._has_focus()
+            # Native focus targeted this element, but the focused element being
+            # merely an ancestor still is not proof; that case goes to the click.
+            state = self._has_focus(allow_ancestor=False)
             if state is True:
                 return
             if state is None:
