@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import subprocess
 import sys
 
@@ -29,16 +30,61 @@ def mock_desktop():
         pypilot.set_desktop(old)
 
 
+# Variables the interpreter itself needs to start. Without SYSTEMROOT, Python 3.9 on
+# Windows aborts with "Fatal Python error: _Py_HashRandomization_Init: failed to get
+# random numbers" before running a single line (seen on GitHub's windows-latest).
+_OS_ESSENTIAL_ENV = ("SYSTEMROOT", "SystemDrive", "WINDIR", "TEMP", "TMP", "HOME", "TMPDIR", "LANG")
+
+
+def _package_root() -> str:
+    """The directory that contains the ``pypilot`` package under test."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(pypilot.__file__)))
+
+
+def _isolated_env(environ=None) -> dict:
+    """A minimal environment for a child interpreter: OS essentials only.
+
+    Nothing that customises Python or pypilot leaks in from the parent (no
+    inherited ``PYTHONPATH``, ``PYTHONSTARTUP``, ``PYPILOT_*``, ...).
+    ``PYTHONPATH`` is set explicitly to the directory of the pypilot *under
+    test*, so the child imports this very package whether it is installed
+    editable, from a wheel, or only placed on the path.
+    """
+    environ = os.environ if environ is None else environ
+    upper = {k.upper(): v for k, v in environ.items()}  # Windows names are case-insensitive
+    env = {"PATH": ""}
+    for name in _OS_ESSENTIAL_ENV:
+        if name.upper() in upper:
+            env[name] = upper[name.upper()]
+    env["PYTHONPATH"] = _package_root()
+    return env
+
+
+def test_isolated_env_keeps_os_essentials_but_drops_python_customisation():
+    parent = {
+        "SystemRoot": r"C:\Windows", "TEMP": r"C:\Temp", "HOME": "/home/u", "PATH": "/usr/bin",
+        "PYTHONPATH": "/somewhere/else", "PYTHONSTARTUP": "/evil.py", "PYPILOT_BACKEND": "mock",
+    }
+    env = _isolated_env(parent)
+    assert env == {"PATH": "", "SYSTEMROOT": r"C:\Windows", "TEMP": r"C:\Temp", "HOME": "/home/u",
+                   "PYTHONPATH": _package_root()}
+    assert os.path.isfile(os.path.join(env["PYTHONPATH"], "pypilot", "__init__.py"))
+
+
 def test_import_is_side_effect_free():
     code = (
         "import sys, json, pypilot\n"
         "heavy = [m for m in sys.modules if m.split('.')[0] in ('numpy', 'PIL', 'mss', 'Xlib', 'comtypes', 'Quartz')]\n"
         "import pypilot.backends as b\n"
         "print(json.dumps({'heavy': heavy, 'backend': b._default is None, 'desktop': pypilot._default_desktop is None,\n"
-        "                  'version': pypilot.__version__}))\n"
+        "                  'version': pypilot.__version__, 'file': pypilot.__file__}))\n"
     )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, env={"PATH": ""})
+    # -s: no user site-packages either.
+    out = subprocess.run([sys.executable, "-s", "-c", code], capture_output=True, text=True, env=_isolated_env())
+    assert out.returncode == 0, out.stderr
     info = json.loads(out.stdout.strip().splitlines()[-1])
+    imported = info.pop("file")
+    assert os.path.normcase(os.path.abspath(imported)) == os.path.normcase(os.path.abspath(pypilot.__file__))
     assert info == {"heavy": [], "backend": True, "desktop": True, "version": pypilot.__version__}
 
 
