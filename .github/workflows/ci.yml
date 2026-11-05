@@ -103,8 +103,19 @@ jobs:
       - name: Install pypilot
         run: python -m pip install .
 
+      # Step-level continue-on-error as well as job-level: job-level alone keeps
+      # the workflow run green but still records this job's check run as failed,
+      # which would leave the PR showing a red X. With it on the step, a
+      # self-test failure becomes a warning annotation plus the uploaded report.
       - name: Self-test against the runner's real desktop
+        id: selftest
+        continue-on-error: true
         run: python -m pypilot.selftest --yes --out selftest-report
+
+      - name: Flag a failed self-test (non-blocking)
+        if: steps.selftest.outcome == 'failure'
+        shell: bash
+        run: echo "::warning title=windows-native-selftest::The real-desktop self-test reported failures; see the windows-native-selftest-report artifact."
 
       - name: Upload self-test report
         if: always()

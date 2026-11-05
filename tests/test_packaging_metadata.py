@@ -55,3 +55,17 @@ def test_ci_native_selftest_job_is_non_blocking_and_uploads_its_report():
     assert "--yes" in run and "--out selftest-report" in run and "--backend" not in run
     upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@v4"))
     assert upload["if"] == "always()" and upload["with"]["path"] == "selftest-report"
+
+
+def test_ci_native_selftest_failure_does_not_turn_the_pr_check_red():
+    # Job-level continue-on-error still records the job's check run as failed;
+    # the self-test step itself must swallow the failure and surface a warning.
+    steps = _workflow()["jobs"]["windows-native-selftest"]["steps"]
+    selftest = next(s for s in steps if "pypilot.selftest" in s.get("run", ""))
+    assert selftest["continue-on-error"] is True
+    sid = selftest["id"]
+    warn = next(s for s in steps if s.get("if") == f"steps.{sid}.outcome == 'failure'")
+    assert "::warning" in warn["run"]
+    names = [s.get("name") for s in steps]
+    assert names.index(warn["name"]) < next(i for i, s in enumerate(steps)
+                                            if s.get("uses", "").startswith("actions/upload-artifact"))
