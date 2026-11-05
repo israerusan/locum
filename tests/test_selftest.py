@@ -102,3 +102,32 @@ def test_selftest_uses_the_platform_shortcut_key():
     src = inspect.getsource(selftest.SelfTest)
     for key in "anc":  # Ctrl+A moves to the line start on macOS instead of selecting all
         assert f'hotkey("ctrl+{key}")' not in src and f'hotkey("mod+{key}")' in src
+
+
+def test_selftest_restores_a_non_text_clipboard_in_full(tmp_path):
+    """The self-test used to save/restore clipboard *text* only, so a copied image or
+    file list was wiped by every run (on every platform)."""
+    d = selftest._mock_desktop()
+    be = d.backend
+    snapshot = {"formats": [("image/png", b"\x89PNG...")]}  # opaque, no text at all
+    restored = []
+    be.save_clipboard = lambda: snapshot
+    be.restore_clipboard = lambda saved: restored.append(saved)
+    selftest.SelfTest(d, str(tmp_path / "st"), log=lambda m: None).run()
+    assert restored == [snapshot]
+
+
+def test_selftest_does_not_overwrite_a_clipboard_it_could_not_save(tmp_path):
+    d = selftest._mock_desktop()
+    be = d.backend
+    d.clipboard_set("precious")
+
+    def refuse():
+        raise RuntimeError("clipboard owned by another process")
+
+    be.save_clipboard = refuse
+    st = selftest.SelfTest(d, str(tmp_path / "st"), log=lambda m: None)
+    st.run()
+    status = {c.name: c.status for c in st.checks}
+    assert status["hotkeys + clipboard"] == "SKIP"
+    assert d.clipboard_get() == "precious"

@@ -60,6 +60,8 @@ class SelfTest:
         self.editor_window: Any = None
         #: True when the editor window already existed (the user's own Notepad): it is never closed
         self.editor_preexisting = False
+        #: Whether the user's clipboard was saved (all formats) and will be restored
+        self.clipboard_saved = False
         #: the empty file TextEdit edits on macOS; deleted after the run
         self.temp_doc: Optional[str] = None
         self.editor: Any = None
@@ -255,6 +257,8 @@ class SelfTest:
         return "exact" + (" (keystrokes were garbled; repaired via read-back)" if repaired else "")
 
     def c_clipboard(self) -> str:
+        if not self.clipboard_saved:
+            raise _Skip("your clipboard could not be saved, so it is not overwritten")
         ed = self._editor()
         ed.focus()
         self.d.hotkey("mod+a")
@@ -429,10 +433,17 @@ class SelfTest:
         from .backends.base import CAP_ACCESSIBILITY, CAP_CLIPBOARD, CAP_KEYBOARD, CAP_MOUSE, CAP_SCREENSHOT, CAP_WINDOWS
 
         os.makedirs(self.out, exist_ok=True)
-        saved_clip: Optional[str] = None
-        if self.d.backend.has(CAP_CLIPBOARD):
+        # The user's clipboard is saved in every format the backend can snapshot (images,
+        # file lists, rich text -- not only text) and put back at the end. If it cannot
+        # be saved, the checks that overwrite it are skipped rather than destroy it.
+        saved_clip: Any = None
+        self.clipboard_saved = False
+        be = self.d.backend
+        if be.has(CAP_CLIPBOARD):
             try:
-                saved_clip = self.d.clipboard_get()
+                save = getattr(be, "save_clipboard", None)
+                saved_clip = save() if callable(save) else be.get_clipboard()
+                self.clipboard_saved = True
             except Exception:
                 saved_clip = None
         start_pos = self.d.position() if self.d.backend.has(CAP_MOUSE) else None
@@ -464,11 +475,15 @@ class SelfTest:
                     btn.click()
                 except Exception:
                     pass
-            if saved_clip is not None:
+            if self.clipboard_saved:
                 try:
-                    self.d.clipboard_set(saved_clip)
-                except Exception:
-                    pass
+                    restore = getattr(be, "restore_clipboard", None)
+                    if callable(restore):
+                        restore(saved_clip)
+                    else:
+                        be.set_clipboard(saved_clip if saved_clip is not None else "")
+                except Exception as exc:
+                    self.log(f"  WARNING  could not restore your clipboard: {type(exc).__name__}: {exc}")
             if start_pos is not None:
                 try:
                     self.d.move(start_pos)
