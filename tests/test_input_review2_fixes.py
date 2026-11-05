@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot import Desktop
-from pypilot import failsafe as fs_mod
-from pypilot.backends.mock import MockBackend
-from pypilot.errors import BackendError
-from pypilot.failsafe import FailSafe, reset_abort
-from pypilot.keyboard import Keyboard
-from pypilot.keys import normalize_key, parse_hotkey
-from pypilot.types import Point, Rect
+from locum import Desktop
+from locum import failsafe as fs_mod
+from locum.backends.mock import MockBackend
+from locum.errors import BackendError
+from locum.failsafe import FailSafe, reset_abort
+from locum.keyboard import Keyboard
+from locum.keys import normalize_key, parse_hotkey
+from locum.types import Point, Rect
 
 
 @pytest.fixture(autouse=True)

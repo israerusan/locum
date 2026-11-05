@@ -6,11 +6,11 @@ import os
 import pytest
 from PIL import Image
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import WorkflowError
-from pypilot.rpa import FlowStepError, RunReport, interpolate, run_flow, validate_flow
-from pypilot.rpa.report import FAILED, PASSED
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import WorkflowError
+from locum.rpa import FlowStepError, RunReport, interpolate, run_flow, validate_flow
+from locum.rpa.report import FAILED, PASSED
 
 
 @pytest.fixture
@@ -38,12 +38,12 @@ def run(doc, d, **kw):
 # ---------------------------------------------------------------- interpolation
 
 def test_interpolate_paths_env_defaults_and_types(monkeypatch):
-    monkeypatch.setenv("PYPILOT_TEST_USER", "bob")
+    monkeypatch.setenv("LOCUM_TEST_USER", "bob")
     v = {"a": 1, "item": {"addr": {"city": "Oslo"}, "tags": ["x", "y"]}, "lst": [1, 2]}
     assert interpolate("${a}", v) == 1
     assert interpolate("${lst}", v) == [1, 2]
     assert interpolate("n=${a} c=${item.addr.city} t=${item.tags.1}", v) == "n=1 c=Oslo t=y"
-    assert interpolate("${env.PYPILOT_TEST_USER}", v) == "bob"
+    assert interpolate("${env.LOCUM_TEST_USER}", v) == "bob"
     assert interpolate("${missing:-fallback}", v) == "fallback"
     assert interpolate("$${a} is literal", v) == "${a} is literal"
     assert interpolate({"k": ["${a}", {"z": "${item.addr.city}"}]}, v) == {"k": [1, {"z": "Oslo"}]}
@@ -57,7 +57,7 @@ def test_interpolate_paths_env_defaults_and_types(monkeypatch):
     with pytest.raises(WorkflowError, match="no index"):
         interpolate("${lst.5}", v)
     with pytest.raises(WorkflowError, match="environment variable"):
-        interpolate("${env.PYPILOT_DEFINITELY_UNSET_VAR}", v)
+        interpolate("${env.LOCUM_DEFINITELY_UNSET_VAR}", v)
 
 
 # ---------------------------------------------------------------- validation
@@ -343,7 +343,7 @@ def test_yaml_file_with_evidence(scene, tmp_path):
     flow = tmp_path / "flow.yaml"
     flow.write_text(
         "name: yaml flow\n"
-        "vars:\n  who: ${env.PYPILOT_FLOW_WHO:-nobody}\n"
+        "vars:\n  who: ${env.LOCUM_FLOW_WHO:-nobody}\n"
         "steps:\n"
         "  - set_text: {target: 'edit \"Customer\"', text: '${who}'}\n"
         "  - click: 'button \"DoesNotExist\"'\n"

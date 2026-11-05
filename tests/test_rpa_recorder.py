@@ -4,11 +4,11 @@ import json
 
 import pytest
 
-from pypilot.backends import set_backend
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import NotSupported
-from pypilot.rpa import Recorder, RecordedAction, run_flow
+from locum.backends import set_backend
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import NotSupported
+from locum.rpa import Recorder, RecordedAction, run_flow
 
 
 def build_scene():
@@ -200,7 +200,7 @@ def test_start_twice_and_pynput_unavailable(monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    with pytest.raises(NotSupported, match="pypilot\\[record\\]"):
+    with pytest.raises(NotSupported, match="locum\\[record\\]"):
         rec.start()
     assert not rec.is_recording
 
@@ -271,7 +271,7 @@ def test_python_script_replays_on_fresh_scene():
     rec.stop()
     expected = snapshot(w)
     code = rec.to_python()
-    assert "from pypilot import Desktop" in code and "d = Desktop()" in code
+    assert "from locum import Desktop" in code and "d = Desktop()" in code
     compile(code, "<recorded>", "exec")
     be2, w2 = build_scene()
     try:

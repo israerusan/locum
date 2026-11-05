@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from pypilot import vision
-from pypilot.backends.mock import MockBackend
-from pypilot.types import Match, Rect
+from locum import vision
+from locum.backends.mock import MockBackend
+from locum.types import Match, Rect
 
 
 def noise(h, w, seed=0, c=3):
@@ -267,7 +267,7 @@ class TestLocate:
         assert m.rect == Rect(20, 5, 12, 10)
 
     def test_disabled_cv2_env(self, monkeypatch):
-        monkeypatch.setenv("PYPILOT_DISABLE_CV2", "1")
+        monkeypatch.setenv("LOCUM_DISABLE_CV2", "1")
         assert vision._cv2() is None
 
     def test_fast_len(self):
@@ -608,7 +608,7 @@ def test_cv2_fast_path_is_used_and_post_processed(monkeypatch):
                     out[y, x] = (a * b).sum() / den if den else np.nan  # real cv2 can emit nan/inf here
             return out
 
-    monkeypatch.delenv("PYPILOT_DISABLE_CV2", raising=False)
+    monkeypatch.delenv("LOCUM_DISABLE_CV2", raising=False)
     monkeypatch.setattr(vision, "_CV2", FakeCV2)
     monkeypatch.setattr(vision, "_CV2_CHECKED", True)
     hay = noise(30, 30, seed=100)

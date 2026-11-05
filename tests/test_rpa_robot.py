@@ -6,11 +6,11 @@ import os
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import ElementNotFound, FailSafeTriggered
-from pypilot.rpa import BusinessException, Robot, RunReport, StepResult
-from pypilot.rpa.report import FAILED, PASSED, SKIPPED
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import ElementNotFound, FailSafeTriggered
+from locum.rpa import BusinessException, Robot, RunReport, StepResult
+from locum.rpa.report import FAILED, PASSED, SKIPPED
 
 
 class FakeClock:
@@ -351,13 +351,13 @@ def test_structured_logging(robot, caplog):
             robot.log("saved invoice", invoice=42, level="info")
         robot.log("debug only", level="debug")
 
-    with caplog.at_level(logging.DEBUG, logger="pypilot.robot"):
+    with caplog.at_level(logging.DEBUG, logger="locum.robot"):
         report = robot.run(save=False)
     rec = next(r for r in report.logs if r["message"] == "saved invoice")
     assert rec["invoice"] == 42 and rec["path"] == "t > s" and rec["level"] == "info"
     assert not any(r["message"] == "debug only" for r in report.logs)
-    py = [r for r in caplog.records if getattr(r, "pypilot", {}).get("message") == "saved invoice"]
-    assert py and py[0].pypilot["invoice"] == 42
+    py = [r for r in caplog.records if getattr(r, "locum", {}).get("message") == "saved invoice"]
+    assert py and py[0].locum["invoice"] == 42
     with pytest.raises(ValueError):
         robot.log("x", level="loud")
 
@@ -435,7 +435,7 @@ def test_report_json_roundtrip_and_counts(tmp_path):
 
 def test_report_timestamps_near_epoch_do_not_crash():
     """Windows raises OSError [Errno 22] for naive fromtimestamp() near 1970 west of UTC."""
-    from pypilot.rpa import report as rep
+    from locum.rpa import report as rep
 
     for ts in (0.0, 1.5, 86399.0):
         assert rep._iso(ts).startswith(("1969-12-31", "1970-01-0"))

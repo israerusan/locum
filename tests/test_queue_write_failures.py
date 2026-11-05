@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-import pypilot.rpa.queue as queue_mod
-from pypilot.rpa.queue import IN_PROGRESS, NEW, SUCCESS, LeaseLostError, WorkQueue
+import locum.rpa.queue as queue_mod
+from locum.rpa.queue import IN_PROGRESS, NEW, SUCCESS, LeaseLostError, WorkQueue
 
 
 def _disk_status(path):

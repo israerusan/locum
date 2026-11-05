@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.base import CAP_CLIPBOARD, CAP_UNICODE_TYPING
-from pypilot.backends.mock import MockBackend
-from pypilot.errors import FailSafeTriggered, NotSupported
-from pypilot.failsafe import FailSafe, abort, reset_abort
-from pypilot.keyboard import Keyboard
+from locum.backends.base import CAP_CLIPBOARD, CAP_UNICODE_TYPING
+from locum.backends.mock import MockBackend
+from locum.errors import FailSafeTriggered, NotSupported
+from locum.failsafe import FailSafe, abort, reset_abort
+from locum.keyboard import Keyboard
 
 
 class NoUnicodeBackend(MockBackend):

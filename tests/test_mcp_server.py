@@ -6,10 +6,10 @@ import json
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.llm.mcp_server import LATEST_PROTOCOL_VERSION, MCPServer, serve
-from pypilot.llm.safety import Policy
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.llm.mcp_server import LATEST_PROTOCOL_VERSION, MCPServer, serve
+from locum.llm.safety import Policy
 
 
 @pytest.fixture
@@ -35,7 +35,7 @@ def test_initialize_and_notifications(server):
     res = r["result"]
     assert res["protocolVersion"] == "2025-03-26"
     assert res["capabilities"] == {"tools": {"listChanged": False}}
-    assert res["serverInfo"]["name"] == "pypilot" and res["serverInfo"]["version"]
+    assert res["serverInfo"]["name"] == "locum" and res["serverInfo"]["version"]
     assert srv.client_info == {"name": "t", "version": "1"}
     unknown_version = srv.handle_message(req("initialize", {"protocolVersion": "1999-01-01"}))
     assert unknown_version["result"]["protocolVersion"] == LATEST_PROTOCOL_VERSION == "2025-06-18"

@@ -7,12 +7,12 @@ import math
 import pytest
 from PIL import Image
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import ElementNotFound
-from pypilot.llm.observe import Observation, fit_image_size, observe, visual_tokens
-from pypilot.selectors import parse
-from pypilot.types import Point, Rect
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import ElementNotFound
+from locum.llm.observe import Observation, fit_image_size, observe, visual_tokens
+from locum.selectors import parse
+from locum.types import Point, Rect
 
 
 def make_desktop(width=1920, height=1080):

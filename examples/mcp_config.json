@@ -1,11 +1,11 @@
 {
   "mcpServers": {
-    "pypilot": {
-      "command": "pypilot",
-      "args": ["mcp", "--policy", "default", "--audit", "~/.pypilot/mcp-audit.jsonl"]
+    "locum": {
+      "command": "locum",
+      "args": ["mcp", "--policy", "default", "--audit", "~/.locum/mcp-audit.jsonl"]
     },
-    "pypilot-sandbox": {
-      "command": "pypilot",
+    "locum-sandbox": {
+      "command": "locum",
       "args": ["--backend", "mock", "mcp", "--policy", "permissive"]
     }
   }

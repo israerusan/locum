@@ -1,4 +1,4 @@
-"""Tests for the PyAutoGUI compatibility layer (pypilot.compat.pyautogui) on the MockBackend."""
+"""Tests for the PyAutoGUI compatibility layer (locum.compat.pyautogui) on the MockBackend."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ import numpy as np
 import pytest
 from PIL import Image
 
-import pypilot.compat.pyautogui as pg
-from pypilot.backends.mock import MockBackend
-from pypilot.compat import install_pyautogui_shim, uninstall_pyautogui_shim
-from pypilot.desktop import Desktop
-from pypilot.errors import FailSafeTriggered, ImageNotFound, PypilotError
+import locum.compat.pyautogui as pg
+from locum.backends.mock import MockBackend
+from locum.compat import install_pyautogui_shim, uninstall_pyautogui_shim
+from locum.desktop import Desktop
+from locum.errors import FailSafeTriggered, ImageNotFound, LocumError
 
 
 def noise(w: int, h: int, seed: int = 1) -> Image.Image:
@@ -431,7 +431,7 @@ def test_get_point_on_line():
 
 # ---------------------------------------------------------------------- shim
 def test_install_shim():
-    name = "pyautogui_pypilot_test_shim"
+    name = "pyautogui_locum_test_shim"
     assert install_pyautogui_shim(name) is pg
     assert importlib.import_module(name) is pg
     assert uninstall_pyautogui_shim(name) is True
@@ -447,11 +447,11 @@ def test_install_shim():
 
 
 def test_default_desktop_is_created_lazily(monkeypatch):
-    from pypilot import backends
+    from locum import backends
 
     old = pg.set_desktop(None)
     old_backend = backends._default
-    monkeypatch.setenv("PYPILOT_BACKEND", "mock")
+    monkeypatch.setenv("LOCUM_BACKEND", "mock")
     backends.set_backend(None)
     try:
         d = pg.get_desktop()
@@ -464,5 +464,5 @@ def test_default_desktop_is_created_lazily(monkeypatch):
         backends.set_backend(old_backend)
 
 
-def test_errors_are_pypilot_errors():
-    assert issubclass(pg.ImageNotFoundException, PypilotError)
+def test_errors_are_locum_errors():
+    assert issubclass(pg.ImageNotFoundException, LocumError)

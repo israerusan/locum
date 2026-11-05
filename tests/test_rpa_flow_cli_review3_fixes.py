@@ -10,11 +10,11 @@ import types
 
 import pytest
 
-from pypilot.cli import EXIT_FAILURE, EXIT_OK, EXIT_UNAVAILABLE, DemoBackend, main
-from pypilot.desktop import Desktop
-from pypilot.errors import FailSafeTriggered
-from pypilot.rpa import Recorder, run_flow
-from pypilot.rpa.flow import load_flow
+from locum.cli import EXIT_FAILURE, EXIT_OK, EXIT_UNAVAILABLE, DemoBackend, main
+from locum.desktop import Desktop
+from locum.errors import FailSafeTriggered
+from locum.rpa import Recorder, run_flow
+from locum.rpa.flow import load_flow
 
 pytest.importorskip("yaml")
 
@@ -245,7 +245,7 @@ def test_record_save_failure_keeps_the_recording(tmp_path, monkeypatch, desk):
 
 def test_argparse_output_goes_to_the_injected_streams(capsys):
     code, out, err = cli(["--version"])
-    assert code == EXIT_OK and out.startswith("pypilot ")
+    assert code == EXIT_OK and out.startswith("locum ")
     code, out, err = cli(["clik", "x"])
     assert code == 2 and "invalid choice" in err
     code, out, _ = cli(["run", "--help"])
@@ -255,7 +255,7 @@ def test_argparse_output_goes_to_the_injected_streams(capsys):
 
 
 def test_negative_coordinates(be, desk):
-    from pypilot.types import Monitor, Rect
+    from locum.types import Monitor, Rect
 
     # A second monitor left of the primary one: negative x is on screen.
     be._monitors.append(Monitor(1, Rect(-1920, 0, 1920, 1080), 1.0, False, "MOCK1"))
@@ -327,7 +327,7 @@ def test_layout_produced_characters_are_not_shifted_again():
 
 
 def test_vk_only_keys_are_translated():
-    from pypilot.rpa.recorder import _vk_key
+    from locum.rpa.recorder import _vk_key
 
     assert [_vk_key(v, "win32") for v in (96, 97, 101, 105, 106, 107, 109, 111)] == list("0159*+-/")
     assert _vk_key(110, "win32") in (".", ",")
@@ -341,13 +341,13 @@ def test_vk_only_keys_are_translated():
 
 def test_untranslatable_vk_key_is_logged(caplog):
     r = Recorder(use_selectors=False)
-    with caplog.at_level(logging.WARNING, logger="pypilot.recorder"):
+    with caplog.at_level(logging.WARNING, logger="locum.recorder"):
         assert r._pynput_key(K(vk=0x12345)) is None
     assert "cannot translate key" in caplog.text
 
 
 def test_clipboard_typing_is_recorded_as_text():
-    from pypilot.backends.mock import MockBackend
+    from locum.backends.mock import MockBackend
 
     d = Desktop(MockBackend(), sleep=_noop, default_timeout=0)
     r = Recorder(d, use_selectors=False).start(source="backend")

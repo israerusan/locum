@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import PolicyViolation
-from pypilot.llm.computer_use import ComputerUseAdapter
-from pypilot.llm.safety import Policy
-from pypilot.llm.tools import DesktopToolkit
-from pypilot._nodeinfo import target_label
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import PolicyViolation
+from locum.llm.computer_use import ComputerUseAdapter
+from locum.llm.safety import Policy
+from locum.llm.tools import DesktopToolkit
+from locum._nodeinfo import target_label
 
 
 @pytest.fixture
@@ -134,11 +134,11 @@ def test_allowed_apps_refuses_point_with_unknown_app():
 # --------------------------------------------------------------- finding 4: MCP stdio hygiene
 _MCP_SCRIPT = r"""
 import os, sys
-from pypilot.backends.base import Backend
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.llm.mcp_server import MCPServer
-from pypilot.llm.safety import Policy
+from locum.backends.base import Backend
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.llm.mcp_server import MCPServer
+from locum.llm.safety import Policy
 
 class B(MockBackend):
     def launch(self, command, **kw):  # the real implementation every OS backend uses
@@ -186,7 +186,7 @@ def test_mcp_server_keeps_children_and_strays_off_protocol_stdout(tmp_path):
 def test_mcp_server_sets_launch_redirection_on_supplied_toolkit():
     import subprocess
 
-    from pypilot.llm.mcp_server import MCPServer
+    from locum.llm.mcp_server import MCPServer
 
     be = MockBackend()
     d = Desktop(be, failsafe=False, sleep=lambda s: None)
@@ -199,7 +199,7 @@ def test_mcp_server_sets_launch_redirection_on_supplied_toolkit():
 
 # --------------------------------------------------------------- finding 5: Agent extra_tools behind the policy
 def _agent_with(policy, *extra, script):
-    from pypilot.llm.agent import Agent, ScriptedClient
+    from locum.llm.agent import Agent, ScriptedClient
 
     d = Desktop(MockBackend(), failsafe=False, sleep=lambda s: None)
     client = ScriptedClient(script)
@@ -229,7 +229,7 @@ def _make_tools(ran):
 
 
 def test_extra_tools_obey_deny_list_and_are_audited():
-    from pypilot.llm.agent import tool_use_block
+    from locum.llm.agent import tool_use_block
 
     ran = []
     delete_record, _ = _make_tools(ran)
@@ -244,7 +244,7 @@ def test_extra_tools_obey_deny_list_and_are_audited():
 
 
 def test_extra_tools_dry_run_and_confirmation():
-    from pypilot.llm.agent import tool_use_block
+    from locum.llm.agent import tool_use_block
 
     ran = []
     delete_record, lookup_record = _make_tools(ran)
@@ -269,7 +269,7 @@ def test_extra_tools_dry_run_and_confirmation():
 
 
 def test_extra_tools_keep_argument_validation():
-    from pypilot.llm.agent import tool_use_block
+    from locum.llm.agent import tool_use_block
 
     ran = []
     _, lookup_record = _make_tools(ran)
@@ -282,7 +282,7 @@ def test_extra_tools_keep_argument_validation():
 
 # --------------------------------------------------------------- finding 3 / 8: flow reports, call vars
 def test_flow_report_never_contains_interpolated_secrets(tmp_path, monkeypatch):
-    from pypilot.rpa.flow import run_flow
+    from locum.rpa.flow import run_flow
 
     monkeypatch.setenv("APP_PASSWORD", "hunter2-secret")
     be = MockBackend()
@@ -304,7 +304,7 @@ def test_flow_report_never_contains_interpolated_secrets(tmp_path, monkeypatch):
 
 
 def test_call_vars_defaults_see_overrides_and_each_other():
-    from pypilot.rpa.flow import run_flow
+    from locum.rpa.flow import run_flow
 
     d = Desktop(MockBackend(), failsafe=False, sleep=lambda s: None)
     sub = {"vars": {"host": "erp", "url": "https://${host}/login"}, "steps": [{"log": "${url}"}]}
@@ -319,7 +319,7 @@ def test_call_vars_defaults_see_overrides_and_each_other():
 
 # --------------------------------------------------------------- finding 6 / 9: queue references & abandoned items
 def test_queue_same_basename_in_other_folder_is_not_a_duplicate(tmp_path):
-    from pypilot.rpa.queue import WorkQueue
+    from locum.rpa.queue import WorkQueue
 
     (tmp_path / "jan").mkdir()
     (tmp_path / "feb").mkdir()
@@ -335,7 +335,7 @@ def test_queue_same_basename_in_other_folder_is_not_a_duplicate(tmp_path):
 
 
 def test_queue_rows_inserted_into_source_are_picked_up_once(tmp_path):
-    from pypilot.rpa.queue import WorkQueue
+    from locum.rpa.queue import WorkQueue
 
     src = tmp_path / "data.csv"
     src.write_text("no\nR1\nR2\n")
@@ -356,7 +356,7 @@ def test_queue_rows_inserted_into_source_are_picked_up_once(tmp_path):
 def _crash_file(tmp_path, attempts):
     import json
 
-    from pypilot.rpa.queue import WorkQueue
+    from locum.rpa.queue import WorkQueue
 
     path = tmp_path / "q.json"
     q = WorkQueue("pay", path)
@@ -369,7 +369,7 @@ def _crash_file(tmp_path, attempts):
 
 
 def test_abandoned_in_progress_items_are_failed_by_default(tmp_path):
-    from pypilot.rpa.queue import FAILED, WorkQueue
+    from locum.rpa.queue import FAILED, WorkQueue
 
     path = _crash_file(tmp_path, 1)
     q = WorkQueue.open(path)
@@ -386,7 +386,7 @@ def test_abandoned_in_progress_items_are_failed_by_default(tmp_path):
 
 
 def test_requeued_abandoned_items_respect_retry_budget_across_runs(tmp_path):
-    from pypilot.rpa.queue import FAILED, SUCCESS, WorkQueue
+    from locum.rpa.queue import FAILED, SUCCESS, WorkQueue
 
     # attempts already used up by crashing runs -> failed without running again
     q = WorkQueue.open(_crash_file(tmp_path, 2), on_abandoned="requeue")
@@ -410,7 +410,7 @@ def test_requeued_abandoned_items_respect_retry_budget_across_runs(tmp_path):
     # an interruption by the human while the handler runs: a human checks the item
     # (its side effect may have happened); retrying it then starts from scratch
     (tmp_path / "q.json").unlink()
-    from pypilot.errors import FailSafeTriggered
+    from locum.errors import FailSafeTriggered
 
     q = WorkQueue("x", tmp_path / "q.json")
     q.add({"n": 1}, reference="a")
@@ -429,10 +429,10 @@ def test_requeued_abandoned_items_respect_retry_budget_across_runs(tmp_path):
 
 # --------------------------------------------------------------- finding 7: recorder escapes ${
 def test_recorded_dollar_brace_text_replays_literally(monkeypatch):
-    from pypilot.rpa.flow import run_flow
-    from pypilot.rpa.recorder import Recorder
+    from locum.rpa.flow import run_flow
+    from locum.rpa.recorder import Recorder
 
-    monkeypatch.setenv("PYPILOT_TEST_SECRET", "s3cr3t")
+    monkeypatch.setenv("LOCUM_TEST_SECRET", "s3cr3t")
     be = MockBackend()
     d = Desktop(be, failsafe=False, sleep=lambda s: None)
     w = be.add_window("T", (100, 100, 400, 300))
@@ -442,7 +442,7 @@ def test_recorded_dollar_brace_text_replays_literally(monkeypatch):
     c = e.screen_rect.center
     rec.feed(("down", "left", c.x, c.y))
     rec.feed(("up", "left", c.x, c.y))
-    typed = "cost ${total} key=${env.PYPILOT_TEST_SECRET} keep $${x}"
+    typed = "cost ${total} key=${env.LOCUM_TEST_SECRET} keep $${x}"
     rec.feed(("type", typed))
     c2 = b.screen_rect.center
     rec.feed(("down", "left", c2.x, c2.y))

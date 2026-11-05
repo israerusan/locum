@@ -7,11 +7,11 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from pypilot import failsafe as fs_mod
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.element import Element
-from pypilot.errors import (
+from locum import failsafe as fs_mod
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.element import Element
+from locum.errors import (
     ActionTimeout,
     ElementNotFound,
     FailSafeTriggered,
@@ -20,10 +20,10 @@ from pypilot.errors import (
     SelectorSyntaxError,
     WindowNotFound,
 )
-from pypilot.motion import Humanize
-from pypilot.ocr import OCRWord
-from pypilot.types import Match, Point, Rect
-from pypilot.window import Window
+from locum.motion import Humanize
+from locum.ocr import OCRWord
+from locum.types import Match, Point, Rect
+from locum.window import Window
 
 
 class FakeTime:

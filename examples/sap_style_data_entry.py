@@ -2,7 +2,7 @@
 
 This is the classic "SAP-style" back-office robot, written code-first:
 
-* a :class:`~pypilot.rpa.WorkQueue` (Orchestrator-style transactions) is loaded
+* a :class:`~locum.rpa.WorkQueue` (Orchestrator-style transactions) is loaded
   from ``data/invoices.csv``; it is persisted to JSON, so an interrupted run
   resumes where it stopped and re-running never enters an invoice twice;
 * an invoice is identified by vendor + invoice number (invoice numbers are
@@ -13,7 +13,7 @@ This is the classic "SAP-style" back-office robot, written code-first:
   coordinates), clicks *Save* and reads the status bar;
 * bad data (an amount that is not a plain positive number with at most two
   decimals, a duplicate, a validation message from the app) raises a
-  :class:`~pypilot.rpa.BusinessException` -- recorded, never retried. Amounts
+  :class:`~locum.rpa.BusinessException` -- recorded, never retried. Amounts
   are read as ``1250.00`` / ``1,250.00`` (``--decimal-comma`` for
   ``1.250,00`` / ``1250,00``); anything ambiguous (``1,250`` or ``1.250``
   without decimals) is rejected rather than guessed;
@@ -21,15 +21,15 @@ This is the classic "SAP-style" back-office robot, written code-first:
   retried. Once Save has been clicked the outcome is unknown, so a missing or
   late answer is never retried (that could post the invoice twice): the item
   is recorded as "needs review" -- check the ERP, then re-queue it if needed;
-* the :class:`~pypilot.rpa.Robot` times every step, saves a screenshot when
+* the :class:`~locum.rpa.Robot` times every step, saves a screenshot when
   something fails and writes ``report.json`` + a self-contained ``report.html``.
 
 The selectors target a generic data-entry window titled "Invoice Entry*" with
 fields whose automation ids are vendor / invoice_no / amount / due_date. Point
-them at your own application with ``pypilot inspect`` (prints a robust selector
-for the element under the cursor) or ``pypilot tree --window "<title>"``.
+them at your own application with ``locum inspect`` (prints a robust selector
+for the element under the cursor) or ``locum tree --window "<title>"``.
 
-Pairing with SAP GUI: for SAP GUI for Windows, pypilot drives the window
+Pairing with SAP GUI: for SAP GUI for Windows, locum drives the window
 through UI Automation like any other app. If your SAP basis team has enabled
 **SAP GUI Scripting**, you can additionally talk to the scripting API from the
 same robot (``pip install pywin32``) for fields UIA cannot see, e.g.::
@@ -40,12 +40,12 @@ same robot (``pip install pywin32``) for fields UIA cannot see, e.g.::
     session.findById("wnd[0]/tbar[0]/okcd").text = "/nFB60"   # your transaction
     session.findById("wnd[0]").sendVKey(0)
 
-and keep pypilot for everything around it (logon dialogs, pop-ups, Excel,
+and keep locum for everything around it (logon dialogs, pop-ups, Excel,
 e-mail, screenshots, reports, queues, retries).
 
 Run against the demo desktop (no real input is sent):
 
-    PYPILOT_BACKEND=mock python examples/sap_style_data_entry.py
+    LOCUM_BACKEND=mock python examples/sap_style_data_entry.py
 
 Run for real (the ERP window must be open or ``--launch`` must start it):
 
@@ -63,9 +63,9 @@ import tempfile
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from pypilot import Desktop
-from pypilot.errors import FailSafeTriggered
-from pypilot.rpa import BusinessException, QueueItem, Robot, WorkQueue
+from locum import Desktop
+from locum.errors import FailSafeTriggered
+from locum.rpa import BusinessException, QueueItem, Robot, WorkQueue
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -85,8 +85,8 @@ SEL = {
 
 
 def make_desktop() -> Desktop:
-    if os.environ.get("PYPILOT_BACKEND", "").lower() in ("mock", "demo"):
-        from pypilot.cli import DemoBackend
+    if os.environ.get("LOCUM_BACKEND", "").lower() in ("mock", "demo"):
+        from locum.cli import DemoBackend
 
         return Desktop(DemoBackend(), sleep=lambda s: None, default_timeout=2)
     return Desktop(default_timeout=15)
@@ -232,12 +232,12 @@ def build_robot(desktop: Desktop, csv_path: str, queue_path: str, run_dir: str, 
 
 
 def main(argv: Optional[list] = None) -> int:
-    mock = os.environ.get("PYPILOT_BACKEND", "").lower() in ("mock", "demo")
-    scratch = tempfile.mkdtemp(prefix="pypilot-invoices-") if mock else "."
+    mock = os.environ.get("LOCUM_BACKEND", "").lower() in ("mock", "demo")
+    scratch = tempfile.mkdtemp(prefix="locum-invoices-") if mock else "."
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--csv", default=os.path.join(HERE, "data", "invoices.csv"))
     p.add_argument("--queue", default=os.path.join(scratch, "invoices.queue.json"), help="queue state (resume) file")
-    p.add_argument("--run-dir", default=os.path.join(scratch, "pypilot_runs"))
+    p.add_argument("--run-dir", default=os.path.join(scratch, "locum_runs"))
     p.add_argument("--launch", help="command that starts the ERP client if its window is not open")
     p.add_argument("--decimal-comma", action="store_true",
                    help="amounts are written 1.250,00 / 1250,00 (default: 1,250.00 / 1250.00)")

@@ -1,10 +1,10 @@
-# pypilot
+# locum
 
 **Desktop automation for Python that understands the screen.** One library for
 mouse/keyboard input, screenshots and template matching, accessibility
 selectors, RPA robots, and LLM-agent control. Windows is the most-validated
 platform; macOS and Linux (X11) backends exist but have been tested less (see
-below). **Native Wayland is not supported**: on Linux, pypilot drives X11
+below). **Native Wayland is not supported**: on Linux, locum drives X11
 sessions and XWayland windows only.
 
 | Platform | Backend | How it is tested today |
@@ -32,27 +32,27 @@ sessions and XWayland windows only.
   coordinates.
 * **LLM-native.** Set-of-marks observations; a Claude (Anthropic) agent loop
   and computer-use adapter; tool schemas exportable in Anthropic, OpenAI and
-  MCP formats (pypilot ships no OpenAI agent runtime — bring your own loop);
+  MCP formats (locum ships no OpenAI agent runtime — bring your own loop);
   a zero-dependency MCP server; and a safety policy with human confirmation,
   dry-run and audit logs.
-* **A drop-in PyAutoGUI layer** (`import pypilot.compat.pyautogui as pyautogui`)
+* **A drop-in PyAutoGUI layer** (`import locum.compat.pyautogui as pyautogui`)
   so existing scripts move over with one line.
 
 > Status: **0.1 alpha** — usable, tested, but APIs may still change between
-> releases. The design is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-> See [`docs/COMPARISON.md`](docs/COMPARISON.md) and [`docs/LLM.md`](docs/LLM.md).
+> releases. The design is in [`docs/ARCHITECTURE.md`](https://github.com/israerusan/locum/blob/main/docs/ARCHITECTURE.md).
+> See [`docs/COMPARISON.md`](https://github.com/israerusan/locum/blob/main/docs/COMPARISON.md) and [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md).
 
 ---
 
 ## Install
 
 ```bash
-pip install pypilot                 # core: pillow, numpy, mss (+ python-xlib / comtypes / pyobjc per OS)
-pip install "pypilot[llm]"          # + anthropic SDK for the Agent
-pip install "pypilot[ocr]"          # + pytesseract only (install the Tesseract binary too)
-pip install "pypilot[record]"       # + pynput: live recorder and global kill hotkey
-pip install "pypilot[yaml]"         # + PyYAML for YAML flows (JSON flows need nothing)
-pip install "pypilot[all]"          # everything above
+pip install locum                 # core: pillow, numpy, mss (+ python-xlib / comtypes / pyobjc per OS)
+pip install "locum[llm]"          # + anthropic SDK for the Agent
+pip install "locum[ocr]"          # + pytesseract only (install the Tesseract binary too)
+pip install "locum[record]"       # + pynput: live recorder and global kill hotkey
+pip install "locum[yaml]"         # + PyYAML for YAML flows (JSON flows need nothing)
+pip install "locum[all]"          # everything above
 ```
 
 From a checkout: `pip install -e ".[dev]"` and `python -m pytest -q`.
@@ -71,7 +71,7 @@ moves that window, then cleans up and restores your clipboard and mouse. It
 refuses to type into an editor that already contains text:
 
 ```bash
-python -m pypilot.selftest          # report in ./pypilot_selftest_<timestamp>/
+python -m locum.selftest          # report in ./locum_selftest_<timestamp>/
 ```
 
 Don't touch the mouse or keyboard while it runs (about a minute); slam the
@@ -79,12 +79,12 @@ mouse into a screen corner to abort.
 
 ## 60-second quickstart
 
-pypilot ships with a simulated desktop (an ERP form, a spreadsheet and a text
+locum ships with a simulated desktop (an ERP form, a spreadsheet and a text
 editor), so you can try everything without touching your real screen:
 
 ```python
-from pypilot import Desktop
-from pypilot.cli import DemoBackend
+from locum import Desktop
+from locum.cli import DemoBackend
 
 d = Desktop(DemoBackend())          # Desktop() drives your real screen instead
 
@@ -100,15 +100,15 @@ print(d.find("text#status").text)                    # Saved invoice INV-42
 The same from the shell (`--backend mock` = the demo desktop):
 
 ```bash
-pypilot --backend mock windows
-pypilot --backend mock tree --window "Invoice Entry"
-pypilot --backend mock click 'button "Save"'
-pypilot --backend mock observe                       # what an LLM agent sees
-pypilot --backend mock run examples/excel_report_flow.yaml
+locum --backend mock windows
+locum --backend mock tree --window "Invoice Entry"
+locum --backend mock click 'button "Save"'
+locum --backend mock observe                       # what an LLM agent sees
+locum --backend mock run examples/excel_report_flow.yaml
 ```
 
 On your real desktop the same calls work against real applications — e.g.
-`pypilot inspect` prints a robust selector for the element under the mouse.
+`locum inspect` prints a robust selector for the element under the mouse.
 
 ## Feature tour
 
@@ -125,7 +125,7 @@ d.find('window "Book1 - Excel" > edit "Name Box"')             # child combinato
 cells = d.find_all('edit[name~="^[A-E]1$"]')                    # regex attribute match
 assert [c.name for c in cells] == ["A1", "B1", "C1", "D1", "E1"]
 
-from pypilot import selector_for
+from locum import selector_for
 el = d.element_at(370, 171)                                     # what is under this point?
 print(selector_for(el.node, roots=d.roots()))                   # window "Invoice Entry - ERP" edit#amount
 print(d.tree(window="Invoice Entry*", interactive_only=True))   # readable tree dump
@@ -169,9 +169,9 @@ d.click_image(needle, timeout=2)                      # wait for it, then click 
 differences, `grayscale=True`, `region=`, `d.wait_until_stable()` and
 `d.wait_for_change()` are all there. With an OCR engine installed,
 `d.find_text("Total")`, `d.click_text("Submit")` and `d.read_text(region)` work
-on any pixels. `pypilot[ocr]` installs only `pytesseract` (plus the Tesseract
+on any pixels. `locum[ocr]` installs only `pytesseract` (plus the Tesseract
 binary from your OS); RapidOCR (`pip install rapidocr-onnxruntime`) and EasyOCR
-(`pip install easyocr`) are optional, separate installs that pypilot picks up
+(`pip install easyocr`) are optional, separate installs that locum picks up
 when present.
 
 ### Humanized, layout-independent input
@@ -198,18 +198,18 @@ of those when the exact text matters.
 
 `Desktop(humanize=True)` (or `Humanize(speed=..., jitter=..., seed=...)`) makes
 every move human-like; `pause=` mirrors PyAutoGUI's `PAUSE`. Moving the mouse
-into a screen corner raises `FailSafeTriggered`; `pypilot.install_kill_hotkey()`
+into a screen corner raises `FailSafeTriggered`; `locum.install_kill_hotkey()`
 (needs `pynput`) aborts from anywhere.
 
 ### RPA: robots, work queues, flows, recorder
 
 ```python
 import re
-from pypilot import FailSafeTriggered
-from pypilot.rpa import BusinessException, Robot, WorkQueue
+from locum import FailSafeTriggered
+from locum.rpa import BusinessException, Robot, WorkQueue
 
-robot = Robot(d, name="invoices", run_dir="pypilot_runs")
-queue = WorkQueue("invoices", path="pypilot_runs/invoices.queue.json")   # persistent: runs resume
+robot = Robot(d, name="invoices", run_dir="locum_runs")
+queue = WorkQueue("invoices", path="locum_runs/invoices.queue.json")   # persistent: runs resume
 queue.add({"vendor": "Initech", "invoice_no": "INV-43", "amount": "75"}, reference="Initech|INV-43")
 queue.add({"vendor": "Umbrella", "invoice_no": "INV-44", "amount": "-1"}, reference="Umbrella|INV-44")
 
@@ -248,10 +248,10 @@ print(report.summary(), robot.vars["stats"]["success"], robot.vars["stats"]["bus
 Declarative flows (YAML/JSON) cover the same ground without Python —
 `click, type, set_text, wait, if_exists, for_each (csv/json/items), try/catch,
 repeat, call, read_value, assert_exists, ...` with `${var}` interpolation; see
-[`examples/excel_report_flow.yaml`](examples/excel_report_flow.yaml):
+[`examples/excel_report_flow.yaml`](https://github.com/israerusan/locum/blob/main/examples/excel_report_flow.yaml):
 
 ```python
-from pypilot.rpa import run_flow
+from locum.rpa import run_flow
 
 report = run_flow({"steps": [
     {"set_text": {"target": "edit#vendor", "text": "${vendor}"}},
@@ -260,11 +260,11 @@ report = run_flow({"steps": [
 assert report.ok
 ```
 
-The `Recorder` turns live input (or anything pypilot itself does) into flows
+The `Recorder` turns live input (or anything locum itself does) into flows
 or Python **with selectors instead of coordinates**:
 
 ```python
-from pypilot.rpa import Recorder
+from locum.rpa import Recorder
 
 rec = Recorder(d).start(source="backend")       # "auto" = global hooks via pynput
 d.click("edit#due_date")
@@ -276,7 +276,7 @@ print(rec.to_python())                          # d.click('window "Invoice Entry
 ### LLM control: tools, computer use, MCP, agents
 
 ```python
-from pypilot.llm import DesktopToolkit, Policy
+from locum.llm import DesktopToolkit, Policy
 
 kit = DesktopToolkit(d, policy=Policy())        # every call is policy-checked and audited
 tools = kit.to_anthropic()                      # also .to_openai() / .to_mcp()
@@ -288,8 +288,8 @@ print(kit.call("click", {"selector": 'button "Submit Payment"'}).is_error)   # T
 
 <!-- norun -->
 ```python
-from pypilot import Desktop
-from pypilot.llm import Agent, AuditLog, Policy, console_confirm
+from locum import Desktop
+from locum.llm import Agent, AuditLog, Policy, console_confirm
 
 agent = Agent(Desktop(), policy=Policy(confirm=console_confirm), audit=AuditLog("audit.jsonl"))
 result = agent.run("Open the Q3 report in Excel and e-mail the totals to Dana")
@@ -300,20 +300,20 @@ print(result.success, result.final_text)
   selectors, OCR, keyboard/mouse, windows, apps, clipboard, and a `done` tool.
 * `mode="computer_use"` uses Claude's computer-use toolset, executed by
   `ComputerUseAdapter` (screenshot scaling and coordinate mapping included).
-* `pypilot mcp` exposes the same tools to Claude Desktop, Claude Code or any
-  MCP client — config in [`examples/mcp_config.json`](examples/mcp_config.json):
+* `locum mcp` exposes the same tools to Claude Desktop, Claude Code or any
+  MCP client — config in [`examples/mcp_config.json`](https://github.com/israerusan/locum/blob/main/examples/mcp_config.json):
 
 ```json
-{"mcpServers": {"pypilot": {"command": "pypilot", "args": ["mcp", "--policy", "default"]}}}
+{"mcpServers": {"locum": {"command": "locum", "args": ["mcp", "--policy", "default"]}}}
 ```
 
-or `claude mcp add pypilot -- pypilot mcp --policy default` for Claude Code.
-Details, prompting tips and the safety model: [`docs/LLM.md`](docs/LLM.md).
+or `claude mcp add locum -- locum mcp --policy default` for Claude Code.
+Details, prompting tips and the safety model: [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md).
 
 ### Safety policy
 
 ```python
-from pypilot.llm import CARD_NUMBER, Policy
+from locum.llm import CARD_NUMBER, Policy
 
 policy = Policy(
     allowed_apps=["erp", "excel"],              # act (and launch) only inside these apps
@@ -351,13 +351,13 @@ keys and Enter/Space on the control it names; application shortcuts such as
 Escape, F-keys or Alt+F4 need a `keys=` rule. Robots and flows are gated only when
 you pass a policy (`Robot(policy=...)`, `run_flow(..., policy=...)`); without one
 they run ungated as before. Text typed into password fields is masked in audit
-logs and recordings. Details: [`docs/LLM.md`](docs/LLM.md#6-safety-model).
+logs and recordings. Details: [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md#6-safety-model).
 
 ### PyAutoGUI compatibility
 
 <!-- norun -->
 ```python
-import pypilot.compat.pyautogui as pyautogui    # was: import pyautogui
+import locum.compat.pyautogui as pyautogui    # was: import pyautogui
 
 pyautogui.moveTo(100, 200, duration=0.5, tween=pyautogui.easeInOutQuad)
 pyautogui.write("Hello!\n", interval=0.05)
@@ -365,18 +365,18 @@ box = pyautogui.locateOnScreen("button.png", confidence=0.9)
 pyautogui.click(pyautogui.center(box))
 ```
 
-See [`examples/pyautogui_migration.py`](examples/pyautogui_migration.py) for
+See [`examples/pyautogui_migration.py`](https://github.com/israerusan/locum/blob/main/examples/pyautogui_migration.py) for
 the before/after.
 
 ## How it compares
 
-|                                   | PyAutoGUI | UiPath | **pypilot** |
+|                                   | PyAutoGUI | UiPath | **locum** |
 |-----------------------------------|:---------:|:------:|:-----------:|
 | Mouse/keyboard/screenshots        | ✓ | ✓ | ✓ |
 | Accessibility selectors (UIA/AX/AT-SPI) | — | ✓ (Windows-first) | ✓ |
 | UiPath-style XML selectors        | — | ✓ | ✓ (compatible subset) |
 | Template matching w/ alpha masks, multi-scale | confidence needs OpenCV | ✓ | ✓ (numpy; OpenCV optional) |
-| OCR                               | — | ✓ | pluggable: Tesseract via `pypilot[ocr]`; RapidOCR / EasyOCR as separate installs |
+| OCR                               | — | ✓ | pluggable: Tesseract via `locum[ocr]`; RapidOCR / EasyOCR as separate installs |
 | Native invoke / set-value (works when covered) | — | ✓ | ✓ |
 | Humanized motion, Unicode typing  | partial | — | ✓ |
 | Robots, retries, evidence reports | — | ✓ | ✓ (code-first) |
@@ -388,9 +388,9 @@ the before/after.
 
 UiPath is a full enterprise platform — Studio's visual designer, Orchestrator
 scheduling and credential vaults, Action Center, governance and vendor
-support. pypilot does not replace that; it is a **code-first, free,
+support. locum does not replace that; it is a **code-first, free,
 LLM-native** library for developers who want UiPath-grade robustness inside
-plain Python. Full write-up: [`docs/COMPARISON.md`](docs/COMPARISON.md).
+plain Python. Full write-up: [`docs/COMPARISON.md`](https://github.com/israerusan/locum/blob/main/docs/COMPARISON.md).
 
 ## Platform details
 
@@ -399,7 +399,7 @@ backend uses.
 
 | Platform | Input | Screenshots | Windows | Accessibility | Notes |
 |----------|-------|-------------|---------|---------------|-------|
-| Windows 10/11 | SendInput (Unicode, DPI-aware, multi-monitor) | mss / GDI | Win32 | **UI Automation** (comtypes) | run as the same integrity level as the target app (UAC); text pypilot puts on the clipboard is kept out of Clipboard History (Win+V) and cloud sync (`WindowsBackend(clipboard_history=True)` allows it) |
+| Windows 10/11 | SendInput (Unicode, DPI-aware, multi-monitor) | mss / GDI | Win32 | **UI Automation** (comtypes) | run as the same integrity level as the target app (UAC); text locum puts on the clipboard is kept out of Clipboard History (Win+V) and cloud sync (`WindowsBackend(clipboard_history=True)` allows it) |
 | macOS 12+ | Quartz events | Quartz (Retina-aware) | Quartz / AppKit | **AX API** | needs Accessibility + Screen Recording permission; not yet validated on a real Mac |
 | Linux X11 | XTEST (Unicode via spare keycodes) | mss / XGetImage | EWMH | **AT-SPI** (PyGObject) | native X11 clipboard (xclip/xsel optional) |
 | Linux Wayland | XWayland apps only | XWayland only | XWayland only | AT-SPI works | see below |
@@ -422,7 +422,7 @@ ScreenCast) support is not implemented yet.
   the agent into the applications the task needs, and `dry_run=True` to
   rehearse.
 * Keep the fail-safe on (mouse to a corner aborts) and arm the kill hotkey
-  (`pypilot --kill-hotkey agent ...` or `install_kill_hotkey()`).
+  (`locum --kill-hotkey agent ...` or `install_kill_hotkey()`).
 * Treat on-screen text as untrusted: a web page or document can contain
   instructions aimed at the model (prompt injection). The policy enforces
   limits regardless of what the model was told.
@@ -432,7 +432,7 @@ ScreenCast) support is not implemented yet.
 ## CLI
 
 ```text
-pypilot [--backend NAME] [--timeout S] [--json] [--no-failsafe] [--humanize] [--kill-hotkey] COMMAND
+locum [--backend NAME] [--timeout S] [--json] [--no-failsafe] [--humanize] [--kill-hotkey] COMMAND
   info | screenshot [-o PNG] [--region L,T,W,H] [--monitor N] | windows | tree [--window T] [--depth N] [--all]
   find SELECTOR [--all] | click TARGET | move TARGET | type TEXT [-e] [--into SEL] | hotkey COMBO | press KEY...
   scroll DY [--at TARGET] | wait SELECTOR [--state S] | locate IMAGE [--confidence C] [--click]
@@ -450,14 +450,14 @@ Exit codes: 0 ok · 1 failed (not found, timeout, policy, failed flow/agent) ·
 
 | File | What it shows |
 |------|---------------|
-| [`basic_automation.py`](examples/basic_automation.py) | windows, selectors, typing, screenshots, template matching |
-| [`sap_style_data_entry.py`](examples/sap_style_data_entry.py) | robot + CSV work queue entering invoices via selectors, business exceptions, reports |
-| [`excel_report_flow.yaml`](examples/excel_report_flow.yaml) | YAML flow filling a spreadsheet from CSV |
-| [`llm_agent.py`](examples/llm_agent.py) | Claude agent with a policy, confirmation callback and audit log |
-| [`mcp_config.json`](examples/mcp_config.json) | Claude Desktop / Claude Code MCP configuration |
-| [`pyautogui_migration.py`](examples/pyautogui_migration.py) | one-line PyAutoGUI switch, then the upgrade |
+| [`basic_automation.py`](https://github.com/israerusan/locum/blob/main/examples/basic_automation.py) | windows, selectors, typing, screenshots, template matching |
+| [`sap_style_data_entry.py`](https://github.com/israerusan/locum/blob/main/examples/sap_style_data_entry.py) | robot + CSV work queue entering invoices via selectors, business exceptions, reports |
+| [`excel_report_flow.yaml`](https://github.com/israerusan/locum/blob/main/examples/excel_report_flow.yaml) | YAML flow filling a spreadsheet from CSV |
+| [`llm_agent.py`](https://github.com/israerusan/locum/blob/main/examples/llm_agent.py) | Claude agent with a policy, confirmation callback and audit log |
+| [`mcp_config.json`](https://github.com/israerusan/locum/blob/main/examples/mcp_config.json) | Claude Desktop / Claude Code MCP configuration |
+| [`pyautogui_migration.py`](https://github.com/israerusan/locum/blob/main/examples/pyautogui_migration.py) | one-line PyAutoGUI switch, then the upgrade |
 
-All of them run on the demo desktop: `PYPILOT_BACKEND=mock python examples/<file>`.
+All of them run on the demo desktop: `LOCUM_BACKEND=mock python examples/<file>`.
 
 ## License
 

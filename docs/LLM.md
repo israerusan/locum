@@ -1,13 +1,13 @@
 # Driving the desktop with an LLM
 
-pypilot gives a language model three ways to operate a computer, all behind
+locum gives a language model three ways to operate a computer, all behind
 the same safety policy and audit log:
 
 | Way | What the model gets | Best for |
 |-----|---------------------|----------|
 | **Tools** (`DesktopToolkit`, `Agent(mode="tools")`) | numbered elements + annotated screenshot, then `click(element_id=7)`, `set_value`, `type_text`, `hotkey`, `find_elements`, `wait_for`, OCR, windows, apps, clipboard | apps with an accessibility tree (most Windows/macOS business apps, Office, browsers, GTK/Qt). Cheapest and most reliable. |
 | **Computer use** (`ComputerUseAdapter`, `Agent(mode="computer_use")`) | Claude's native computer-use toolset: screenshots and pixel actions | canvas apps, games, remote desktops (Citrix/RDP), anything without accessibility |
-| **MCP** (`pypilot mcp`) | the tools above over the Model Context Protocol | Claude Desktop, Claude Code, IDE agents — no Python glue |
+| **MCP** (`locum mcp`) | the tools above over the Model Context Protocol | Claude Desktop, Claude Code, IDE agents — no Python glue |
 
 The examples below run on the built-in demo desktop
 (`d = Desktop(DemoBackend())`, see the README quickstart); swap in `Desktop()`
@@ -17,9 +17,9 @@ test-suite.
 ## 1. Observations: set-of-marks
 
 ```python
-from pypilot import Desktop
-from pypilot.cli import DemoBackend
-from pypilot.llm import observe
+from locum import Desktop
+from locum.cli import DemoBackend
+from locum.llm import observe
 
 d = Desktop(DemoBackend())
 obs = observe(d, max_long_edge=1280)            # screenshot + numbered interactive elements
@@ -40,13 +40,13 @@ png_b64 = obs.image_base64(annotated=True)     # numbered boxes drawn on every e
 * `observe(d, window="Invoice Entry*")` restricts the view (and the screenshot)
   to one window; `interactive_only=False` adds labels and static text.
 
-From the shell: `pypilot observe --screenshot marks.png` prints exactly what
+From the shell: `locum observe --screenshot marks.png` prints exactly what
 the model will read and saves the annotated image.
 
 ## 2. The desktop toolkit
 
 ```python
-from pypilot.llm import AuditLog, DesktopToolkit, Policy
+from locum.llm import AuditLog, DesktopToolkit, Policy
 
 audit = AuditLog()                              # AuditLog("audit.jsonl") to persist
 kit = DesktopToolkit(d, policy=Policy(), audit=audit)
@@ -74,7 +74,7 @@ Schemas for any provider: `kit.to_anthropic()` (`name/description/input_schema`)
 ### Your own tools
 
 ```python
-from pypilot.llm import ToolRegistry
+from locum.llm import ToolRegistry
 
 reg = ToolRegistry()
 
@@ -104,8 +104,8 @@ every call. In `mode="tools"` the computer-use toolset is not offered, and a
 
 <!-- norun -->
 ```python
-from pypilot import Desktop
-from pypilot.llm import Agent, AuditLog, Policy, console_confirm
+from locum import Desktop
+from locum.llm import Agent, AuditLog, Policy, console_confirm
 
 agent = Agent(
     Desktop(),
@@ -148,7 +148,7 @@ SDK objects or plain dicts — your own gateway, a proxy, or `ScriptedClient`
 for **offline evaluations**:
 
 ```python
-from pypilot.llm import Agent, Policy, ScriptedClient, scripted_response, tool_use_block
+from locum.llm import Agent, Policy, ScriptedClient, scripted_response, tool_use_block
 
 client = ScriptedClient([
     scripted_response("Filling the form.",
@@ -169,7 +169,7 @@ runs: record the transcript, assert on `d.backend.invoices` and the audit log.
 ## 4. Computer use
 
 ```python
-from pypilot.llm import ComputerUseAdapter, computer_block
+from locum.llm import ComputerUseAdapter, computer_block
 
 cu = ComputerUseAdapter(d, max_long_edge=1280)
 print(cu.tool_definition())                   # {'type': 'computer_toolset_20260801'}
@@ -197,7 +197,7 @@ every key or typed piece that follows a key that may have moved focus: `"Tab
 Return"` or typed `"1000\t\n"` that lands on a "Pay" button needs the same
 confirmation as clicking it. A single combination that mixes Enter/Space with
 another key (`tab+Return`) is rejected.
-Screenshots are downscaled by pypilot (long edge ≤ 2576 px and ≤ 4784 visual
+Screenshots are downscaled by locum (long edge ≤ 2576 px and ≤ 4784 visual
 tokens) and every coordinate is scaled back to physical pixels — on HiDPI and
 multi-monitor setups too. Pick a monitor with `ComputerUseAdapter(d, monitor=1)`.
 
@@ -206,24 +206,24 @@ multi-monitor setups too. Pick a monitor with `ComputerUseAdapter(d, monitor=1)`
 
 ## 5. MCP server
 
-`pypilot mcp` speaks MCP (JSON-RPC 2.0 over stdio, protocol `2025-06-18`) with
+`locum mcp` speaks MCP (JSON-RPC 2.0 over stdio, protocol `2025-06-18`) with
 no extra dependencies. Claude Desktop (`claude_desktop_config.json`) or Claude
 Code (`.mcp.json`):
 
 ```json
 {
   "mcpServers": {
-    "pypilot": {
-      "command": "pypilot",
-      "args": ["mcp", "--policy", "default", "--audit", "~/.pypilot/mcp-audit.jsonl"]
+    "locum": {
+      "command": "locum",
+      "args": ["mcp", "--policy", "default", "--audit", "~/.locum/mcp-audit.jsonl"]
     }
   }
 }
 ```
 
-or `claude mcp add pypilot -- pypilot mcp --policy default`. If `pypilot` is
+or `claude mcp add locum -- locum mcp --policy default`. If `locum` is
 not on the client's `PATH`, use the interpreter: `"command": "/path/to/python",
-"args": ["-m", "pypilot", "mcp"]`. Add `--backend mock` for a sandbox the
+"args": ["-m", "locum", "mcp"]`. Add `--backend mock` for a sandbox the
 model can practice on, `--dry-run` to rehearse, `--policy strict` for
 unattended use, `--allow-app excel` to fence it in.
 
@@ -236,7 +236,7 @@ arrive intact on Windows too.
 In-process (tests, custom transports):
 
 ```python
-from pypilot.llm import MCPServer
+from locum.llm import MCPServer
 
 server = MCPServer(d)
 init = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -269,8 +269,8 @@ authorization mechanism. For payments, postings, deletions and submissions,
 use allow-list mode.
 
 ```python
-from pypilot import PolicyViolation
-from pypilot.llm import CARD_NUMBER, DesktopToolkit, Policy
+from locum import PolicyViolation
+from locum.llm import CARD_NUMBER, DesktopToolkit, Policy
 
 asked = []
 policy = Policy(
@@ -305,8 +305,8 @@ screenshot, find, list windows, read text/clipboard, wait) are never gated;
 moving the pointer, scrolling and focusing a window are not consequential.
 
 ```python
-from pypilot.llm import DesktopToolkit, Policy
-from pypilot.llm.safety import AllowRule
+from locum.llm import DesktopToolkit, Policy
+from locum.llm.safety import AllowRule
 
 decided = []
 policy = Policy(
@@ -365,8 +365,8 @@ or inside a Robot task that wraps it in another error). Without a policy
 (the default) RPA is not gated at all, exactly as before.
 
 ```python
-from pypilot.llm import AuditLog, Policy
-from pypilot.rpa import run_flow
+from locum.llm import AuditLog, Policy
+from locum.rpa import run_flow
 
 audit = AuditLog()
 report = run_flow(
@@ -423,8 +423,8 @@ nobody authorized; it is not a sandbox against code that reaches
   `ToolSpec.from_function(fn, confirm=True)` makes every call need a human.
 * **Passwords.** Text typed into a password field (UIA `IsPassword`, AT-SPI
   `password text`, macOS secure text fields) is written as `***` in the audit
-  log and tool results, and the `Recorder` saves `${env.PYPILOT_PASSWORD}`
-  (`os.environ["PYPILOT_PASSWORD"]` in scripts) instead of the text.
+  log and tool results, and the `Recorder` saves `${env.LOCUM_PASSWORD}`
+  (`os.environ["LOCUM_PASSWORD"]` in scripts) instead of the text.
 * **Applications.** `allowed_apps`/`blocked_apps` judge the application the
   input really reaches: the element acted on, the focused control for keyboard
   input, the window under the pointer (the active window only when no target
@@ -468,6 +468,6 @@ audit log. Run unattended agents in a VM or a dedicated account.
   says Saved and call done".
 * Name applications and windows as they appear in the title bar.
 * Prefer tools mode for business apps; switch to `computer_use` (or mix in
-  `extra_tools`) when `pypilot observe` shows no useful elements.
+  `extra_tools`) when `locum observe` shows no useful elements.
 * Keep tasks small and chain them in a `Robot` — retries, evidence screenshots
   and reports come for free.

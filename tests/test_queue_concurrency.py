@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from pypilot.rpa.queue import IN_PROGRESS, NEW, SUCCESS, WorkQueue
+from locum.rpa.queue import IN_PROGRESS, NEW, SUCCESS, WorkQueue
 
 sys.path.insert(0, os.path.dirname(__file__))
 import _queue_workers  # noqa: E402

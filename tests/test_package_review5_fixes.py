@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import ActionTimeout, ElementNotFound
-from pypilot.llm.agent import Agent, ScriptedClient, scripted_response, tool_use_block
-from pypilot.llm.safety import Policy
-from pypilot.rpa import WorkQueue
-from pypilot.rpa.flow import run_flow
-from pypilot.types import Monitor, Point, Rect
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import ActionTimeout, ElementNotFound
+from locum.llm.agent import Agent, ScriptedClient, scripted_response, tool_use_block
+from locum.llm.safety import Policy
+from locum.rpa import WorkQueue
+from locum.rpa.flow import run_flow
+from locum.types import Monitor, Point, Rect
 
 
 def _noop(_s):

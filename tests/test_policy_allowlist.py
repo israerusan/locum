@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import PolicyViolation
-from pypilot.llm.agent import Agent, ScriptedClient, scripted_response, text_block, tool_use_block
-from pypilot.llm.computer_use import ComputerUseAdapter
-from pypilot.llm.safety import READ_ONLY_TOOLS, AllowRule, AuditLog, Policy, keys_navigate_only
-from pypilot.llm.tools import DesktopToolkit, ToolSpec
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import PolicyViolation
+from locum.llm.agent import Agent, ScriptedClient, scripted_response, text_block, tool_use_block
+from locum.llm.computer_use import ComputerUseAdapter
+from locum.llm.safety import READ_ONLY_TOOLS, AllowRule, AuditLog, Policy, keys_navigate_only
+from locum.llm.tools import DesktopToolkit, ToolSpec
 
 
 def _fake_time():

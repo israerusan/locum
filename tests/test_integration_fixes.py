@@ -12,18 +12,18 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot._nodeinfo import ancestors, node_app, owning_window, window_at
-from pypilot.backends.mock import MockBackend, MockNode
-from pypilot.desktop import Desktop
-from pypilot.element import add_action_listener, remove_action_listener
-from pypilot.errors import ElementNotFound
-from pypilot.llm.agent import Agent
-from pypilot.llm.computer_use import ComputerUseAdapter
-from pypilot.llm.safety import Policy, keys_activate
-from pypilot.llm.tools import DesktopToolkit
-from pypilot.rpa.flow import run_flow
-from pypilot.rpa.recorder import Recorder
-from pypilot.types import Point
+from locum._nodeinfo import ancestors, node_app, owning_window, window_at
+from locum.backends.mock import MockBackend, MockNode
+from locum.desktop import Desktop
+from locum.element import add_action_listener, remove_action_listener
+from locum.errors import ElementNotFound
+from locum.llm.agent import Agent
+from locum.llm.computer_use import ComputerUseAdapter
+from locum.llm.safety import Policy, keys_activate
+from locum.llm.tools import DesktopToolkit
+from locum.rpa.flow import run_flow
+from locum.rpa.recorder import Recorder
+from locum.types import Point
 
 
 @pytest.fixture
@@ -190,7 +190,7 @@ def test_policy_target_apps_context():
 
 
 def test_agent_policy_rebinds_prepared_toolkit_and_computer():
-    from pypilot.llm import ScriptedClient, computer_block, scripted_response, tool_use_block
+    from locum.llm import ScriptedClient, computer_block, scripted_response, tool_use_block
 
     be, d, paid = payment_form()
     kit = DesktopToolkit(d, find_timeout=0)

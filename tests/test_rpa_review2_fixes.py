@@ -7,13 +7,13 @@ import threading
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import FailSafeTriggered
-from pypilot.rpa import Robot, WorkQueue
-from pypilot.rpa.queue import FAILED as Q_FAILED
-from pypilot.rpa.queue import NEW
-from pypilot.rpa.report import FAILED, PASSED, SKIPPED
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import FailSafeTriggered
+from locum.rpa import Robot, WorkQueue
+from locum.rpa.queue import FAILED as Q_FAILED
+from locum.rpa.queue import NEW
+from locum.rpa.report import FAILED, PASSED, SKIPPED
 
 
 class FakeClock:
@@ -218,7 +218,7 @@ def test_retried_step_return_and_break_still_pass(tmp_path):
 
 # ------------------------------------------------------ abort during retry wait
 def test_abort_during_task_retry_wait_fails_task(tmp_path):
-    from pypilot import failsafe as fs
+    from locum import failsafe as fs
 
     d = Desktop(MockBackend(width=800, height=600))
     r = Robot(d, name="r3", run_dir=tmp_path, save_reports=False, screenshot_on_error=False)

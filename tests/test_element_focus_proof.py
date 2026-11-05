@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot import Desktop
-from pypilot.backends.mock import MockBackend, MockNode
-from pypilot.element import Element
-from pypilot.errors import ElementNotFound
-from pypilot.types import MouseButton
+from locum import Desktop
+from locum.backends.mock import MockBackend, MockNode
+from locum.element import Element
+from locum.errors import ElementNotFound
+from locum.types import MouseButton
 
 
 class FakeTime:

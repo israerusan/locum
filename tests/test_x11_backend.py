@@ -23,8 +23,8 @@ from Xlib import X, Xatom  # noqa: E402
 from Xlib import display as xdisplay  # noqa: E402
 from Xlib import error as xerror  # noqa: E402
 
-from pypilot.backends import create_backend  # noqa: E402
-from pypilot.backends.base import (  # noqa: E402
+from locum.backends import create_backend  # noqa: E402
+from locum.backends.base import (  # noqa: E402
     CAP_ACCESSIBILITY,
     CAP_CLIPBOARD,
     CAP_HSCROLL,
@@ -35,7 +35,7 @@ from pypilot.backends.base import (  # noqa: E402
     CAP_WINDOWS,
     ROLES,
 )
-from pypilot.backends.x11 import (  # noqa: E402
+from locum.backends.x11 import (  # noqa: E402
     BUTTONS,
     KEYSYMS,
     AtspiNode,
@@ -45,9 +45,9 @@ from pypilot.backends.x11 import (  # noqa: E402
     key_to_keysym,
     map_atspi_role,
 )
-from pypilot.errors import BackendError, BackendUnavailable, NotSupported, WindowNotFound  # noqa: E402
-from pypilot.keys import KEYS  # noqa: E402
-from pypilot.types import MouseButton, Rect  # noqa: E402
+from locum.errors import BackendError, BackendUnavailable, NotSupported, WindowNotFound  # noqa: E402
+from locum.keys import KEYS  # noqa: E402
+from locum.types import MouseButton, Rect  # noqa: E402
 
 
 # =============================================================================== pure tests
@@ -328,7 +328,7 @@ def test_atspi_node_properties_and_actions():
 
 def test_atspi_nodes_expose_app_for_selectors():
     """``[app=...]`` selectors must match AT-SPI nodes (regression: no 'app' attribute before)."""
-    from pypilot.selectors import parse
+    from locum.selectors import parse
 
     # pid of this very process -> /proc/<pid>/comm is the process name, like list_windows() reports.
     me = os.getpid()
@@ -402,7 +402,7 @@ def _pixel(d, rgb):
     return put(rgb[0], visual.red_mask) | put(rgb[1], visual.green_mask) | put(rgb[2], visual.blue_mask)
 
 
-def make_window(d, rect, rgb=(200, 30, 90), title="pypilot-x11-test", event_mask=0, delete_protocol=True):
+def make_window(d, rect, rgb=(200, 30, 90), title="locum-x11-test", event_mask=0, delete_protocol=True):
     scr = d.screen()
     x, y, w, h = rect
     win = scr.root.create_window(
@@ -411,7 +411,7 @@ def make_window(d, rect, rgb=(200, 30, 90), title="pypilot-x11-test", event_mask
     )
     win.set_wm_name(title)
     win.change_property(d.intern_atom("_NET_WM_NAME"), d.intern_atom("UTF8_STRING"), 8, title.encode("utf-8"))
-    win.set_wm_class("pypilottest", "PypilotTest")
+    win.set_wm_class("locumtest", "LocumTest")
     win.change_property(d.intern_atom("_NET_WM_PID"), Xatom.CARDINAL, 32, [os.getpid()])
     if delete_protocol:
         win.set_wm_protocols([d.intern_atom("WM_DELETE_WINDOW")])
@@ -763,17 +763,17 @@ def test_monitors(be, xc):
 
 @pytest.mark.x11
 def test_list_and_manage_windows_without_wm(be, xc):
-    win = make_window(xc, (60, 70, 210, 110), title="pypilot ü window")
-    other = make_window(xc, (400, 300, 100, 100), title="pypilot other", delete_protocol=False)
+    win = make_window(xc, (60, 70, 210, 110), title="locum ü window")
+    other = make_window(xc, (400, 300, 100, 100), title="locum other", delete_protocol=False)
     try:
         wins = be.list_windows()
         mine = [w for w in wins if w.handle == win.id]
         assert mine, wins
         info = mine[0]
-        assert info.title == "pypilot ü window"
+        assert info.title == "locum ü window"
         assert info.rect == Rect(60, 70, 210, 110)
         assert info.pid == os.getpid()
-        assert info.class_name == "PypilotTest"
+        assert info.class_name == "LocumTest"
         assert info.app  # process name from /proc or WM_CLASS
         assert info.is_visible and not info.is_minimized
         # z-order: the most recently mapped window is on top
@@ -836,7 +836,7 @@ def test_list_and_manage_windows_without_wm(be, xc):
 @pytest.mark.x11
 def test_ewmh_window_properties(be, xc):
     """Simulate the EWMH properties a window manager would publish."""
-    win = make_window(xc, (90, 90, 160, 100), title="pypilot ewmh")
+    win = make_window(xc, (90, 90, 160, 100), title="locum ewmh")
     root = xc.screen().root
     check = root.create_window(-10, -10, 1, 1, 0, X.CopyFromParent)
     atom = xc.intern_atom
@@ -1093,7 +1093,7 @@ def test_garbage_collected_backend_releases_connections_and_clipboard_thread(xvf
     import gc
 
     def clip_threads():
-        return sum(1 for t in threading.enumerate() if t.name == "pypilot-x11-clipboard")
+        return sum(1 for t in threading.enumerate() if t.name == "locum-x11-clipboard")
 
     gc.collect()
     sockets, threads = _socket_fds(), clip_threads()
@@ -1114,7 +1114,7 @@ def test_garbage_collected_backend_releases_connections_and_clipboard_thread(xvf
 def test_native_clipboard_serves_large_text_incrementally(xvfb_display):
     """Texts larger than one X request are served with the INCR protocol (other
     applications used to receive nothing while set_clipboard reported success)."""
-    from pypilot.backends._x11clip import X11Clipboard
+    from locum.backends._x11clip import X11Clipboard
 
     owner = X11Backend(xvfb_display, clipboard_tool="native", accessibility=False)
     reader = X11Clipboard(xvfb_display)
@@ -1132,7 +1132,7 @@ def test_native_clipboard_serves_large_text_incrementally(xvfb_display):
 def test_native_clipboard_stale_selection_clear_keeps_new_text(xvfb_display):
     """Another app copies, then we copy again before our serving thread handled the
     SelectionClear of the first loss: the stale event must not erase the new text."""
-    from pypilot.backends._x11clip import X11Clipboard
+    from locum.backends._x11clip import X11Clipboard
 
     ours, other, reader = X11Clipboard(xvfb_display), X11Clipboard(xvfb_display), X11Clipboard(xvfb_display)
     try:
@@ -1312,7 +1312,7 @@ def test_bordered_window_rect_round_trips_without_wm(be, xc):
     own rect is a no-op and maximize -> normal restores the original rect."""
     scr = xc.screen()
     win = scr.root.create_window(100, 100, 240, 130, 3, scr.root_depth, X.InputOutput, X.CopyFromParent)
-    win.set_wm_name("pypilot-border-test")
+    win.set_wm_name("locum-border-test")
     win.map()
     xc.sync()
     time.sleep(0.1)

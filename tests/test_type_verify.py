@@ -10,9 +10,9 @@ from __future__ import annotations
 import pytest
 
 from _stub_desktop import StubDesktop
-from pypilot.backends.mock import MockBackend
-from pypilot.element import _repair_candidates, _typed_into
-from pypilot.errors import ActionTimeout
+from locum.backends.mock import MockBackend
+from locum.element import _repair_candidates, _typed_into
+from locum.errors import ActionTimeout
 
 
 class GarblingBackend(MockBackend):
@@ -160,7 +160,7 @@ def test_type_accepts_autocomplete_masks_and_case(completing, behaviour, typed, 
 
 
 def test_looks_reformatted():
-    from pypilot.element import _looks_reformatted
+    from locum.element import _looks_reformatted
 
     assert _looks_reformatted("", "google.com", "goo")
     assert _looks_reformatted("x ", "x (555) 123-4", "5551234")
@@ -171,7 +171,7 @@ def test_looks_reformatted():
 # -------------------------------------------------------------- Desktop.type
 @pytest.fixture
 def real():
-    from pypilot import Desktop
+    from locum import Desktop
 
     be = GarblingBackend(width=1280, height=800)
     d = Desktop(be, sleep=lambda s: None, default_timeout=0)

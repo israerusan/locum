@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.element import Element
-from pypilot.errors import PolicyViolation
-from pypilot.llm.safety import AuditLog, GuardedDesktop, GuardedElement, GuardedWindow, Policy
-from pypilot.rpa import FlowRunner, Robot, RunReport, run_flow
-from pypilot.rpa.report import FAILED
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.element import Element
+from locum.errors import PolicyViolation
+from locum.llm.safety import AuditLog, GuardedDesktop, GuardedElement, GuardedWindow, Policy
+from locum.rpa import FlowRunner, Robot, RunReport, run_flow
+from locum.rpa.report import FAILED
 
 
 class _Backend(MockBackend):

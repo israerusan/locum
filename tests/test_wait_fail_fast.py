@@ -9,11 +9,11 @@ from __future__ import annotations
 import pytest
 from PIL import Image
 
-from pypilot import failsafe as fs_mod
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.element import Element
-from pypilot.errors import (
+from locum import failsafe as fs_mod
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.element import Element
+from locum.errors import (
     ActionTimeout,
     AmbiguousElement,
     BackendError,
@@ -24,12 +24,12 @@ from pypilot.errors import (
     NotSupported,
     PermissionDenied,
     PolicyViolation,
-    PypilotError,
+    LocumError,
     SelectorSyntaxError,
     WindowNotFound,
     is_transient,
 )
-from pypilot.wait import wait_until
+from locum.wait import wait_until
 
 
 class FakeTime:
@@ -120,7 +120,7 @@ def test_transient_flag_overrides_the_type_rule():
     assert is_transient(RuntimeError("x")) is False
     assert is_transient(BackendError("UI busy", transient=True)) is True
     assert is_transient(BackendError("driver crashed", transient=False)) is False
-    err = PypilotError("x")
+    err = LocumError("x")
     err.transient = True
     assert is_transient(err) is True
     # stop requests can never be marked retryable
@@ -216,7 +216,7 @@ def test_window_not_found_still_waits(d, ft):
 
 
 def test_scoped_element_find_fails_fast_on_programming_error(d, ft, monkeypatch):
-    from pypilot.selectors import Selector
+    from locum.selectors import Selector
 
     root = d.window("Invoice Editor", timeout=0).element
 
@@ -230,7 +230,7 @@ def test_scoped_element_find_fails_fast_on_programming_error(d, ft, monkeypatch)
 
 
 def test_scoped_element_find_retries_transient_errors(d, ft, monkeypatch):
-    from pypilot.selectors import Selector
+    from locum.selectors import Selector
 
     root = d.window("Invoice Editor", timeout=0).element
     orig = Selector.find_first
@@ -318,7 +318,7 @@ def test_locate_not_found_still_returns_none_after_timeout(d, ft):
     assert ft.now == pytest.approx(1.0)
 
 
-# ----------------------------------------------------- pypilot.wait.wait_until
+# ----------------------------------------------------- locum.wait.wait_until
 def test_wait_until_transient_mode():
     with pytest.raises(TypeError):
         wait_until(lambda: len(None), timeout=5, ignore_exceptions="transient", sleep=lambda s: None)

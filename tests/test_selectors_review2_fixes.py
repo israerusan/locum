@@ -17,12 +17,12 @@ import os
 
 import pytest
 
-from pypilot import Desktop
-from pypilot.backends.base import AccessibleNode
-from pypilot.backends.mock import MockBackend
-from pypilot.cli import main
-from pypilot.errors import SelectorSyntaxError
-from pypilot.selectors import describe_node, parse, selector_for
+from locum import Desktop
+from locum.backends.base import AccessibleNode
+from locum.backends.mock import MockBackend
+from locum.cli import main
+from locum.errors import SelectorSyntaxError
+from locum.selectors import describe_node, parse, selector_for
 
 
 def _noop(_s: float) -> None:
@@ -86,8 +86,8 @@ def test_selector_for_explicit_root_still_honoured():
 def test_selector_for_round_trips_on_fake_atspi(xvfb_display):
     from Xlib import display as xdisplay
 
-    from pypilot.backends.x11 import X11Backend
-    from pypilot.rpa.recorder import Recorder
+    from locum.backends.x11 import X11Backend
+    from locum.rpa.recorder import Recorder
     from test_x11_backend import build_fake_tree, make_fake_atspi, make_window
 
     xc = xdisplay.Display(xvfb_display)

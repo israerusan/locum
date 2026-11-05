@@ -8,12 +8,12 @@ import threading
 
 import pytest
 
-import pypilot.rpa.queue as queue_mod
-from pypilot.rpa.queue import FAILED, IN_PROGRESS, NEW, SUCCESS, WorkQueue
+import locum.rpa.queue as queue_mod
+from locum.rpa.queue import FAILED, IN_PROGRESS, NEW, SUCCESS, WorkQueue
 
-# A queue file exactly as pypilot 0.1.0 (before leases) wrote it.
+# A queue file exactly as locum 0.1.0 (before leases) wrote it.
 OLD_FORMAT = {
-    "format": "pypilot.workqueue",
+    "format": "locum.workqueue",
     "version": 1,
     "name": "legacy",
     "created_at": 1700000000.0,

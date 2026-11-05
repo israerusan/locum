@@ -25,8 +25,8 @@ def test_headline_does_not_claim_equal_support_on_all_platforms():
 
 def test_ocr_extra_is_described_as_pytesseract_only():
     assert "pluggable (Tesseract, RapidOCR, EasyOCR)" not in README
-    assert "`pypilot[ocr]` installs only `pytesseract`" in README
-    from pypilot import ocr
+    assert "`locum[ocr]` installs only `pytesseract`" in README
+    from locum import ocr
 
     assert "installs only `pytesseract`" in ocr.__doc__
 

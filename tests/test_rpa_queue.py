@@ -5,9 +5,9 @@ import json
 
 import pytest
 
-from pypilot.errors import FailSafeTriggered
-from pypilot.rpa import BusinessException, WorkQueue
-from pypilot.rpa.queue import BUSINESS_EXCEPTION, FAILED, IN_PROGRESS, NEW, SUCCESS, QueueItem
+from locum.errors import FailSafeTriggered
+from locum.rpa import BusinessException, WorkQueue
+from locum.rpa.queue import BUSINESS_EXCEPTION, FAILED, IN_PROGRESS, NEW, SUCCESS, QueueItem
 
 
 def test_add_and_item_access():

@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import PolicyViolation
-from pypilot.llm.safety import (
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import PolicyViolation
+from locum.llm.safety import (
     AuditLog, GuardedDesktop, Policy, combo_acts_on_target, pressed_control, target_identity,
 )
-from pypilot.llm.tools import DesktopToolkit
-from pypilot.rpa import Robot, run_flow
-from pypilot.rpa.flow import FlowStepError
+from locum.llm.tools import DesktopToolkit
+from locum.rpa import Robot, run_flow
+from locum.rpa.flow import FlowStepError
 
 
 class _Backend(MockBackend):
@@ -188,7 +188,7 @@ def test_flow_container_with_retries_does_not_ask_again(app):
 
 
 def test_nested_refusal_detection():
-    from pypilot.rpa.flow import _is_refusal
+    from locum.rpa.flow import _is_refusal
 
     inner = FlowStepError("inner", original=PolicyViolation("declined"))
     assert _is_refusal(FlowStepError("outer", original=inner))
@@ -246,7 +246,7 @@ class _Leaf:
 
 
 def test_identity_search_fetches_a_bounded_number_of_children():
-    from pypilot.types import Point
+    from locum.types import Point
 
     huge = _Huge()
     assert target_identity(huge, Point(5, 5)) == ""
@@ -254,7 +254,7 @@ def test_identity_search_fetches_a_bounded_number_of_children():
 
 
 def test_identity_search_uses_one_hit_test_when_a_backend_is_given():
-    from pypilot.types import Point
+    from locum.types import Point
 
     huge = _Huge()
     named = _Leaf(huge)

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot import Desktop
-from pypilot.backends.base import AccessibleNode
-from pypilot.backends.mock import MockBackend, MockNode
-from pypilot.element import Element
-from pypilot.errors import ActionTimeout, BackendError, ElementNotFound, ImageNotFound, NotSupported, WindowNotFound
-from pypilot.types import MouseButton
+from locum import Desktop
+from locum.backends.base import AccessibleNode
+from locum.backends.mock import MockBackend, MockNode
+from locum.element import Element
+from locum.errors import ActionTimeout, BackendError, ElementNotFound, ImageNotFound, NotSupported, WindowNotFound
+from locum.types import MouseButton
 
 
 class FakeTime:
@@ -235,7 +235,7 @@ def test_scoped_find_propagates_not_supported_immediately(ft):
 
 
 def test_element_find_propagates_not_supported_immediately(ft, monkeypatch):
-    from pypilot import selectors
+    from locum import selectors
 
     be = MockBackend()
     w = be.add_window("Invoice")
@@ -367,7 +367,7 @@ def test_locate_reports_capture_failure_instead_of_not_found(ft):
 
 # ----------------------------------------------------------------------- compat
 def test_compat_caret_key_types_a_caret(ft):
-    import pypilot.compat.pyautogui as pg
+    import locum.compat.pyautogui as pg
 
     be = MockBackend()
     w = be.add_window("E")

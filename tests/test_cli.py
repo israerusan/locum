@@ -1,4 +1,4 @@
-"""Tests for the ``pypilot`` command line (run in-process on the demo MockBackend)."""
+"""Tests for the ``locum`` command line (run in-process on the demo MockBackend)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import sys
 
 import pytest
 
-from pypilot import cli
-from pypilot.cli import (
+from locum import cli
+from locum.cli import (
     EXIT_ABORTED,
     EXIT_FAILURE,
     EXIT_INTERRUPTED,
@@ -23,9 +23,9 @@ from pypilot.cli import (
     build_parser,
     main,
 )
-from pypilot.desktop import Desktop
-from pypilot.errors import NotSupported
-from pypilot.llm.agent import scripted_response, tool_use_block
+from locum.desktop import Desktop
+from locum.errors import NotSupported
+from locum.llm.agent import scripted_response, tool_use_block
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
@@ -58,7 +58,7 @@ def test_version_and_help():
     code, out, _ = run(["--version"])
     assert code == EXIT_OK
     code, out, _ = run([])
-    assert code == EXIT_USAGE and "usage: pypilot" in out
+    assert code == EXIT_USAGE and "usage: locum" in out
     code, _, _ = run(["--help"])
     assert code == EXIT_OK
 
@@ -78,9 +78,9 @@ def test_every_spec_command_is_registered():
 
 
 def test_python_dash_m_entry_point():
-    proc = subprocess.run([sys.executable, "-m", "pypilot", "--version"], capture_output=True, text=True, timeout=60)
+    proc = subprocess.run([sys.executable, "-m", "locum", "--version"], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0
-    assert "pypilot" in proc.stdout
+    assert "locum" in proc.stdout
 
 
 def test_unknown_backend_is_unavailable():
@@ -102,7 +102,7 @@ def test_backend_mock_builds_the_demo_desktop():
 
 
 def test_env_var_selects_demo_backend(monkeypatch):
-    monkeypatch.setenv("PYPILOT_BACKEND", "mock")
+    monkeypatch.setenv("LOCUM_BACKEND", "mock")
     code, out, _ = run(["windows"])
     assert code == EXIT_OK and "Book1 - Excel" in out
 
@@ -384,7 +384,7 @@ def test_mcp_strict_policy_blocks_launch(desk):
 
 
 def _agent_script():
-    from pypilot.llm.agent import ScriptedClient
+    from locum.llm.agent import ScriptedClient
 
     return ScriptedClient([
         scripted_response("Filling the form.",
@@ -428,14 +428,14 @@ def test_agent_without_sdk_reports_missing_dependency(desk, monkeypatch):
     monkeypatch.setitem(sys.modules, "anthropic", None)  # import anthropic -> ImportError
     code, _, err = run(["agent", "x"], desk)
     assert code == EXIT_UNAVAILABLE
-    assert "missing dependency" in err and "pypilot[llm]" in err
+    assert "missing dependency" in err and "locum[llm]" in err
 
 
 # ============================================================================== record
 
 
 def test_record_saves_python_and_json(desk, be, tmp_path, monkeypatch):
-    from pypilot.rpa import recorder as rec_mod
+    from locum.rpa import recorder as rec_mod
 
     def fake_start(self):
         for ev in (("move", 370, 99), ("down", "left", 370, 99), ("up", "left", 370, 99), ("type", "ACME")):
@@ -456,7 +456,7 @@ def test_record_saves_python_and_json(desk, be, tmp_path, monkeypatch):
 
 
 def test_record_until_interrupted(desk, tmp_path, monkeypatch):
-    from pypilot.rpa import recorder as rec_mod
+    from locum.rpa import recorder as rec_mod
 
     monkeypatch.setattr(rec_mod.Recorder, "_start_pynput", lambda self: None)
     calls = []
@@ -472,7 +472,7 @@ def test_record_until_interrupted(desk, tmp_path, monkeypatch):
 
 def test_record_on_mock_backend_uses_backend_source(desk, tmp_path, monkeypatch):
     """'auto' on the mock backend must not start global pynput hooks on the real display (regression)."""
-    from pypilot.rpa import recorder as rec_mod
+    from locum.rpa import recorder as rec_mod
 
     def boom(self):
         raise AssertionError("pynput must not be used for the mock backend")
@@ -485,14 +485,14 @@ def test_record_on_mock_backend_uses_backend_source(desk, tmp_path, monkeypatch)
 
 
 def test_record_errors(desk, tmp_path, monkeypatch):
-    from pypilot.rpa import recorder as rec_mod
+    from locum.rpa import recorder as rec_mod
 
     def unavailable(self):
-        raise NotSupported("Live recording needs pynput: pip install pypilot[record]")
+        raise NotSupported("Live recording needs pynput: pip install locum[record]")
 
     monkeypatch.setattr(rec_mod.Recorder, "_start_pynput", unavailable)
     code, _, err = run(["record", "--source", "pynput", "-o", str(tmp_path / "r.py"), "--duration", "0"], desk)
-    assert code == EXIT_UNAVAILABLE and "pypilot[record]" in err
+    assert code == EXIT_UNAVAILABLE and "locum[record]" in err
     assert run(["record", "-o", str(tmp_path / "r.txt")], desk)[0] == EXIT_USAGE
     assert run(["record", "--duration", "-1"], desk)[0] == EXIT_USAGE
 
@@ -524,7 +524,7 @@ def test_keyboard_interrupt_and_unexpected_errors(desk, monkeypatch):
 
 
 def test_kill_hotkey_flag_is_best_effort(desk, monkeypatch):
-    import pypilot.failsafe as fs
+    import locum.failsafe as fs
 
     monkeypatch.setattr(fs, "install_kill_hotkey", lambda combo="": False)
     code, _, err = run(["--kill-hotkey", "info"], desk)
@@ -606,7 +606,7 @@ def test_demo_spreadsheet_navigation(desk, be):
 
 
 def _run_example(name, monkeypatch, argv=()):
-    monkeypatch.setenv("PYPILOT_BACKEND", "mock")
+    monkeypatch.setenv("LOCUM_BACKEND", "mock")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(sys, "argv", [str(EXAMPLES / name), *argv])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
@@ -640,7 +640,7 @@ def test_mcp_config_example_matches_the_cli():
     config = json.loads((EXAMPLES / "mcp_config.json").read_text(encoding="utf-8"))
     parser = build_parser()
     for server in config["mcpServers"].values():
-        assert server["command"] == "pypilot"
+        assert server["command"] == "locum"
         args = parser.parse_args(server["args"])
         assert args.command == "mcp"
 
@@ -672,8 +672,8 @@ def test_documentation_snippets_run_on_the_demo_desktop(doc, tmp_path, monkeypat
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
     monkeypatch.setitem(Desktop.__init__.__kwdefaults__, "sleep", _noop)  # snippets' Desktop() never sleeps
     namespace = {"__name__": "__doc_snippets__"}
-    if "from pypilot.cli import DemoBackend" not in "".join(snippets[:1]):
-        exec("from pypilot import Desktop\nfrom pypilot.cli import DemoBackend\nd = Desktop(DemoBackend())", namespace)
+    if "from locum.cli import DemoBackend" not in "".join(snippets[:1]):
+        exec("from locum import Desktop\nfrom locum.cli import DemoBackend\nd = Desktop(DemoBackend())", namespace)
     for i, code in enumerate(snippets):
         try:
             exec(compile(code, f"{doc}[python block {i}]", "exec"), namespace)

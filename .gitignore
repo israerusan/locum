@@ -5,6 +5,9 @@ dist/
 build/
 .pytest_cache/
 .venv/
-pypilot_runs/
+locum_runs/
 *.log
 __pycache__/
+
+# local agent worktrees / tool state
+.claude/

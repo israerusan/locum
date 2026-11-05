@@ -5,11 +5,11 @@ from typing import List, Literal, Optional
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import FailSafeTriggered, PolicyViolation
-from pypilot.llm.safety import AuditLog, Policy
-from pypilot.llm.tools import DesktopToolkit, ToolRegistry, ToolResult, ToolSpec, parse_docstring, schema_from_function
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import FailSafeTriggered, PolicyViolation
+from locum.llm.safety import AuditLog, Policy
+from locum.llm.tools import DesktopToolkit, ToolRegistry, ToolResult, ToolSpec, parse_docstring, schema_from_function
 
 
 # ============================================================================ registry

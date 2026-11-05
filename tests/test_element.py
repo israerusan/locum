@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 
 from _stub_desktop import StubDesktop
-from pypilot.backends.mock import MockBackend
-from pypilot.element import Element
-from pypilot.errors import ActionTimeout, ElementNotFound, NotSupported
-from pypilot.types import Point, Rect
+from locum.backends.mock import MockBackend
+from locum.element import Element
+from locum.errors import ActionTimeout, ElementNotFound, NotSupported
+from locum.types import Point, Rect
 
 
 @pytest.fixture
@@ -429,7 +429,7 @@ def test_to_dict_repr_eq(env):
 
 
 def test_center_is_usable_by_coerce_point(env):
-    from pypilot.types import coerce_point
+    from locum.types import coerce_point
 
     d, be, win, w = env
     assert coerce_point(el(d, "#ok")) == Point(160, 455)

@@ -5,11 +5,11 @@ from typing import List, Optional, Sequence
 
 import pytest
 
-from pypilot.backends.base import AccessibleNode
-from pypilot.backends.mock import MockBackend
-from pypilot.errors import SelectorSyntaxError
-from pypilot.selectors import describe_node, parse, quote, selector_for, tree_text
-from pypilot.types import Rect
+from locum.backends.base import AccessibleNode
+from locum.backends.mock import MockBackend
+from locum.errors import SelectorSyntaxError
+from locum.selectors import describe_node, parse, quote, selector_for, tree_text
+from locum.types import Rect
 
 
 @pytest.fixture

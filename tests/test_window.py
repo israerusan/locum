@@ -5,11 +5,11 @@ import re
 import pytest
 
 from _stub_desktop import StubDesktop
-from pypilot.backends.mock import MockBackend
-from pypilot.element import Element
-from pypilot.errors import ActionTimeout, ElementNotFound, NotSupported, WindowNotFound
-from pypilot.types import Rect, WindowInfo
-from pypilot.window import Window, match_window
+from locum.backends.mock import MockBackend
+from locum.element import Element
+from locum.errors import ActionTimeout, ElementNotFound, NotSupported, WindowNotFound
+from locum.types import Rect, WindowInfo
+from locum.window import Window, match_window
 
 
 def info(title="Untitled - Notepad", app="C:\\Windows\\notepad.exe", cls="Notepad", pid=10, handle=1):

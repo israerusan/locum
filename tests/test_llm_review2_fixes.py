@@ -13,13 +13,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.llm.agent import Agent, ScriptedClient, computer_block, scripted_response, tool_use_block
-from pypilot.llm.computer_use import ComputerUseAdapter
-from pypilot.llm.mcp_server import MCPServer, _claim_stdout
-from pypilot.llm.safety import Policy, split_typed_text
-from pypilot.llm.tools import DesktopToolkit
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.llm.agent import Agent, ScriptedClient, computer_block, scripted_response, tool_use_block
+from locum.llm.computer_use import ComputerUseAdapter
+from locum.llm.mcp_server import MCPServer, _claim_stdout
+from locum.llm.safety import Policy, split_typed_text
+from locum.llm.tools import DesktopToolkit
 
 
 # ---------------------------------------------------------------- fixtures
@@ -262,10 +262,10 @@ def test_later_request_failures_are_still_reported(bank):
 
 _MCP_CHILD = textwrap.dedent("""
     import sys
-    from pypilot.backends.mock import MockBackend
-    from pypilot.desktop import Desktop
-    from pypilot.llm.mcp_server import MCPServer
-    from pypilot.llm.safety import Policy
+    from locum.backends.mock import MockBackend
+    from locum.desktop import Desktop
+    from locum.llm.mcp_server import MCPServer
+    from locum.llm.safety import Policy
     be = MockBackend(width=1280, height=800)
     d = Desktop(be, failsafe=False, sleep=lambda s: None)
     win = be.add_window("Vendor master", (100, 100, 800, 600), app="saplogon")

@@ -10,8 +10,8 @@ import time
 
 import pytest
 
-import pypilot.rpa.queue as queue_mod
-from pypilot.rpa.queue import FAILED, IN_PROGRESS, NEW, SUCCESS, LeaseLostError, WorkQueue
+import locum.rpa.queue as queue_mod
+from locum.rpa.queue import FAILED, IN_PROGRESS, NEW, SUCCESS, LeaseLostError, WorkQueue
 
 
 @pytest.fixture

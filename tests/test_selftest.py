@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pypilot import selftest
+from locum import selftest
 
 
 def test_selftest_passes_on_simulated_desktop(tmp_path):

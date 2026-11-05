@@ -1,8 +1,8 @@
 # Fill a sales report in a spreadsheet from a CSV file, then save it.
 #
-#   pypilot run examples/excel_report_flow.yaml --report-dir runs          # real Excel
-#   pypilot --backend mock run examples/excel_report_flow.yaml             # simulated spreadsheet
-#   pypilot run examples/excel_report_flow.yaml --var data=other.csv --var start_cell=B2
+#   locum run examples/excel_report_flow.yaml --report-dir runs          # real Excel
+#   locum --backend mock run examples/excel_report_flow.yaml             # simulated spreadsheet
+#   locum run examples/excel_report_flow.yaml --var data=other.csv --var start_cell=B2
 #
 # The flow drives Excel the way a person does -- Name Box to jump to a cell,
 # Tab between columns, Enter to the next row -- so it needs no COM/add-in and

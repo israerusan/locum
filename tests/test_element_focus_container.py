@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot import Desktop
-from pypilot.backends.mock import MockBackend, MockNode
-from pypilot.errors import ElementNotFound
-from pypilot.types import MouseButton
+from locum import Desktop
+from locum.backends.mock import MockBackend, MockNode
+from locum.errors import ElementNotFound
+from locum.types import MouseButton
 
 
 class FakeTime:
@@ -146,7 +146,7 @@ def test_focus_on_descendant_is_not_refocused(ft, monkeypatch):
     """A container whose child already has focus keeps it (no focus() call that would steal it)."""
     d, be, w, iban = make(ft)
     be._set_focus(iban)
-    from pypilot.element import Element
+    from locum.element import Element
 
     win = Element(MockNode(be, w.root), d)
     called = []

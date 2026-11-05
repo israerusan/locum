@@ -12,7 +12,7 @@ import time
 
 def drain(path: str, worker_name: str, log_dir: str, start, lease_duration: float = 60.0) -> None:
     """Process the queue at ``path`` until it is empty, logging each handler run to ``<log_dir>/<worker>.log``."""
-    from pypilot.rpa.queue import WorkQueue
+    from locum.rpa.queue import WorkQueue
 
     start.wait(60)
     q = WorkQueue.open(path, worker_id=worker_name, lease_duration=lease_duration)
@@ -29,7 +29,7 @@ def drain(path: str, worker_name: str, log_dir: str, start, lease_duration: floa
 
 def claim_one(path: str, out_path: str, lease_duration: float) -> None:
     """Claim one item and exit without finishing it (a worker that crashes mid-transaction)."""
-    from pypilot.rpa.queue import WorkQueue
+    from locum.rpa.queue import WorkQueue
 
     q = WorkQueue.open(path, worker_id="crasher", lease_duration=lease_duration)
     item = q.next()

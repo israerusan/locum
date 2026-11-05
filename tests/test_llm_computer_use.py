@@ -7,9 +7,9 @@ import math
 import pytest
 from PIL import Image
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.llm.computer_use import (
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.llm.computer_use import (
     ACTIONS,
     NOT_EXECUTED,
     ComputerUseAdapter,
@@ -17,7 +17,7 @@ from pypilot.llm.computer_use import (
     parse_key_combo,
     parse_key_sequence,
 )
-from pypilot.llm.safety import Policy
+from locum.llm.safety import Policy
 
 
 def setup(width=1920, height=1080, **kw):

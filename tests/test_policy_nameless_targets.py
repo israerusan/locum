@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.llm.computer_use import ComputerUseAdapter
-from pypilot.llm.safety import UNKNOWN_TARGET_REASON, AuditLog, Policy, target_identity
-from pypilot.llm.tools import DesktopToolkit
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.llm.computer_use import ComputerUseAdapter
+from locum.llm.safety import UNKNOWN_TARGET_REASON, AuditLog, Policy, target_identity
+from locum.llm.tools import DesktopToolkit
 
 
 def _fake_time():

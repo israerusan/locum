@@ -48,13 +48,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb xauth xclip x11-utils
 
-      - name: Install pypilot
+      - name: Install locum
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
       - name: Import check (core dependencies only)
-        run: python -c "import pypilot, pypilot.cli, pypilot.llm, pypilot.rpa, pypilot.compat.pyautogui; print(pypilot.__version__)"
+        run: python -c "import locum, locum.cli, locum.llm, locum.rpa, locum.compat.pyautogui; print(locum.__version__)"
 
       - name: Test suite incl. X11 tests under Xvfb (Linux)
         if: runner.os == 'Linux'
@@ -66,13 +66,13 @@ jobs:
 
       - name: Smoke-test the CLI and examples on the demo desktop
         env:
-          PYPILOT_BACKEND: mock
+          LOCUM_BACKEND: mock
         run: |
-          pypilot --version
-          pypilot info
-          pypilot windows --json
-          pypilot observe --window "Invoice Entry"
-          pypilot run examples/excel_report_flow.yaml
+          locum --version
+          locum info
+          locum windows --json
+          locum observe --window "Invoice Entry"
+          locum run examples/excel_report_flow.yaml
           python examples/basic_automation.py
           python examples/sap_style_data_entry.py
           python examples/llm_agent.py < /dev/null
@@ -100,7 +100,7 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install pypilot
+      - name: Install locum
         run: python -m pip install .
 
       # Step-level continue-on-error as well as job-level: job-level alone keeps
@@ -110,7 +110,7 @@ jobs:
       - name: Self-test against the runner's real desktop
         id: selftest
         continue-on-error: true
-        run: python -m pypilot.selftest --yes --out selftest-report
+        run: python -m locum.selftest --yes --out selftest-report
 
       - name: Flag a failed self-test (non-blocking)
         if: steps.selftest.outcome == 'failure'

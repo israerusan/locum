@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
 
 
 class _InterruptAfterPress(MockBackend):
@@ -128,7 +128,7 @@ def _interrupt_mid_reply(backend):
 
 def test_x11_backend_recovers_after_interrupted_round_trip(xvfb_display):
     pytest.importorskip("Xlib")
-    from pypilot.backends.x11 import X11Backend
+    from locum.backends.x11 import X11Backend
 
     b = X11Backend(xvfb_display, accessibility=False)
     try:
@@ -145,7 +145,7 @@ def test_x11_backend_recovers_after_interrupted_round_trip(xvfb_display):
 
 def test_x11_close_after_interrupt_does_not_hang_and_releases_keys(xvfb_display):
     pytest.importorskip("Xlib")
-    from pypilot.backends.x11 import X11Backend
+    from locum.backends.x11 import X11Backend
 
     b = X11Backend(xvfb_display, accessibility=False)
     b.key_down("shift")
@@ -158,7 +158,7 @@ def test_x11_close_after_interrupt_does_not_hang_and_releases_keys(xvfb_display)
 
 def test_x11_native_clipboard_recovers_after_interrupt(xvfb_display):
     pytest.importorskip("Xlib")
-    from pypilot.backends._x11clip import X11Clipboard
+    from locum.backends._x11clip import X11Clipboard
 
     clip = X11Clipboard(xvfb_display)
     try:
@@ -196,7 +196,7 @@ class _ClipTracking(MockBackend):
 
 
 def test_clipboard_paste_default_settle_is_long_enough_and_configurable():
-    from pypilot.keyboard import DEFAULT_CLIPBOARD_SETTLE
+    from locum.keyboard import DEFAULT_CLIPBOARD_SETTLE
 
     slept = []
     be = _ClipTracking(None)  # the backend cannot tell when the app read it
@@ -229,7 +229,7 @@ def test_x11_native_clipboard_paste_waits_for_slow_app(xvfb_display):
     from Xlib import X
     from Xlib import display as xdisplay
 
-    from pypilot.backends.x11 import X11Backend
+    from locum.backends.x11 import X11Backend
 
     app = xdisplay.Display(xvfb_display)
     root = app.screen().root
@@ -242,7 +242,7 @@ def test_x11_native_clipboard_paste_waits_for_slow_app(xvfb_display):
     got = {}
 
     def slow_text_field():  # requests CLIPBOARD 0.4 s after Ctrl+V (a busy UI thread)
-        clip, utf8, prop = (app.intern_atom(n) for n in ("CLIPBOARD", "UTF8_STRING", "PYPILOT_T"))
+        clip, utf8, prop = (app.intern_atom(n) for n in ("CLIPBOARD", "UTF8_STRING", "LOCUM_T"))
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             ev = app.next_event()
@@ -275,7 +275,7 @@ def test_x11_native_clipboard_paste_waits_for_slow_app(xvfb_display):
 # --------------------------------------------------------------------------- abort during long sleeps
 @pytest.fixture
 def _clean_abort():
-    from pypilot import failsafe
+    from locum import failsafe
 
     failsafe.reset_abort()
     yield failsafe
@@ -300,7 +300,7 @@ def _abort_soon(failsafe, after=0.15):
 def test_desktop_sleep_honours_abort_promptly(_clean_abort):
     import time
 
-    from pypilot.errors import FailSafeTriggered
+    from locum.errors import FailSafeTriggered
 
     d = Desktop(MockBackend(), failsafe=False)
     _abort_soon(_clean_abort)
@@ -311,7 +311,7 @@ def test_desktop_sleep_honours_abort_promptly(_clean_abort):
 
 
 def test_desktop_sleep_with_injected_sleep_is_sliced(_clean_abort):
-    from pypilot.errors import FailSafeTriggered
+    from locum.errors import FailSafeTriggered
 
     calls = []
 
@@ -329,9 +329,9 @@ def test_desktop_sleep_with_injected_sleep_is_sliced(_clean_abort):
 def test_queue_retry_wait_honours_abort_promptly(_clean_abort, tmp_path):
     import time
 
-    from pypilot.errors import FailSafeTriggered
-    from pypilot.rpa import WorkQueue
-    from pypilot.rpa.queue import NEW
+    from locum.errors import FailSafeTriggered
+    from locum.rpa import WorkQueue
+    from locum.rpa.queue import NEW
 
     q = WorkQueue("q", path=tmp_path / "q.json")
     q.add({"n": 1}, reference="A")
@@ -350,8 +350,8 @@ def test_queue_retry_wait_honours_abort_promptly(_clean_abort, tmp_path):
 def test_robot_sleep_without_desktop_honours_abort(_clean_abort):
     import time
 
-    from pypilot.errors import FailSafeTriggered
-    from pypilot.rpa import Robot
+    from locum.errors import FailSafeTriggered
+    from locum.rpa import Robot
 
     r = Robot(name="r", save_reports=False)
     _abort_soon(_clean_abort)
@@ -363,7 +363,7 @@ def test_robot_sleep_without_desktop_honours_abort(_clean_abort):
 
 # --------------------------------------------------------------------------- recorder hooks
 def test_two_backend_recorders_stop_in_any_order():
-    from pypilot.rpa.recorder import Recorder
+    from locum.rpa.recorder import Recorder
 
     be = MockBackend()
     original = be.mouse_down
@@ -430,7 +430,7 @@ class _FakeListener:
 
 
 def test_kill_hotkey_reports_failure_when_listener_dies(monkeypatch):
-    from pypilot import failsafe
+    from locum import failsafe
 
     class Dead(_FakeListener):  # X server without RECORD: the thread dies before it is ready
         ready_after_start = False
@@ -444,7 +444,7 @@ def test_kill_hotkey_reports_failure_when_listener_dies(monkeypatch):
 
 
 def test_kill_hotkey_reports_failure_when_untrusted_on_macos(monkeypatch):
-    from pypilot import failsafe
+    from locum import failsafe
 
     created = []
 
@@ -464,7 +464,7 @@ def test_kill_hotkey_reports_failure_when_untrusted_on_macos(monkeypatch):
 
 
 def test_kill_hotkey_working_listener(monkeypatch):
-    from pypilot import failsafe
+    from locum import failsafe
 
     class Good(_FakeListener):
         trusted = True
@@ -483,7 +483,7 @@ def test_windows_mss_grabber_closed_when_its_thread_ends(monkeypatch):
     import threading
     import types
 
-    from pypilot.backends.windows import WindowsBackend
+    from locum.backends.windows import WindowsBackend
 
     opened, closed = [], []
 

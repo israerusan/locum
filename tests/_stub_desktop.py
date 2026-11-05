@@ -1,7 +1,7 @@
-"""A minimal stand-in for ``pypilot.desktop.Desktop`` used by the element/window tests.
+"""A minimal stand-in for ``locum.desktop.Desktop`` used by the element/window tests.
 
-It implements only the Desktop API that :mod:`pypilot.element` and
-:mod:`pypilot.window` rely on (see docs/ARCHITECTURE.md), on top of the
+It implements only the Desktop API that :mod:`locum.element` and
+:mod:`locum.window` rely on (see docs/ARCHITECTURE.md), on top of the
 MockBackend, the real Mouse/Keyboard classes and the selector engine.
 """
 
@@ -9,14 +9,14 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from pypilot.backends.mock import MockBackend
-from pypilot.element import Element
-from pypilot.errors import ActionTimeout, ElementNotFound, WindowNotFound
-from pypilot.keyboard import Keyboard
-from pypilot.mouse import Mouse
-from pypilot.selectors import parse
-from pypilot.wait import wait_until
-from pypilot.window import Window, match_window
+from locum.backends.mock import MockBackend
+from locum.element import Element
+from locum.errors import ActionTimeout, ElementNotFound, WindowNotFound
+from locum.keyboard import Keyboard
+from locum.mouse import Mouse
+from locum.selectors import parse
+from locum.wait import wait_until
+from locum.window import Window, match_window
 
 
 def _noop(_s: float) -> None:

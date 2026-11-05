@@ -3,16 +3,16 @@
 Step 1 -- keep your script, change one import::
 
     import pyautogui                                   # before
-    import pypilot.compat.pyautogui as pyautogui       # after (same functions, same semantics)
+    import locum.compat.pyautogui as pyautogui       # after (same functions, same semantics)
 
-  or, without touching the script at all, run ``pypilot.compat.install_pyautogui_shim()``
+  or, without touching the script at all, run ``locum.compat.install_pyautogui_shim()``
   once before it imports ``pyautogui``.
 
-Step 2 -- replace brittle coordinates and screenshots with what pypilot adds:
+Step 2 -- replace brittle coordinates and screenshots with what locum adds:
 accessibility selectors, native set-value/invoke, waits, masked template
 matching, humanized motion, RPA reports and LLM tools.
 
-This example runs on pypilot's built-in demo desktop, so it is safe to run
+This example runs on locum's built-in demo desktop, so it is safe to run
 anywhere (no real mouse/keyboard input is sent)::
 
     python examples/pyautogui_migration.py
@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import sys
 
-import pypilot.compat.pyautogui as pyautogui
-from pypilot import Desktop
-from pypilot.cli import DemoBackend
+import locum.compat.pyautogui as pyautogui
+from locum import Desktop
+from locum.cli import DemoBackend
 
 
 def legacy_pyautogui_style() -> str:
@@ -50,7 +50,7 @@ def legacy_pyautogui_style() -> str:
     return pyautogui.get_desktop().find("text#status").text
 
 
-def pypilot_style(d: Desktop) -> str:
+def locum_style(d: Desktop) -> str:
     """The same task, robust to window moves, resolution, DPI and theme changes."""
     form = d.window("Invoice Entry*")                   # glob / substring / regex titles
     form.activate()
@@ -67,13 +67,13 @@ def main() -> int:
     previous = pyautogui.set_desktop(demo)              # route the compat module to the demo desktop
     try:
         print("[legacy] status:", legacy_pyautogui_style())
-        print("[pypilot] status:", pypilot_style(demo))
+        print("[locum] status:", locum_style(demo))
         print("invoices:", [(i["invoice_no"], i["vendor"], i["amount"]) for i in demo.backend.invoices])
 
         # Things PyAutoGUI cannot do:
         print(demo.tree(window="Invoice Entry*", max_depth=2, interactive_only=True).splitlines()[1])
         el = demo.element_at(370, 99)
-        from pypilot.selectors import selector_for
+        from locum.selectors import selector_for
 
         print("selector recorded for (370, 99):", selector_for(el.node))
     finally:

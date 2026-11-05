@@ -20,12 +20,12 @@ import re
 
 import pytest
 
-from pypilot import Desktop
-from pypilot.backends.mock import MockBackend, MockNode
-from pypilot.cli import DemoBackend
-from pypilot.errors import ActionTimeout, ElementNotFound
-from pypilot.keyboard import Keyboard
-from pypilot.keys import press_actions
+from locum import Desktop
+from locum.backends.mock import MockBackend, MockNode
+from locum.cli import DemoBackend
+from locum.errors import ActionTimeout, ElementNotFound
+from locum.keyboard import Keyboard
+from locum.keys import press_actions
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -130,7 +130,7 @@ def test_set_text_with_a_single_line_field_dropping_the_line_break_raises():
 
 # =============================================================================== click
 def test_click_on_a_disabled_button_raises_instead_of_reporting_success():
-    from pypilot.rpa import run_flow
+    from locum.rpa import run_flow
 
     be, d = demo()
     save = be.erp.find("Save")
@@ -191,7 +191,7 @@ def test_ambiguous_or_duplicate_key_combos_are_refused(call):
 
 
 def test_flow_press_step_sends_every_key():
-    from pypilot.rpa import run_flow
+    from locum.rpa import run_flow
 
     be, d = demo()
     d.find("edit#vendor").click()
@@ -200,7 +200,7 @@ def test_flow_press_step_sends_every_key():
 
 
 def test_toolkit_press_keys_splits_key_sequences():
-    from pypilot.llm import DesktopToolkit, Policy
+    from locum.llm import DesktopToolkit, Policy
 
     be, d = demo()
     d.find("edit#vendor").click()
@@ -212,7 +212,7 @@ def test_toolkit_press_keys_splits_key_sequences():
 
 # ============================================================ policy: committing shortcuts
 def _pay_now_kit(name="Pay now", access_key="Alt+P"):
-    from pypilot.llm import DesktopToolkit, Policy
+    from locum.llm import DesktopToolkit, Policy
 
     be, d = demo()
     pay = be.erp.find("Submit Payment")
@@ -244,7 +244,7 @@ def test_committing_shortcuts_need_confirmation(combo):
 
 
 def test_harmless_shortcuts_and_permissive_policy_are_not_gated():
-    from pypilot.llm import DesktopToolkit, Policy
+    from locum.llm import DesktopToolkit, Policy
 
     be, d, kit, asked = _pay_now_kit()
     assert not kit.call("hotkey", {"combo": "ctrl+c"}).is_error
@@ -256,7 +256,7 @@ def test_harmless_shortcuts_and_permissive_policy_are_not_gated():
 
 
 def test_computer_use_key_action_is_judged_by_the_shortcut_target():
-    from pypilot.llm import ComputerUseAdapter, Policy
+    from locum.llm import ComputerUseAdapter, Policy
 
     be, d, kit, asked = _pay_now_kit()
     cu = ComputerUseAdapter(d, policy=Policy())
@@ -278,7 +278,7 @@ def test_bare_word_selector_suggests_the_named_element():
 
 # ========================================================================= README RPA
 def test_readme_rpa_handler_reports_rejected_postings_as_business_exceptions(tmp_path, monkeypatch):
-    from pypilot.rpa import BusinessException
+    from locum.rpa import BusinessException
 
     text = (ROOT / "README.md").read_text(encoding="utf-8")
     block = next(c for c in re.findall(r"```python\n(.*?)```", text, re.S) if "def enter_invoice" in c)
@@ -323,7 +323,7 @@ def test_clipboard_typing_restores_the_backend_snapshot():
 def test_windows_clipboard_snapshot_keeps_every_format():
     from test_windows_backend import FakeApi
 
-    from pypilot.backends import windows as winmod
+    from locum.backends import windows as winmod
 
     class MultiFormatApi(FakeApi):
         """A clipboard holding several formats (an image / Excel range), like the real one."""

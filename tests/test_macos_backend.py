@@ -15,10 +15,10 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from pypilot.backends import create_backend
-from pypilot.backends import macos
-from pypilot.backends.base import CAP_ACCESSIBILITY, CAP_CLIPBOARD, CAP_UNICODE_TYPING
-from pypilot.backends.macos import (
+from locum.backends import create_backend
+from locum.backends import macos
+from locum.backends.base import CAP_ACCESSIBILITY, CAP_CLIPBOARD, CAP_UNICODE_TYPING
+from locum.backends.macos import (
     AXNode,
     ClickTracker,
     DisplayInfo,
@@ -32,9 +32,9 @@ from pypilot.backends.macos import (
     split_typing_segments,
     utf16_len,
 )
-from pypilot.errors import BackendError, BackendUnavailable, NotSupported, WindowNotFound
-from pypilot.keys import KEYS, MODIFIERS
-from pypilot.types import MouseButton, Point, Rect
+from locum.errors import BackendError, BackendUnavailable, NotSupported, WindowNotFound
+from locum.keys import KEYS, MODIFIERS
+from locum.types import MouseButton, Point, Rect
 
 
 # =============================================================================
@@ -448,7 +448,7 @@ def test_map_ax_role():
 
 
 def test_all_mapped_roles_are_portable():
-    from pypilot.backends.base import ROLES
+    from locum.backends.base import ROLES
 
     for value in list(macos._AX_ROLE_MAP.values()) + list(macos._AX_SUBROLE_MAP.values()):
         assert value in ROLES, value
@@ -1200,7 +1200,7 @@ def test_element_at_and_focused():
 
 
 def test_selectors_work_on_ax_tree():
-    from pypilot.selectors import parse
+    from locum.selectors import parse
 
     be, q, appkit, ax, els = _tree_setup()
     roots = be.accessibility_roots()
@@ -1277,9 +1277,9 @@ def test_launch_uses_open_for_app_names(monkeypatch):
 
 
 def test_frontmost_app_is_read_live_not_from_stale_appkit():
-    from pypilot import Desktop
-    from pypilot.llm.safety import Policy
-    from pypilot.llm.tools import DesktopToolkit
+    from locum import Desktop
+    from locum.llm.safety import Policy
+    from locum.llm.tools import DesktopToolkit
 
     claude, term = FakeRunningApp(100, "Claude"), FakeRunningApp(200, "Terminal")
     be, q, appkit = make_backend(apps=[claude, term])
@@ -1406,8 +1406,8 @@ def test_window_without_ax_counterpart_is_not_resolved_to_the_only_ax_window():
 
 
 def test_minimized_windows_are_listed():
-    from pypilot import Desktop
-    from pypilot.errors import ActionTimeout
+    from locum import Desktop
+    from locum.errors import ActionTimeout
 
     ax = FakeAX()
     win = FakeEl(pid=100, AXRole="AXWindow", AXTitle="Budget.xlsx", AXPosition=(100.0, 50.0), AXSize=(400.0, 300.0),
@@ -1469,7 +1469,7 @@ def test_activate_window_must_make_the_app_frontmost(monkeypatch):
         be.activate_window(7)
 
 
-def test_restore_unzooms_a_window_maximized_outside_pypilot():
+def test_restore_unzooms_a_window_maximized_outside_locum():
     class ZoomAX(FakeAX):
         def perform(self, el, action):
             ok = super().perform(el, action)
@@ -1516,8 +1516,8 @@ def test_launch_opens_app_names_with_spaces(monkeypatch):
 
 
 def test_policy_judges_multi_word_app_names_as_a_whole():
-    from pypilot.errors import PolicyViolation
-    from pypilot.llm.safety import Policy
+    from locum.errors import PolicyViolation
+    from locum.llm.safety import Policy
 
     with pytest.raises(PolicyViolation, match="Google Chrome"):
         Policy(blocked_apps=["google chrome"]).check("launch_app", {"command": "Google Chrome"}, context={})

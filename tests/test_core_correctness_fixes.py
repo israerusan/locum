@@ -8,15 +8,15 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from pypilot import Desktop, failsafe
-from pypilot import vision
-from pypilot.backends.base import AccessibleNode
-from pypilot.backends.mock import MockBackend
-from pypilot.errors import ActionTimeout, ElementNotFound, FailSafeTriggered, PolicyViolation
-from pypilot.keys import parse_hotkey
-from pypilot.selectors import parse
-from pypilot.types import Point
-from pypilot.wait import retry_call, wait_until
+from locum import Desktop, failsafe
+from locum import vision
+from locum.backends.base import AccessibleNode
+from locum.backends.mock import MockBackend
+from locum.errors import ActionTimeout, ElementNotFound, FailSafeTriggered, PolicyViolation
+from locum.keys import parse_hotkey
+from locum.selectors import parse
+from locum.types import Point
+from locum.wait import retry_call, wait_until
 
 
 class FakeClock:
@@ -314,7 +314,7 @@ class TestHotkeyNames:
             parse_hotkey("page-sideways")
 
     def test_keyboard_press_multiword(self):
-        from pypilot.keyboard import Keyboard
+        from locum.keyboard import Keyboard
 
         be = MockBackend()
         Keyboard(be, sleep=lambda s: None).press("Page Down")
@@ -362,7 +362,7 @@ class TestVisionInputErrors:
         assert clk.t == 0.0
 
     def test_not_found_still_times_out(self):
-        from pypilot.errors import ImageNotFound
+        from locum.errors import ImageNotFound
 
         d, clk = self._desktop()
         with pytest.raises(ImageNotFound):

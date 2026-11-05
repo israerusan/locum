@@ -1,4 +1,4 @@
-"""Tests for the top-level ``pypilot`` package: lazy imports, default desktop, convenience API."""
+"""Tests for the top-level ``locum`` package: lazy imports, default desktop, convenience API."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ import sys
 
 import pytest
 
-import pypilot
-from pypilot import backends
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
+import locum
+from locum import backends
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
 
 
 @pytest.fixture
@@ -23,11 +23,11 @@ def mock_desktop():
     user = win.add_edit("User", (20, 40, 200, 28))
     ok = win.add_button("Sign in", (20, 200, 100, 30))
     d = Desktop(be, sleep=lambda s: None, default_timeout=0.0)
-    old = pypilot.set_desktop(d)
+    old = locum.set_desktop(d)
     try:
         yield d, be, user, ok
     finally:
-        pypilot.set_desktop(old)
+        locum.set_desktop(old)
 
 
 # Variables the interpreter itself needs to start. Without SYSTEMROOT, Python 3.9 on
@@ -37,16 +37,16 @@ _OS_ESSENTIAL_ENV = ("SYSTEMROOT", "SystemDrive", "WINDIR", "TEMP", "TMP", "HOME
 
 
 def _package_root() -> str:
-    """The directory that contains the ``pypilot`` package under test."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(pypilot.__file__)))
+    """The directory that contains the ``locum`` package under test."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(locum.__file__)))
 
 
 def _isolated_env(environ=None) -> dict:
     """A minimal environment for a child interpreter: OS essentials only.
 
-    Nothing that customises Python or pypilot leaks in from the parent (no
-    inherited ``PYTHONPATH``, ``PYTHONSTARTUP``, ``PYPILOT_*``, ...).
-    ``PYTHONPATH`` is set explicitly to the directory of the pypilot *under
+    Nothing that customises Python or locum leaks in from the parent (no
+    inherited ``PYTHONPATH``, ``PYTHONSTARTUP``, ``LOCUM_*``, ...).
+    ``PYTHONPATH`` is set explicitly to the directory of the locum *under
     test*, so the child imports this very package whether it is installed
     editable, from a wheel, or only placed on the path.
     """
@@ -63,130 +63,130 @@ def _isolated_env(environ=None) -> dict:
 def test_isolated_env_keeps_os_essentials_but_drops_python_customisation():
     parent = {
         "SystemRoot": r"C:\Windows", "TEMP": r"C:\Temp", "HOME": "/home/u", "PATH": "/usr/bin",
-        "PYTHONPATH": "/somewhere/else", "PYTHONSTARTUP": "/evil.py", "PYPILOT_BACKEND": "mock",
+        "PYTHONPATH": "/somewhere/else", "PYTHONSTARTUP": "/evil.py", "LOCUM_BACKEND": "mock",
     }
     env = _isolated_env(parent)
     assert env == {"PATH": "", "SYSTEMROOT": r"C:\Windows", "TEMP": r"C:\Temp", "HOME": "/home/u",
                    "PYTHONPATH": _package_root()}
-    assert os.path.isfile(os.path.join(env["PYTHONPATH"], "pypilot", "__init__.py"))
+    assert os.path.isfile(os.path.join(env["PYTHONPATH"], "locum", "__init__.py"))
 
 
 def test_import_is_side_effect_free():
     code = (
-        "import sys, json, pypilot\n"
+        "import sys, json, locum\n"
         "heavy = [m for m in sys.modules if m.split('.')[0] in ('numpy', 'PIL', 'mss', 'Xlib', 'comtypes', 'Quartz')]\n"
-        "import pypilot.backends as b\n"
-        "print(json.dumps({'heavy': heavy, 'backend': b._default is None, 'desktop': pypilot._default_desktop is None,\n"
-        "                  'version': pypilot.__version__, 'file': pypilot.__file__}))\n"
+        "import locum.backends as b\n"
+        "print(json.dumps({'heavy': heavy, 'backend': b._default is None, 'desktop': locum._default_desktop is None,\n"
+        "                  'version': locum.__version__, 'file': locum.__file__}))\n"
     )
     # -s: no user site-packages either.
     out = subprocess.run([sys.executable, "-s", "-c", code], capture_output=True, text=True, env=_isolated_env())
     assert out.returncode == 0, out.stderr
     info = json.loads(out.stdout.strip().splitlines()[-1])
     imported = info.pop("file")
-    assert os.path.normcase(os.path.abspath(imported)) == os.path.normcase(os.path.abspath(pypilot.__file__))
-    assert info == {"heavy": [], "backend": True, "desktop": True, "version": pypilot.__version__}
+    assert os.path.normcase(os.path.abspath(imported)) == os.path.normcase(os.path.abspath(locum.__file__))
+    assert info == {"heavy": [], "backend": True, "desktop": True, "version": locum.__version__}
 
 
 def test_version_and_reexports():
-    assert isinstance(pypilot.__version__, str) and pypilot.__version__.count(".") >= 2
-    from pypilot.element import Element
-    from pypilot.errors import ElementNotFound
-    from pypilot.motion import Humanize
-    from pypilot.types import Point, Rect
-    from pypilot.window import Window
+    assert isinstance(locum.__version__, str) and locum.__version__.count(".") >= 2
+    from locum.element import Element
+    from locum.errors import ElementNotFound
+    from locum.motion import Humanize
+    from locum.types import Point, Rect
+    from locum.window import Window
 
-    assert pypilot.Desktop is Desktop
-    assert pypilot.Element is Element
-    assert pypilot.Window is Window
-    assert pypilot.Humanize is Humanize
-    assert pypilot.Point is Point and pypilot.Rect is Rect
-    assert pypilot.ElementNotFound is ElementNotFound
-    assert issubclass(pypilot.FailSafeTriggered, pypilot.PypilotError)
-    for name in pypilot.__all__:
-        assert getattr(pypilot, name) is not None, name
-    assert "Desktop" in dir(pypilot)
+    assert locum.Desktop is Desktop
+    assert locum.Element is Element
+    assert locum.Window is Window
+    assert locum.Humanize is Humanize
+    assert locum.Point is Point and locum.Rect is Rect
+    assert locum.ElementNotFound is ElementNotFound
+    assert issubclass(locum.FailSafeTriggered, locum.LocumError)
+    for name in locum.__all__:
+        assert getattr(locum, name) is not None, name
+    assert "Desktop" in dir(locum)
     with pytest.raises(AttributeError):
-        pypilot.does_not_exist  # noqa: B018
+        locum.does_not_exist  # noqa: B018
 
 
 def test_wait_and_window_are_functions_and_modules():
-    import pypilot.wait as wait_mod
-    import pypilot.window as window_mod
+    import locum.wait as wait_mod
+    import locum.window as window_mod
 
-    assert callable(pypilot.wait) and callable(pypilot.window)
-    assert wait_mod.wait_until is sys.modules["pypilot.wait"].wait_until
-    assert pypilot.wait.retry is sys.modules["pypilot.wait"].retry
-    assert pypilot.window.Window is sys.modules["pypilot.window"].Window
-    assert window_mod.match_window is sys.modules["pypilot.window"].match_window
-    assert "selector" in inspect.signature(pypilot.wait).parameters
-    assert "title" in inspect.signature(pypilot.window).parameters
-    assert "Wait for an element" in pypilot.wait.__doc__
-    assert "retry" in dir(pypilot.wait)
-    assert "pypilot.wait" in repr(pypilot.wait)
+    assert callable(locum.wait) and callable(locum.window)
+    assert wait_mod.wait_until is sys.modules["locum.wait"].wait_until
+    assert locum.wait.retry is sys.modules["locum.wait"].retry
+    assert locum.window.Window is sys.modules["locum.window"].Window
+    assert window_mod.match_window is sys.modules["locum.window"].match_window
+    assert "selector" in inspect.signature(locum.wait).parameters
+    assert "title" in inspect.signature(locum.window).parameters
+    assert "Wait for an element" in locum.wait.__doc__
+    assert "retry" in dir(locum.wait)
+    assert "locum.wait" in repr(locum.wait)
 
 
 def test_proxy_setattr_reaches_module(monkeypatch):
     sentinel = object()
-    monkeypatch.setattr("pypilot.wait.SENTINEL_FOR_TEST", sentinel, raising=False)
-    assert sys.modules["pypilot.wait"].SENTINEL_FOR_TEST is sentinel
+    monkeypatch.setattr("locum.wait.SENTINEL_FOR_TEST", sentinel, raising=False)
+    assert sys.modules["locum.wait"].SENTINEL_FOR_TEST is sentinel
     monkeypatch.undo()
-    assert not hasattr(sys.modules["pypilot.wait"], "SENTINEL_FOR_TEST")
+    assert not hasattr(sys.modules["locum.wait"], "SENTINEL_FOR_TEST")
 
 
 def test_get_desktop_is_lazy_singleton(monkeypatch):
-    old = pypilot.set_desktop(None)
+    old = locum.set_desktop(None)
     old_backend = backends._default
-    monkeypatch.setenv("PYPILOT_BACKEND", "mock")
+    monkeypatch.setenv("LOCUM_BACKEND", "mock")
     backends.set_backend(None)
     try:
-        d1 = pypilot.get_desktop()
+        d1 = locum.get_desktop()
         assert isinstance(d1.backend, MockBackend)
-        assert pypilot.get_desktop() is d1
+        assert locum.get_desktop() is d1
     finally:
-        pypilot.set_desktop(old)
+        locum.set_desktop(old)
         backends.set_backend(old_backend)
 
 
 def test_convenience_functions_drive_default_desktop(mock_desktop):
     d, be, user, ok = mock_desktop
-    assert pypilot.get_desktop() is d
-    assert pypilot.size() == (1024, 768)
-    pypilot.move(300, 300)
-    assert pypilot.position() == (300, 300)
-    pypilot.click('edit "User"')
-    pypilot.type("alice")
+    assert locum.get_desktop() is d
+    assert locum.size() == (1024, 768)
+    locum.move(300, 300)
+    assert locum.position() == (300, 300)
+    locum.click('edit "User"')
+    locum.type("alice")
     assert user.value == "alice"
-    pypilot.hotkey("ctrl+a")
-    pypilot.press("backspace")
+    locum.hotkey("ctrl+a")
+    locum.press("backspace")
     assert user.value == ""
-    pypilot.click('button "Sign in"')
+    locum.click('button "Sign in"')
     assert ok.clicks == 1
-    pypilot.double_click('button "Sign in"')
+    locum.double_click('button "Sign in"')
     assert ok.clicks == 3
-    pypilot.right_click(5, 5)
-    pypilot.triple_click(5, 5)
-    pypilot.middle_click(5, 5)
-    pypilot.drag((10, 10), (50, 50), duration=0)
-    pypilot.scroll(-2)
+    locum.right_click(5, 5)
+    locum.triple_click(5, 5)
+    locum.middle_click(5, 5)
+    locum.drag((10, 10), (50, 50), duration=0)
+    locum.scroll(-2)
     assert ("scroll", 0, -2, 50, 50) in be.events
-    assert pypilot.find('button "Sign in"').name == "Sign in"
-    assert len(pypilot.find_all("edit")) == 1
-    assert pypilot.exists("button") and not pypilot.exists("checkbox")
-    assert pypilot.wait('button "Sign in"').name == "Sign in"
-    assert pypilot.window("Login").app == "auth"
-    assert [w.title for w in pypilot.windows()] == ["Login"]
-    assert pypilot.active_window().title == "Login"
-    assert pypilot.screenshot().size == (1024, 768)
-    assert pypilot.locate(pypilot.screenshot((150, 150, 40, 40))) is not None
-    pypilot.clipboard_set("x")
-    assert pypilot.clipboard_get() == "x"
-    assert 'button "Sign in"' in pypilot.tree()
-    assert pypilot.launch("app") is None and be.launched == ["app"]
+    assert locum.find('button "Sign in"').name == "Sign in"
+    assert len(locum.find_all("edit")) == 1
+    assert locum.exists("button") and not locum.exists("checkbox")
+    assert locum.wait('button "Sign in"').name == "Sign in"
+    assert locum.window("Login").app == "auth"
+    assert [w.title for w in locum.windows()] == ["Login"]
+    assert locum.active_window().title == "Login"
+    assert locum.screenshot().size == (1024, 768)
+    assert locum.locate(locum.screenshot((150, 150, 40, 40))) is not None
+    locum.clipboard_set("x")
+    assert locum.clipboard_get() == "x"
+    assert 'button "Sign in"' in locum.tree()
+    assert locum.launch("app") is None and be.launched == ["app"]
 
 
 def test_errors_bubble_from_convenience_functions(mock_desktop):
-    with pytest.raises(pypilot.ElementNotFound):
-        pypilot.find('button "Nope"')
-    with pytest.raises(pypilot.WindowNotFound):
-        pypilot.window("Nope")
+    with pytest.raises(locum.ElementNotFound):
+        locum.find('button "Nope"')
+    with pytest.raises(locum.WindowNotFound):
+        locum.window("Nope")

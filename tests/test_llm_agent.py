@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import FailSafeTriggered
-from pypilot.llm.agent import (
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import FailSafeTriggered
+from locum.llm.agent import (
     Agent,
     AgentStep,
     ScriptedClient,
@@ -19,8 +19,8 @@ from pypilot.llm.agent import (
     thinking_block,
     tool_use_block,
 )
-from pypilot.llm.computer_use import NOT_EXECUTED
-from pypilot.llm.safety import Policy
+from locum.llm.computer_use import NOT_EXECUTED
+from locum.llm.safety import Policy
 
 
 def fake_time():
@@ -352,7 +352,7 @@ def test_constructor_validation_and_missing_sdk(app, monkeypatch):
     with pytest.raises(ValueError):
         Agent(d, client=ScriptedClient([])).run("   ")
     monkeypatch.setitem(sys.modules, "anthropic", None)
-    with pytest.raises(ImportError, match="pypilot\\[llm\\]"):
+    with pytest.raises(ImportError, match="locum\\[llm\\]"):
         Agent(d).run("x")
 
 

@@ -7,13 +7,13 @@ import time
 
 import pytest
 
-from pypilot.backends import mock as mock_backend
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import PolicyViolation
-from pypilot.llm import CARD_NUMBER, AuditLog, DesktopToolkit, Policy, ToolRegistry
-from pypilot.llm.safety import launch_program
-from pypilot.types import Rect
+from locum.backends import mock as mock_backend
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import PolicyViolation
+from locum.llm import CARD_NUMBER, AuditLog, DesktopToolkit, Policy, ToolRegistry
+from locum.llm.safety import launch_program
+from locum.types import Rect
 
 
 # ---------------------------------------------------------------- fixtures
@@ -315,7 +315,7 @@ def test_wait_for_text_polls_tree_and_ocr_within_one_timeout():
 
 
 def test_wait_for_text_finds_ocr_text():
-    from pypilot.types import Match
+    from locum.types import Match
 
     be = MockBackend()
     be.add_window("Invoice", app="erp")

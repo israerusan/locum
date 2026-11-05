@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-from pypilot.errors import PolicyViolation
-from pypilot.llm.safety import DEFAULT_CONFIRM, AuditLog, Policy
-from pypilot.types import Point, Rect
+from locum.errors import PolicyViolation
+from locum.llm.safety import DEFAULT_CONFIRM, AuditLog, Policy
+from locum.types import Point, Rect
 
 
 def test_default_policy_allows_plain_actions():

@@ -10,9 +10,9 @@ from decimal import Decimal
 
 import pytest
 
-from pypilot import Desktop
-from pypilot.backends.base import Backend
-from pypilot.backends.mock import MockBackend, MockNode
+from locum import Desktop
+from locum.backends.base import Backend
+from locum.backends.mock import MockBackend, MockNode
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
@@ -193,7 +193,7 @@ def test_default_element_at_respects_z_order():
 
 
 def test_shell_launch_target_classification(tmp_path, monkeypatch):
-    from pypilot.backends import windows as winmod
+    from locum.backends import windows as winmod
 
     monkeypatch.setattr(winmod.shutil, "which", lambda name: "/usr/bin/notepad" if name == "notepad" else None)
     doc = tmp_path / "Q3 report.xlsx"
@@ -212,7 +212,7 @@ def test_shell_launch_target_classification(tmp_path, monkeypatch):
 
 
 def test_windows_launch_uses_shellexecute_for_app_paths(monkeypatch):
-    from pypilot.backends import windows as winmod
+    from locum.backends import windows as winmod
 
     calls = {}
 
@@ -249,14 +249,14 @@ def test_windows_launch_uses_shellexecute_for_app_paths(monkeypatch):
 
 
 def test_shell_process_without_a_process_handle_reports_exited():
-    from pypilot.backends.windows import ShellProcess
+    from locum.backends.windows import ShellProcess
 
     proc = ShellProcess(object(), "Q3.xlsx", None)  # handed over to the running Excel
     assert proc.pid is None and proc.poll() == 0
 
 
 def test_shellexecuteinfo_layout_matches_win64():
-    from pypilot.backends.windows import SHELLEXECUTEINFOW
+    from locum.backends.windows import SHELLEXECUTEINFOW
 
     if ctypes.sizeof(ctypes.c_void_p) == 8:
         assert ctypes.sizeof(SHELLEXECUTEINFOW) == 112
@@ -270,7 +270,7 @@ def test_shellexecuteinfo_layout_matches_win64():
 
 @pytest.fixture
 def sap(monkeypatch):
-    monkeypatch.setenv("PYPILOT_BACKEND", "mock")
+    monkeypatch.setenv("LOCUM_BACKEND", "mock")
     spec = importlib.util.spec_from_file_location("sap_example_under_test", EXAMPLES / "sap_style_data_entry.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -286,7 +286,7 @@ def _csv(tmp_path, body):
 @pytest.mark.parametrize("raw", ["1.250,00", "1,25", "1,250", "NaN", "nan", "inf", "-inf", "1e3", "12.345",
                                  "0", "-15.00", "", "1 250.00", "abc"])
 def test_sap_parse_amount_rejects_ambiguous_or_invalid(sap, raw):
-    from pypilot.rpa import BusinessException
+    from locum.rpa import BusinessException
 
     with pytest.raises(BusinessException):
         sap.parse_amount(raw)
@@ -301,7 +301,7 @@ def test_sap_parse_amount_accepts_plain_and_decimal_comma(sap):
 
 
 def test_sap_example_never_reposts_after_save(sap, tmp_path, monkeypatch, capsys):
-    from pypilot.cli import DemoBackend
+    from locum.cli import DemoBackend
 
     orig = DemoBackend._set_status
     swallowed = []

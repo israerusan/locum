@@ -8,10 +8,10 @@ from __future__ import annotations
 import pytest
 from PIL import Image
 
-from pypilot import failsafe as fs_mod
-from pypilot.backends.mock import MockBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import ActionTimeout, BackendError, is_transient
+from locum import failsafe as fs_mod
+from locum.backends.mock import MockBackend
+from locum.desktop import Desktop
+from locum.errors import ActionTimeout, BackendError, is_transient
 
 
 class FakeTime:

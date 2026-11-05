@@ -1,22 +1,22 @@
 """Let an LLM operate the desktop -- with a safety policy, human confirmation and an audit log.
 
-    pip install "pypilot[llm]"
+    pip install "locum[llm]"
     export ANTHROPIC_API_KEY=...
     python examples/llm_agent.py "Enter invoice INV-7 from ACME Corp for 120.50 and pay it"
 
 Offline demo (no API key, no real input): a scripted model drives the demo
 desktop, and the confirmation prompt fires when it tries to submit a payment:
 
-    PYPILOT_BACKEND=mock python examples/llm_agent.py
+    LOCUM_BACKEND=mock python examples/llm_agent.py
 
 How it stays safe:
 
-* the :class:`~pypilot.llm.Policy` lets the agent act only in the allowed apps,
+* the :class:`~locum.llm.Policy` lets the agent act only in the allowed apps,
   blocks card numbers / ``rm -rf`` style text, caps the number and rate of
   actions, and asks ``confirm()`` before anything that looks like it commits
   money or data (pay, submit, delete, send, approve, post, ...);
 * every tool call -- allowed, blocked or declined -- is written to a JSON-lines
-  :class:`~pypilot.llm.AuditLog`;
+  :class:`~locum.llm.AuditLog`;
 * moving the mouse into a screen corner (fail-safe) aborts the run instantly.
 """
 
@@ -29,13 +29,13 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional
 
-from pypilot import Desktop
-from pypilot.llm import Agent, AgentStep, AuditLog, Policy, ScriptedClient, scripted_response, tool_use_block
+from locum import Desktop
+from locum.llm import Agent, AgentStep, AuditLog, Policy, ScriptedClient, scripted_response, tool_use_block
 
 
 def make_desktop() -> Desktop:
-    if os.environ.get("PYPILOT_BACKEND", "").lower() in ("mock", "demo"):
-        from pypilot.cli import DemoBackend
+    if os.environ.get("LOCUM_BACKEND", "").lower() in ("mock", "demo"):
+        from locum.cli import DemoBackend
 
         return Desktop(DemoBackend(), sleep=lambda s: None, default_timeout=2)
     return Desktop()
@@ -83,13 +83,13 @@ def scripted_demo_client() -> ScriptedClient:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    mock = os.environ.get("PYPILOT_BACKEND", "").lower() in ("mock", "demo")
+    mock = os.environ.get("LOCUM_BACKEND", "").lower() in ("mock", "demo")
     p = argparse.ArgumentParser(description="Run a desktop task with an LLM agent.")
     p.add_argument("task", nargs="?", default="Enter invoice INV-7 from ACME Corp for 120.50 and pay it.")
     p.add_argument("--model", default="claude-opus-5-5")
     p.add_argument("--mode", choices=("tools", "computer_use"), default="tools")
     p.add_argument("--allow-app", action="append", help="apps the agent may drive (default: any; demo: erp)")
-    p.add_argument("--audit", default=os.path.join(tempfile.gettempdir(), "pypilot_agent_audit.jsonl"))
+    p.add_argument("--audit", default=os.path.join(tempfile.gettempdir(), "locum_agent_audit.jsonl"))
     p.add_argument("--dry-run", action="store_true", help="simulate every action")
     p.add_argument("--offline", action="store_true", help="use the scripted demo model instead of the API")
     args = p.parse_args(argv)

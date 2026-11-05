@@ -1,13 +1,13 @@
-# pypilot vs PyAutoGUI vs UiPath
+# locum vs PyAutoGUI vs UiPath
 
-An honest comparison. pypilot aims to be strictly better than PyAutoGUI for
+An honest comparison. locum aims to be strictly better than PyAutoGUI for
 writing automation in Python, and to bring the robustness ideas of
 enterprise RPA (selectors, queues, retries, evidence) to code — plus native
 LLM control. It is **not** a replacement for the UiPath platform as a whole.
 
 ## At a glance
 
-| | PyAutoGUI | UiPath | pypilot |
+| | PyAutoGUI | UiPath | locum |
 |---|---|---|---|
 | What it is | Python library: synthetic input + screenshots | Commercial RPA platform (Studio, Robots, Orchestrator, …) | Python library: input, vision, accessibility, RPA, LLM control |
 | Authoring | Python | Visual designer (Studio), low-code; C#/VB expressions | Python, YAML/JSON flows, recorder output |
@@ -16,21 +16,21 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 
 ## Finding things on screen
 
-| | PyAutoGUI | UiPath | pypilot |
+| | PyAutoGUI | UiPath | locum |
 |---|---|---|---|
 | Coordinates | ✓ | ✓ | ✓ (any "target": point, rect, element, selector, image) |
 | Accessibility tree | — | ✓ UIA / MSAA / browser DOM / SAP / Java bridges | ✓ UIA (Windows), AX (macOS), AT-SPI (Linux) |
 | Selectors | — | XML selectors, fuzzy & anchor-based targeting | CSS-like (`window "ERP" button:has-text("Save")`), **UiPath-XML compatible subset** (`<wnd app='x' title='*'/><ctrl name='OK' role='push button'/>`), dict form |
-| Selector generation | — | Studio "Indicate element" | `pypilot inspect`, `selector_for(node)`, the recorder |
+| Selector generation | — | Studio "Indicate element" | `locum inspect`, `selector_for(node)`, the recorder |
 | Native actions (invoke / set value / toggle / expand) | — | ✓ ("simulate" input) | ✓ with automatic mouse fallback |
 | Template matching | ✓ (confidence needs OpenCV), no masks, single scale | ✓ image activities | NCC via FFT in numpy (OpenCV optional), **alpha masks**, multi-scale, multi-monitor, NMS for `locate_all`, color search |
-| OCR | — | ✓ (several engines, some paid) | pluggable: Tesseract (`pypilot[ocr]` installs pytesseract), RapidOCR and EasyOCR (separate optional installs); `find_text` / `click_text` with fuzzy matching |
+| OCR | — | ✓ (several engines, some paid) | pluggable: Tesseract (`locum[ocr]` installs pytesseract), RapidOCR and EasyOCR (separate optional installs); `find_text` / `click_text` with fuzzy matching |
 | Waiting | `time.sleep` | element-exists / wait activities | everything waits with timeouts: `find`, `wait(state=...)`, `wait_image`, `wait_until_stable`, `wait_for_change` |
 | Error messages | generic | good, Studio debugging | "No element matching `button "Sav"`; did you mean: `button "Save" #save`" |
 
 ## Input
 
-| | PyAutoGUI | UiPath | pypilot |
+| | PyAutoGUI | UiPath | locum |
 |---|---|---|---|
 | Mouse paths | tweens | instant / simulated | tweens + humanized Bézier paths with jitter/overshoot and Fitts's-law timing |
 | Unicode typing | limited (keymap-dependent) | ✓ | ✓ layout-independent injection (SendInput Unicode, XTEST spare keycodes, Quartz), paced per character; some apps can still drop keystrokes under load, so `Element.type` reads text fields back and repairs them; clipboard mode pastes |
@@ -40,7 +40,7 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 
 ## Automation at scale
 
-| | PyAutoGUI | UiPath | pypilot |
+| | PyAutoGUI | UiPath | locum |
 |---|---|---|---|
 | Retries, steps, logs | DIY | ✓ (Try/Catch, Retry Scope) | `Robot` tasks/steps with retries + backoff, structured logs |
 | Evidence & reports | — | Orchestrator logs, screenshots | error screenshots, `report.json` and self-contained `report.html` per run |
@@ -53,25 +53,25 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 
 ## LLM control
 
-| | PyAutoGUI | UiPath | pypilot |
+| | PyAutoGUI | UiPath | locum |
 |---|---|---|---|
 | LLM tool schemas | — | via UiPath AI products | `DesktopToolkit` → Anthropic, OpenAI and MCP schemas |
 | Set-of-marks observation | — | — | numbered elements + annotated, token-budgeted screenshot |
 | Claude computer-use toolset | — | — | `ComputerUseAdapter` (batches, scaling, legacy shape) |
-| MCP server | — | — | `pypilot mcp`, zero extra dependencies |
+| MCP server | — | — | `locum mcp`, zero extra dependencies |
 | Agent loop | — | agentic products (commercial) | `Agent` for Claude, any compatible client, offline `ScriptedClient` evals |
 | Guardrails | — | platform governance | `Policy`: allow/deny tools and apps, confirmations for consequential verbs, deny patterns, rate limits, screen region, dry-run |
 
 ## When to choose what
 
 * **PyAutoGUI** — you need a tiny dependency to move the mouse in a script
-  that will only ever run on one known screen. (pypilot's compat layer runs
+  that will only ever run on one known screen. (locum's compat layer runs
   those scripts unchanged when they outgrow it.)
 * **UiPath** — you are an organization that wants citizen developers building
   automations in a visual designer, central orchestration of many robots,
   credential vaults, SLAs, governance and vendor support, deep SAP/Citrix/
   mainframe integrations, and a budget for it.
-* **pypilot** — you write code; you want selector-based robustness, vision,
+* **locum** — you write code; you want selector-based robustness, vision,
   queues, reports and CI-testable automations in plain Python; you want LLM
   agents (Claude, MCP clients) to operate desktop apps with guardrails; and
   you want it free and open source.

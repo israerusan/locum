@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from pypilot.backends.mock import MockBackend
+from locum.backends.mock import MockBackend
 
 
 @pytest.fixture
@@ -16,8 +16,8 @@ def mock_backend():
 @pytest.fixture(scope="session")
 def xvfb_display():
     """Start a private Xvfb server (or reuse $DISPLAY). Skips if neither is available."""
-    if os.environ.get("PYPILOT_TEST_DISPLAY"):
-        yield os.environ["PYPILOT_TEST_DISPLAY"]
+    if os.environ.get("LOCUM_TEST_DISPLAY"):
+        yield os.environ["LOCUM_TEST_DISPLAY"]
         return
     xvfb = shutil.which("Xvfb")
     if not xvfb:

@@ -1,8 +1,8 @@
-"""pypilot in 60 seconds: windows, selectors, typing, screenshots and vision.
+"""locum in 60 seconds: windows, selectors, typing, screenshots and vision.
 
 Run it against the built-in demo desktop (safe anywhere, no real input):
 
-    PYPILOT_BACKEND=mock python examples/basic_automation.py
+    LOCUM_BACKEND=mock python examples/basic_automation.py
 
 or for real (opens Notepad / TextEdit / gedit and types into it):
 
@@ -17,13 +17,13 @@ import os
 import sys
 import tempfile
 
-from pypilot import Desktop, Humanize, WindowNotFound
+from locum import Desktop, Humanize, WindowNotFound
 
 
 def make_desktop() -> Desktop:
-    """The real desktop, or the in-memory demo desktop when PYPILOT_BACKEND=mock."""
-    if os.environ.get("PYPILOT_BACKEND", "").lower() in ("mock", "demo"):
-        from pypilot.cli import DemoBackend
+    """The real desktop, or the in-memory demo desktop when LOCUM_BACKEND=mock."""
+    if os.environ.get("LOCUM_BACKEND", "").lower() in ("mock", "demo"):
+        from locum.cli import DemoBackend
 
         return Desktop(DemoBackend(), humanize=Humanize(seed=7), sleep=lambda s: None)
     return Desktop(humanize=True)  # human-like Bezier mouse motion
@@ -63,13 +63,13 @@ def main() -> int:
         editor = win.find("edit, document")
         d.move(editor)                       # humanized motion when enabled
         editor.click()
-        d.type("Hello from pypilot!\n")      # layout-independent unicode typing
+        d.type("Hello from locum!\n")      # layout-independent unicode typing
         d.type("Selectors > coordinates.\n")
         d.hotkey("mod+end")                  # mod = ctrl, or cmd on macOS
         print("editor now contains:", repr(editor.refresh().value))
 
         # 3. Screenshots and template matching (alpha channel of a needle = mask).
-        shot_path = os.path.join(tempfile.gettempdir(), "pypilot_window.png")
+        shot_path = os.path.join(tempfile.gettempdir(), "locum_window.png")
         win.screenshot().save(shot_path)
         title_bar = d.screenshot((win.rect.left, win.rect.top, min(160, win.rect.width), 24))
         match = d.locate(title_bar, confidence=0.95, region=win.rect)   # region= keeps it fast
@@ -78,7 +78,7 @@ def main() -> int:
             print(f"found the title bar again at {match.rect} (confidence {match.confidence:.3f})")
 
         # 4. What would an LLM see? A numbered, set-of-marks view of the screen.
-        from pypilot.llm import observe
+        from locum.llm import observe
 
         obs = observe(d, window=win, screenshot=False)
         print(obs.text().splitlines()[-1])

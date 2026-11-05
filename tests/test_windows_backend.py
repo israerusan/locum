@@ -22,9 +22,9 @@ from typing import Any, Dict, List, Optional
 import pytest
 from PIL import Image
 
-import pypilot.backends.windows as winmod
-from pypilot.backends import create_backend
-from pypilot.backends.base import (
+import locum.backends.windows as winmod
+from locum.backends import create_backend
+from locum.backends.base import (
     CAP_ACCESSIBILITY,
     CAP_CLIPBOARD,
     CAP_HSCROLL,
@@ -35,7 +35,7 @@ from pypilot.backends.base import (
     CAP_WINDOWS,
     ROLES,
 )
-from pypilot.backends.windows import (
+from locum.backends.windows import (
     EXTENDED_KEYS,
     INJECTED_EXTRA_INFO,
     INPUT,
@@ -71,9 +71,9 @@ from pypilot.backends.windows import (
     utf16_units,
     vk_for_key,
 )
-from pypilot.errors import BackendError, BackendUnavailable, NotSupported, WindowNotFound
-from pypilot.keys import KEYS
-from pypilot.types import MouseButton, Point, Rect
+from locum.errors import BackendError, BackendUnavailable, NotSupported, WindowNotFound
+from locum.keys import KEYS
+from locum.types import MouseButton, Point, Rect
 
 PTR64 = ctypes.sizeof(ctypes.c_void_p) == 8
 
@@ -82,7 +82,7 @@ PTR64 = ctypes.sizeof(ctypes.c_void_p) == 8
 def test_module_imports_without_windows():
     # A fresh interpreter: importing must not touch windll/WINFUNCTYPE or comtypes.
     code = (
-        "import sys; import pypilot.backends.windows as w; "
+        "import sys; import locum.backends.windows as w; "
         "assert 'comtypes' not in sys.modules; print(w.WindowsBackend.name)"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
@@ -1472,7 +1472,7 @@ def test_uia_unavailable_reports_not_supported(be, monkeypatch):
 
 def test_uia_nodes_expose_app_for_selectors(be, api):
     """[app=...] / <wnd app=...> selectors must work on UIA trees (regression)."""
-    from pypilot.selectors import parse
+    from locum.selectors import parse
 
     _desktop(api)
     edit = FakeElement(50004, "Text Editor", pid=100, hwnd=0)  # WPF-like: no own HWND
@@ -1528,7 +1528,7 @@ def test_char_keys_honour_capslock(be, api):
 def test_keyboard_layout_chars_reach_backend_unchanged(be, api):
     """Keyboard.press/type(mode="keys") must not rewrite "@" into US "shift+2": on a
     German layout "@" is AltGr+Q and Shift+2 types '"' (regression)."""
-    from pypilot.keyboard import Keyboard
+    from locum.keyboard import Keyboard
 
     api.layout_table = {"@": 0x651, '"': 0x132, "2": 0x32, "q": 0x51, "Q": 0x151, "#": 0xBF}
     altgr_q = [(0xA2, False), (0xA4, False), (0x51, False), (0x51, True), (0xA4, True), (0xA2, True)]
@@ -1568,7 +1568,7 @@ def test_dead_key_characters_fall_back_to_unicode(be, api):
 def test_popup_menus_are_accessibility_roots(be, api):
     """Context menus / menu-bar drop-downs are untitled tool windows that UIA parents
     to the desktop: they must still be searchable roots (front-most first)."""
-    from pypilot.desktop import Desktop
+    from locum.desktop import Desktop
 
     excel = api.add(FakeWin(0x100, "Book1 - Excel", Rect(0, 0, 1200, 800), pid=50, exe="C:\\Office\\EXCEL.EXE",
                             cls="XLMAIN"))
@@ -1609,7 +1609,7 @@ def test_popup_menus_are_accessibility_roots(be, api):
 def test_app_names_follow_pid_reuse(be, api):
     """Windows recycles PIDs: [app=...] must name the process that owns the PID now,
     as list_windows() does, not a cached exited one (regression)."""
-    from pypilot.selectors import parse
+    from locum.selectors import parse
 
     def setup(title, exe):
         api.wins.clear()
@@ -1691,7 +1691,7 @@ def test_failed_release_stays_tracked_for_retry(be, api):
     ]
     assert not be._held and not be._buttons_down
     # Keyboard keeps its own record too, so its release_all() can retry
-    from pypilot.keyboard import Keyboard
+    from locum.keyboard import Keyboard
 
     kb = Keyboard(be, sleep=lambda s: None)
     kb.down("shift")
@@ -1705,7 +1705,7 @@ def test_failed_release_stays_tracked_for_retry(be, api):
 
 def test_type_text_is_paced_per_character_keeping_surrogate_pairs(api):
     """Windows 11 Notepad garbles long KEYEVENTF_UNICODE bursts (seen on a real
-    machine: 'Hello pypilot \\ude80\\ude80...'). Each character must be its own
+    machine: 'Hello locum \\ude80\\ude80...'). Each character must be its own
     SendInput call -- a surrogate pair together -- with a pause in between."""
     sleeps = []
     nb = WindowsBackend(_api=api, dpi_aware=False, sleep=sleeps.append, type_char_delay=0.01)

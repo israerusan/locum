@@ -5,16 +5,16 @@ import json
 
 import pytest
 
-from pypilot.backends import mock
-from pypilot.backends.mock import MockBackend
-from pypilot.cli import DemoBackend
-from pypilot.desktop import Desktop
-from pypilot.errors import PolicyViolation
-from pypilot.llm import AuditLog, DesktopToolkit, Policy
-from pypilot.llm.agent import Agent, ScriptedClient, scripted_response, tool_use_block
-from pypilot.llm.computer_use import ComputerUseAdapter
-from pypilot.llm.tools import ToolSpec
-from pypilot.rpa.recorder import Recorder
+from locum.backends import mock
+from locum.backends.mock import MockBackend
+from locum.cli import DemoBackend
+from locum.desktop import Desktop
+from locum.errors import PolicyViolation
+from locum.llm import AuditLog, DesktopToolkit, Policy
+from locum.llm.agent import Agent, ScriptedClient, scripted_response, tool_use_block
+from locum.llm.computer_use import ComputerUseAdapter
+from locum.llm.tools import ToolSpec
+from locum.rpa.recorder import Recorder
 
 from test_llm_tools_review3_fixes import _transfer
 
@@ -232,8 +232,8 @@ def test_recorder_never_saves_passwords(password_states, tmp_path):
     flow = json.dumps(rec.to_flow())
     script = rec.to_python()
     assert "S3cr3t" not in flow and "S3cr3t" not in script and "S3cr3t" not in repr(rec.actions)
-    assert "${env.PYPILOT_PASSWORD}" in flow and "alice" in flow
-    assert "import os" in script and "os.environ['PYPILOT_PASSWORD']" in script
+    assert "${env.LOCUM_PASSWORD}" in flow and "alice" in flow
+    assert "import os" in script and "os.environ['LOCUM_PASSWORD']" in script
     compile(script, "rec.py", "exec")
     assert rec.actions[0].to_dict()["secret"] is True
     # Typed (key events) into the focused password field.
@@ -243,7 +243,7 @@ def test_recorder_never_saves_passwords(password_states, tmp_path):
     for ch in "hunter2":
         rec.feed(("type", ch))
     rec.stop()
-    assert "hunter2" not in json.dumps(rec.to_flow()) and "PYPILOT_PASSWORD" in rec.to_python()
+    assert "hunter2" not in json.dumps(rec.to_flow()) and "LOCUM_PASSWORD" in rec.to_python()
 
 
 def test_toolkit_and_computer_use_redact_passwords(password_states):

@@ -5,10 +5,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from pypilot import ocr
-from pypilot.errors import NotSupported
-from pypilot.ocr import OCRWord
-from pypilot.types import Match, Rect
+from locum import ocr
+from locum.errors import NotSupported
+from locum.ocr import OCRWord
+from locum.types import Match, Rect
 
 
 def W(text, x, y, w=None, h=12, conf=0.9, line=0):
@@ -64,7 +64,7 @@ def test_registry_and_default(fake, monkeypatch):
     ocr.set_default_ocr_engine("fake")
     assert ocr.get_ocr_engine() is fake
     ocr.set_default_ocr_engine(None)
-    monkeypatch.setenv("PYPILOT_OCR_ENGINE", "fake")
+    monkeypatch.setenv("LOCUM_OCR_ENGINE", "fake")
     assert ocr.get_ocr_engine() is fake
     with pytest.raises(NotSupported):
         ocr.get_ocr_engine("nope")
@@ -110,7 +110,7 @@ def test_factory_import_error_becomes_not_supported():
 def test_auto_detection_order_and_install_hint(monkeypatch):
     saved = dict(ocr._factories)
     saved_inst = dict(ocr._instances)
-    monkeypatch.delenv("PYPILOT_OCR_ENGINE", raising=False)
+    monkeypatch.delenv("LOCUM_OCR_ENGINE", raising=False)
     try:
         def unavailable():
             raise NotSupported("missing")
