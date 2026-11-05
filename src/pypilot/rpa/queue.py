@@ -13,14 +13,58 @@ status per item exactly like UiPath Orchestrator queues:
   marked ``failed``.
 * With ``path=...`` the queue is persisted to JSON after every transition, so a
   crashed or interrupted run **resumes** where it stopped: re-opening the queue
-  keeps finished items. Items left ``in_progress`` by a crash may already have
-  had their side effects (the payment went out, then the robot died), so by
-  default they are marked ``failed`` (error type ``Abandoned``) for a human to
-  check, like Orchestrator's *Abandoned* status; ``on_abandoned="requeue"``
+  keeps finished items.
+* Claiming an item (:meth:`WorkQueue.next`, used by :meth:`WorkQueue.process`)
+  gives the worker a **lease**: the item records ``worker_id`` and
+  ``lease_expires_at`` (default ``lease_duration`` 30 minutes).
+  :meth:`WorkQueue.process` renews the lease automatically while the handler
+  runs (every ``lease_duration / 3``); code that calls ``next()`` itself must
+  call :meth:`WorkQueue.renew` for items that take longer than the lease. An
+  ``in_progress`` item is *abandoned* -- its worker died -- when its lease has
+  expired, when it has no lease at all (files written by older pypilot
+  versions), or when its worker process on this machine no longer exists
+  (``reclaim_dead_workers=True``, the default). Abandoned items may already
+  have had their side effects (the payment went out, then the robot died), so
+  by default they are marked ``failed`` (error type ``Abandoned``) for a human
+  to check, like Orchestrator's *Abandoned* status; ``on_abandoned="requeue"``
   puts them back to ``new`` instead, still bounded by ``process(retries=...)``
   because :attr:`QueueItem.attempts` is persisted and enforced across runs.
   An item whose handler is interrupted (Ctrl+C, kill hotkey, fail-safe) is
   handled the same way (``failed`` with error type ``Interrupted`` by default).
+  A worker whose lease was taken over (it was considered dead) gets
+  :class:`LeaseLostError` from ``complete``/``fail``/``renew`` instead of
+  overwriting the new owner's state; ``process()`` skips such items and lists
+  them in ``lost_ids``.
+
+Concurrency guarantees (``path=...`` with ``autosave=True``, the default):
+
+* Several threads, several :class:`WorkQueue` instances and several
+  **processes on one machine** may share one queue file on a **local
+  filesystem**. Every mutating operation (``add``/``load``, ``next``,
+  ``complete``, ``fail``, ``renew``, ``release``, ``retry_items``, ``remove``,
+  ``clear``, ``save``) runs under an exclusive OS lock on the sidecar file
+  ``<path>.lock`` (``msvcrt.locking`` on Windows, ``fcntl.flock`` on POSIX)
+  plus an in-process lock, re-reads the file if another writer changed it (a
+  ``generation`` counter in the file, bumped on every write), applies the
+  change, writes a temp file, ``flush`` + ``os.fsync``, ``os.replace``, and on
+  POSIX fsyncs the directory. No snapshot taken outside the lock is ever
+  written, so an item is claimed by exactly one worker and no update is lost.
+* Read-only accessors (``items``, ``get``, ``pending``, ``summary``...) show
+  this instance's view as of its last operation; :meth:`WorkQueue.refresh`
+  re-reads the file (``process()`` does so before returning its summary).
+* Exactly-once *processing* is only as strong as the lease: an item is run
+  twice only if its worker stalls past the lease without renewing and
+  ``on_abandoned="requeue"`` hands it to another worker (with the default
+  ``"fail"`` it goes to a human instead).
+
+Not guaranteed / unsupported: network shares (SMB, NFS...), and workers on
+**several machines** sharing one file (file locks are unreliable there, and
+"is that worker's process still alive" cannot be checked); a queue opened with
+``autosave=False`` is single-owner -- its explicit :meth:`WorkQueue.save`
+writes that instance's state under the lock without merging other writers'
+changes. Older pypilot versions do not take the lock, so do not mix them with
+this one on a shared file. A jump of the system clock larger than the lease
+can expire leases early.
 * Items loaded from files get a ``reference`` derived from the file's resolved
   path and the row's *content* (``/abs/path/invoices.csv#<hash>``), and
   duplicate references are ignored, so re-running "load CSV then process" is
@@ -47,24 +91,38 @@ status per item exactly like UiPath Orchestrator queues:
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import dataclasses
 import datetime as _dt
 import hashlib
 import json
 import os
 import pathlib
+import re
+import socket
 import threading
 import time
 import traceback as _tb
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .. import failsafe as _failsafe
 from ..errors import FailSafeTriggered, PypilotError
 
+try:  # POSIX
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None  # type: ignore[assignment]
+try:  # Windows
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    _msvcrt = None  # type: ignore[assignment]
+
 __all__ = [
     "BusinessException",
+    "LeaseLostError",
     "QueueItem",
     "WorkQueue",
     "NEW",
@@ -91,7 +149,15 @@ _FINAL = (SUCCESS, FAILED, BUSINESS_EXCEPTION)
 ABANDONED_POLICIES = ("fail", "requeue")
 
 PathLike = Union[str, "os.PathLike[str]"]
+#: Still 1: version-1 files load unchanged and the new keys (``generation``, lease fields) are optional.
 _FORMAT_VERSION = 1
+#: Default lease of a claimed item, seconds (renewed every third of it by :meth:`WorkQueue.process`).
+DEFAULT_LEASE_DURATION = 30 * 60.0
+#: Default time to wait for the queue file lock before raising ``TimeoutError``, seconds.
+DEFAULT_LOCK_TIMEOUT = 60.0
+
+_HOST = socket.gethostname()
+_HEADER_RE = re.compile(rb'^\{\s*"format":\s*"pypilot\.workqueue",\s*"version":\s*\d+,\s*"generation":\s*(\d+)')
 
 
 class BusinessException(PypilotError):
@@ -103,8 +169,192 @@ class BusinessException(PypilotError):
     """
 
 
+class LeaseLostError(PypilotError):
+    """This worker no longer holds (or never held) the lease of an ``in_progress`` item.
+
+    Raised by :meth:`WorkQueue.complete`, :meth:`WorkQueue.fail`,
+    :meth:`WorkQueue.renew` and :meth:`WorkQueue.release` instead of
+    overwriting the state another worker owns: the lease expired (or this
+    worker was considered dead) and the item was reclaimed, or the item is
+    being processed by another live worker.
+    """
+
+
 def _now() -> float:
     return time.time()
+
+
+def _default_worker_id() -> str:
+    return f"{_HOST}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether process ``pid`` exists on this machine. Unknown answers count as alive (never steal)."""
+    if pid <= 0:
+        return True
+    if pid == os.getpid():
+        return True
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process
+            try:
+                code = wintypes.DWORD()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except Exception:  # PermissionError (someone else's process) and anything unexpected
+        return True
+    return True
+
+
+# ------------------------------------------------------------------ file locking
+_PATH_LOCKS: Dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _reset_path_locks() -> None:  # pragma: no cover - runs in forked children
+    global _PATH_LOCKS_GUARD
+    _PATH_LOCKS.clear()
+    _PATH_LOCKS_GUARD = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # a lock held by another thread of the parent would never be released
+    os.register_at_fork(after_in_child=_reset_path_locks)
+
+
+def _path_lock(key: str) -> threading.Lock:
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = _PATH_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _os_trylock(fd: int) -> None:
+    """Take the exclusive OS lock on ``fd`` or raise ``OSError`` if another holder has it."""
+    if _msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+    elif _fcntl is not None:
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+
+def _os_unlock(fd: int) -> None:
+    if _msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+    elif _fcntl is not None:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: pathlib.Path, timeout: float) -> Iterator[None]:
+    """Exclusive lock shared by threads (in-process lock) and processes (OS lock on ``lock_path``)."""
+    deadline = time.monotonic() + timeout
+    plock = _path_lock(os.path.normcase(os.path.abspath(str(lock_path))))
+    if not plock.acquire(timeout=max(0.0, timeout)):
+        raise TimeoutError(f"timed out after {timeout:g}s waiting for the queue lock {lock_path}")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            delay = 0.001
+            while True:
+                try:
+                    _os_trylock(fd)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"timed out after {timeout:g}s waiting for the queue lock {lock_path} "
+                                           "(held by another process)") from None
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.05)
+            try:
+                yield
+            finally:
+                _os_unlock(fd)
+        finally:
+            os.close(fd)
+    finally:
+        plock.release()
+
+
+def _peek_generation(path: pathlib.Path) -> Optional[int]:
+    """The ``generation`` of a file this module wrote (read from its first bytes), else ``None``."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return None
+    m = _HEADER_RE.match(head)
+    return int(m.group(1)) if m else None
+
+
+def _replace(src: pathlib.Path, dst: pathlib.Path) -> None:
+    # On Windows a reader without FILE_SHARE_DELETE (antivirus, an indexer, an editor) briefly blocks the replace.
+    for attempt in range(40):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 39:
+                raise
+            time.sleep(0.025)
+
+
+def _fsync_dir(directory: pathlib.Path) -> None:
+    if os.name == "nt":  # directories cannot be opened for fsync on Windows; NTFS journals the rename
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _same_file(a: pathlib.Path, b: pathlib.Path) -> bool:
+    def norm(p: pathlib.Path) -> str:
+        return os.path.normcase(os.path.abspath(str(p)))
+
+    return norm(a) == norm(b)
+
+
+def _atomic_write(target: pathlib.Path, text: str) -> None:
+    """Write ``text`` to a temp file, fsync it, rename it over ``target``, fsync the directory."""
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        _replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(target.parent)
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -153,6 +403,15 @@ class QueueItem:
     traceback: Optional[str] = None
     output: Dict[str, Any] = field(default_factory=dict)
     history: List[Dict[str, Any]] = field(default_factory=list)
+    #: Worker that claimed the item most recently (kept after it finishes, for auditing).
+    worker_id: Optional[str] = None
+    #: Host name and process id of that worker (used to detect a dead worker on this machine).
+    worker_host: Optional[str] = None
+    worker_pid: Optional[int] = None
+    #: Identifies one claim; ``None`` unless the item is ``in_progress``.
+    lease_id: Optional[str] = None
+    #: Epoch seconds after which an ``in_progress`` item counts as abandoned; ``None`` unless ``in_progress``.
+    lease_expires_at: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload, dict):
@@ -196,11 +455,23 @@ class QueueItem:
             "payload": _jsonable(self.payload),
             "output": _jsonable(self.output),
             "history": _jsonable(self.history),
+            "worker_id": self.worker_id,
+            "worker_host": self.worker_host,
+            "worker_pid": self.worker_pid,
+            "lease_id": self.lease_id,
+            "lease_expires_at": self.lease_expires_at,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "QueueItem":
+        pid = d.get("worker_pid")
+        expires = d.get("lease_expires_at")
         return cls(
+            worker_id=d.get("worker_id"),
+            worker_host=d.get("worker_host"),
+            worker_pid=int(pid) if pid is not None else None,
+            lease_id=d.get("lease_id"),
+            lease_expires_at=float(expires) if expires is not None else None,
             payload=dict(d.get("payload") or {}),
             id=str(d.get("id") or uuid.uuid4().hex[:12]),
             reference=d.get("reference"),
@@ -228,17 +499,32 @@ class WorkQueue:
     Args:
         name: Queue name (used in summaries/reports).
         path: JSON file to persist to. If it exists, its state is loaded
-            (resume); items left ``in_progress`` are handled per ``on_abandoned``.
-        autosave: Save after every change (only when ``path`` is set).
+            (resume); abandoned ``in_progress`` items are handled per ``on_abandoned``.
+            Several processes on one machine may share it (see module docstring).
+        autosave: Save after every change (only when ``path`` is set). With
+            ``False`` the instance is the file's only owner: nothing is
+            written until :meth:`save`, which does not merge other writers' changes.
         unique_references: Ignore :meth:`add` calls whose ``reference`` is
             already in the queue (returns the existing item instead).
-        on_abandoned: What to do on resume with items a previous run left
-            ``in_progress`` (it died mid-transaction, possibly after the side
-            effect): ``"fail"`` (default) marks them ``failed`` with error type
-            ``Abandoned`` so a human can check and :meth:`retry_items` them;
-            ``"requeue"`` puts them back to ``new`` (their attempt still counts
-            towards ``process(retries=...)``). Also applies to an item whose
-            handler :meth:`process` sees interrupted (error type ``Interrupted``).
+        on_abandoned: What to do with ``in_progress`` items whose worker died
+            mid-transaction, possibly after the side effect (lease expired, no
+            lease, or worker process gone): ``"fail"`` (default) marks them
+            ``failed`` with error type ``Abandoned`` so a human can check and
+            :meth:`retry_items` them; ``"requeue"`` puts them back to ``new``
+            (their attempt still counts towards ``process(retries=...)``). Also
+            applies to an item whose handler :meth:`process` sees interrupted
+            (error type ``Interrupted``).
+        worker_id: This worker's name, recorded on the items it claims
+            (default ``"<host>:<pid>:<random>"``).
+        lease_duration: Seconds a claimed item stays reserved for this worker
+            without a :meth:`renew` (default 30 minutes; :meth:`process`
+            renews automatically).
+        lock_timeout: Seconds to wait for the queue file lock before raising
+            ``TimeoutError`` (default 60).
+        reclaim_dead_workers: Treat an ``in_progress`` item as abandoned before
+            its lease expires when the worker that claimed it was a process on
+            this machine that no longer exists (default ``True``; disable when
+            workers with the same host name run in separate PID namespaces).
     """
 
     def __init__(
@@ -249,23 +535,261 @@ class WorkQueue:
         autosave: bool = True,
         unique_references: bool = True,
         on_abandoned: str = "fail",
+        worker_id: Optional[str] = None,
+        lease_duration: float = DEFAULT_LEASE_DURATION,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+        reclaim_dead_workers: bool = True,
     ):
         if on_abandoned not in ABANDONED_POLICIES:
             raise ValueError(f"on_abandoned must be one of {', '.join(ABANDONED_POLICIES)}, got {on_abandoned!r}")
+        if not float(lease_duration) > 0:
+            raise ValueError("lease_duration must be > 0")
+        if not float(lock_timeout) > 0:
+            raise ValueError("lock_timeout must be > 0")
         self.on_abandoned = on_abandoned
         self.name = name
         self.path: Optional[pathlib.Path] = pathlib.Path(path).expanduser() if path is not None else None
         self.autosave = autosave
         self.unique_references = unique_references
+        self.worker_id = str(worker_id) if worker_id is not None else _default_worker_id()
+        self.lease_duration = float(lease_duration)
+        self.lock_timeout = float(lock_timeout)
+        self.reclaim_dead_workers = bool(reclaim_dead_workers)
         self._items: List[QueueItem] = []
         self._by_id: Dict[str, QueueItem] = {}
         self._by_ref: Dict[str, QueueItem] = {}
         self._lock = threading.RLock()
+        self._claims: Dict[str, str] = {}  # item id -> lease_id of the claims this instance holds
+        self._generation = 0
+        self._disk_sig: Optional[Tuple[int, int, int]] = None
+        self._txn_depth = 0
+        self._dirty = False
         self.created_at = _now()
         self.resumed = False
+        self._initial_load = True  # the first load takes the stored name / created_at
         if self.path is not None and self.path.exists():
-            self._load_state(self.path)
+            if self.autosave:
+                with self._txn():
+                    pass  # load, recover abandoned items, and write the recovery
+            else:
+                with self._lock, _file_lock(self._lock_path(self.path), self.lock_timeout):
+                    self._refresh_locked()
             self.resumed = True
+        self._initial_load = False
+
+    # ---------------------------------------------------------- transactions
+    @staticmethod
+    def _lock_path(path: pathlib.Path) -> pathlib.Path:
+        return path.with_name(path.name + ".lock")
+
+    def _persistent(self) -> bool:
+        return self.path is not None and self.autosave
+
+    def _touch(self) -> None:
+        """Mark the state changed: the enclosing transaction writes it."""
+        self._dirty = True
+
+    @contextlib.contextmanager
+    def _txn(self) -> Iterator[None]:
+        """Run a mutation atomically: thread lock; with persistence also file lock, reload, write.
+
+        Re-entrant: a nested call (``add_many`` -> ``add``) joins the outer
+        transaction, which writes once at the end.
+        """
+        with self._lock:
+            if self._txn_depth or not self._persistent():
+                yield
+                return
+            assert self.path is not None
+            with _file_lock(self._lock_path(self.path), self.lock_timeout):
+                self._dirty = False
+                self._txn_depth += 1
+                try:
+                    if self._refresh_locked():
+                        self._dirty = True
+                    yield
+                except BaseException:
+                    self._disk_sig = None  # memory may be half-changed: re-read the file next time
+                    raise
+                finally:
+                    self._txn_depth -= 1
+                if self._dirty:
+                    self._write_locked(self.path)
+                    self._dirty = False
+
+    def refresh(self) -> "WorkQueue":
+        """Re-read the queue file (other workers' changes) and recover abandoned items. Returns ``self``.
+
+        Existing :class:`QueueItem` objects are updated in place. With
+        ``autosave=False`` this replaces unsaved in-memory changes with the file's state.
+        """
+        if self.path is None:
+            return self
+        if self._persistent():
+            with self._txn():
+                pass
+        elif self.path.exists():
+            with self._lock, _file_lock(self._lock_path(self.path), self.lock_timeout):
+                self._disk_sig = None
+                self._refresh_locked()
+        return self
+
+    def _refresh_locked(self) -> bool:
+        """With the file lock held: load the file if another writer changed it. True if recovery changed items."""
+        assert self.path is not None
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            gen = _peek_generation(self.path)
+            sig = (gen if gen is not None else -1, st.st_size, st.st_mtime_ns)
+            if gen is None or sig != self._disk_sig:
+                self._apply_file(self._read_file(self.path))
+                self._disk_sig = sig
+        return self._recover_abandoned()
+
+    @staticmethod
+    def _read_file(path: pathlib.Path) -> Dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} is not a valid queue file: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise ValueError(f"{path} is not a pypilot work queue file (no 'items' list)")
+        return data
+
+    def _apply_file(self, data: Dict[str, Any]) -> None:
+        """Make the file's state ours, updating the existing :class:`QueueItem` objects in place."""
+        if self._initial_load:
+            self.name = str(data.get("name") or self.name)
+            self.created_at = float(data.get("created_at") or self.created_at)
+        try:
+            self._generation = max(self._generation, int(data.get("generation") or 0))
+        except (TypeError, ValueError):
+            pass
+        items: List[QueueItem] = []
+        by_id: Dict[str, QueueItem] = {}
+        by_ref: Dict[str, QueueItem] = {}
+        for raw in data["items"]:
+            fresh = QueueItem.from_dict(raw)
+            if fresh.id in by_id:
+                continue
+            current = self._by_id.get(fresh.id)
+            if current is not None:
+                if self._owns(current) and fresh.status == IN_PROGRESS and fresh.lease_id == current.lease_id:
+                    fresh = current  # our live claim: only we change it, keep what the handler did to it
+                else:
+                    for f in dataclasses.fields(QueueItem):
+                        setattr(current, f.name, getattr(fresh, f.name))
+                    fresh = current
+            items.append(fresh)
+            by_id[fresh.id] = fresh
+            if fresh.reference is not None and fresh.reference not in by_ref:
+                by_ref[fresh.reference] = fresh
+        self._items, self._by_id, self._by_ref = items, by_id, by_ref
+        for item_id in [i for i in self._claims if i not in by_id]:
+            del self._claims[item_id]
+
+    def _write_locked(self, target: pathlib.Path) -> None:
+        self._generation += 1
+        text = json.dumps(self.to_dict(), indent=2, ensure_ascii=False, default=str)
+        _atomic_write(target, text)
+        st = os.stat(target)
+        self._disk_sig = (self._generation, st.st_size, st.st_mtime_ns)
+
+    # ----------------------------------------------------------------- leases
+    def _owns(self, it: QueueItem) -> bool:
+        claim = self._claims.get(it.id)
+        return claim is not None and it.status == IN_PROGRESS and it.lease_id == claim
+
+    def _abandon_reason(self, it: QueueItem, now: float) -> Optional[str]:
+        if it.status != IN_PROGRESS or self._owns(it):
+            return None
+        if it.lease_expires_at is None:
+            return "it has no lease (written by an older pypilot or a run that crashed)"
+        if now >= it.lease_expires_at:
+            return f"the lease of worker {it.worker_id!r} expired"
+        if (self.reclaim_dead_workers and it.worker_host == _HOST and it.worker_pid is not None
+                and not _pid_alive(int(it.worker_pid))):
+            return f"worker {it.worker_id!r} (pid {it.worker_pid}) is no longer running"
+        return None
+
+    def _recover_abandoned(self) -> bool:
+        """Apply ``on_abandoned`` to ``in_progress`` items whose worker died. True if anything changed."""
+        if self.path is None:
+            return False  # in memory there is no other worker: every in_progress item is one of ours
+        now = _now()
+        changed = False
+        for it in self._items:
+            reason = self._abandon_reason(it, now)
+            if reason is None:
+                continue
+            changed = True
+            previous = it.worker_id
+            if self.on_abandoned == "requeue":
+                self._reset(it, "abandoned", reset_attempts=False)
+                it.history[-1].update({"attempt": it.attempts, "reason": reason, "worker": previous})
+            else:
+                it.status = FAILED
+                it.finished_at = now
+                it.error = ("abandoned: the previous run stopped while processing this item; "
+                            "its side effects may already have happened - check, then retry_items() if needed"
+                            f" ({reason})")
+                it.error_type = "Abandoned"
+                it.traceback = None
+                self._end_lease(it)
+                it.history.append({"time": now, "event": "abandoned", "attempt": it.attempts,
+                                   "reason": reason, "worker": previous})
+        return changed
+
+    def _end_lease(self, it: QueueItem) -> None:
+        it.lease_id = None
+        it.lease_expires_at = None
+        self._claims.pop(it.id, None)
+
+    def _check_owner(self, it: QueueItem) -> None:
+        """Raise :class:`LeaseLostError` if ``it`` is (or was) claimed and this worker is not the owner."""
+        claim = self._claims.get(it.id)
+        if claim is not None:
+            if not self._owns(it):
+                self._claims.pop(it.id, None)
+                by = f" by worker {it.worker_id!r}" if it.status == IN_PROGRESS else f"; it is now {it.status!r}"
+                raise LeaseLostError(f"Item {it.id} ({it.reference or 'no reference'}) of queue {self.name!r}: "
+                                     f"this worker's lease was lost (it was reclaimed{by})")
+        elif it.status == IN_PROGRESS and it.lease_id is not None and self._abandon_reason(it, _now()) is None:
+            raise LeaseLostError(f"Item {it.id} ({it.reference or 'no reference'}) of queue {self.name!r} "
+                                 f"is being processed by worker {it.worker_id!r}")
+
+    def renew(self, item: Union[QueueItem, str], duration: Optional[float] = None) -> QueueItem:
+        """Extend this worker's lease on ``item`` to ``duration`` (default ``lease_duration``) seconds from now.
+
+        Raises :class:`LeaseLostError` when this worker does not hold the item's lease.
+        """
+        d = self.lease_duration if duration is None else float(duration)
+        if not d > 0:
+            raise ValueError("duration must be > 0")
+        with self._txn():
+            it = self._item(item)
+            if not self._owns(it):
+                self._check_owner(it)
+                raise LeaseLostError(f"Item {it.id} of queue {self.name!r} is not claimed by this worker")
+            it.lease_expires_at = _now() + d
+            self._touch()
+            return it
+
+    def release(self, item: Union[QueueItem, str]) -> QueueItem:
+        """Give a claimed item back (``new``) without running it; the attempt does not count."""
+        with self._txn():
+            it = self._item(item)
+            if not self._owns(it):
+                self._check_owner(it)
+                raise LeaseLostError(f"Item {it.id} of queue {self.name!r} is not claimed by this worker")
+            it.attempts = max(0, it.attempts - 1)
+            self._reset(it, "released", reset_attempts=False)
+            self._touch()
+            return it
 
     # ---------------------------------------------------------------- basics
     @classmethod
@@ -317,14 +841,14 @@ class WorkQueue:
         if not isinstance(payload, dict):
             raise TypeError(f"payload must be a dict, not {type(payload).__name__}")
         ref = None if reference is None else str(reference)
-        with self._lock:
+        with self._txn():
             if ref is not None and self.unique_references and ref in self._by_ref:
                 return self._by_ref[ref]
             item = QueueItem(payload=dict(payload), reference=ref, priority=int(priority))
             while item.id in self._by_id:  # astronomically unlikely, but cheap to guard
                 item.id = uuid.uuid4().hex[:12]
             self._append(item)
-            self._autosave()
+            self._touch()
             return item
 
     def _append(self, item: QueueItem) -> None:
@@ -373,14 +897,9 @@ class WorkQueue:
             elif reference_prefix is not None:
                 ref = f"{reference_prefix}#{idx}"
             entries.append((payload, ref))
-        with self._lock:
-            saved, self.autosave = self.autosave, False
-            try:
-                for payload, ref in entries:
-                    added.append(self.add(payload, reference=ref, priority=priority))
-            finally:
-                self.autosave = saved
-            self._autosave()
+        with self._txn():  # one lock, one write for the whole batch
+            for payload, ref in entries:
+                added.append(self.add(payload, reference=ref, priority=priority))
         return added
 
     def load_csv(
@@ -504,19 +1023,16 @@ class WorkQueue:
             return self.add_many(rows, reference_field=reference_field, priority=priority)
         added: List[QueueItem] = []
         seen: Dict[str, int] = {}
-        with self._lock:
-            saved, self.autosave = self.autosave, False
-            try:
-                for idx, payload in enumerate(rows):
-                    if not isinstance(payload, dict):
-                        raise TypeError(f"item {idx}: payload must be a dict, not {type(payload).__name__}")
-                    base = self.source_reference(path, payload)
-                    seen[base] = seen.get(base, 0) + 1
-                    ref = base if seen[base] == 1 else f"{base}~{seen[base]}"
-                    added.append(self.add(payload, reference=ref, priority=priority))
-            finally:
-                self.autosave = saved
-            self._autosave()
+        entries: List[tuple] = []
+        for idx, payload in enumerate(rows):  # validate every row before adding any
+            if not isinstance(payload, dict):
+                raise TypeError(f"item {idx}: payload must be a dict, not {type(payload).__name__}")
+            base = self.source_reference(path, payload)
+            seen[base] = seen.get(base, 0) + 1
+            entries.append((payload, base if seen[base] == 1 else f"{base}~{seen[base]}"))
+        with self._txn():  # one lock, one write for the whole file
+            for payload, ref in entries:
+                added.append(self.add(payload, reference=ref, priority=priority))
         return added
 
     def load(self, path: PathLike, **kw: Any) -> List[QueueItem]:
@@ -535,22 +1051,36 @@ class WorkQueue:
 
     # ------------------------------------------------------------ transactions
     def next(self) -> Optional[QueueItem]:
-        """Take the next pending item (highest priority first) and mark it ``in_progress``."""
-        with self._lock:
+        """Claim the next pending item (highest priority first): mark it ``in_progress`` with a lease for this worker.
+
+        With a queue file this is atomic across threads and processes: the file
+        is re-read under its lock first, so no two workers get the same item,
+        and abandoned items (expired lease, dead worker) are recovered per
+        ``on_abandoned`` before choosing. The lease lasts ``lease_duration``
+        seconds; call :meth:`renew` for longer work (:meth:`process` does).
+        """
+        with self._txn():
             pending = self.pending()
             if not pending:
                 return None
             item = pending[0]
             self._start(item)
-            self._autosave()
+            self._touch()
             return item
 
     def _start(self, item: QueueItem) -> None:
+        now = _now()
         item.status = IN_PROGRESS
         item.attempts += 1
-        item.started_at = item.started_at or _now()
+        item.started_at = item.started_at or now
         item.finished_at = None
-        item.history.append({"time": _now(), "event": "started", "attempt": item.attempts})
+        item.worker_id = self.worker_id
+        item.worker_host = _HOST
+        item.worker_pid = os.getpid()
+        item.lease_id = uuid.uuid4().hex
+        item.lease_expires_at = now + self.lease_duration
+        self._claims[item.id] = item.lease_id
+        item.history.append({"time": now, "event": "started", "attempt": item.attempts, "worker": self.worker_id})
 
     def _item(self, item: Union[QueueItem, str]) -> QueueItem:
         found = self.get(item) if isinstance(item, str) else item
@@ -559,31 +1089,39 @@ class WorkQueue:
         return found
 
     def complete(self, item: Union[QueueItem, str], output: Optional[Dict[str, Any]] = None) -> QueueItem:
-        """Mark ``item`` ``success`` (merging ``output`` into :attr:`QueueItem.output`)."""
-        with self._lock:
+        """Mark ``item`` ``success`` (merging ``output`` into :attr:`QueueItem.output`).
+
+        Raises :class:`LeaseLostError` if another worker owns the item now.
+        """
+        with self._txn():
             it = self._item(item)
+            self._check_owner(it)
+            self._end_lease(it)
             it.status = SUCCESS
             it.finished_at = _now()
             it.error = it.error_type = it.traceback = None
             if output:
                 it.output.update(output)
             it.history.append({"time": it.finished_at, "event": SUCCESS, "attempt": it.attempts})
-            self._autosave()
+            self._touch()
             return it
 
     def fail(self, item: Union[QueueItem, str], error: Union[BaseException, str], *, business: Optional[bool] = None) -> QueueItem:
         """Mark ``item`` ``failed`` or ``business_exception``.
 
         ``business=None`` decides from the error: :class:`BusinessException` instances are business failures.
+        Raises :class:`LeaseLostError` if another worker owns the item now.
         """
-        with self._lock:
+        with self._txn():
             it = self._item(item)
+            self._check_owner(it)
+            self._end_lease(it)
             is_business = isinstance(error, BusinessException) if business is None else bool(business)
             it.status = BUSINESS_EXCEPTION if is_business else FAILED
             it.finished_at = _now()
             self._set_error(it, error)
             it.history.append({"time": it.finished_at, "event": it.status, "attempt": it.attempts, "error": it.error})
-            self._autosave()
+            self._touch()
             return it
 
     @staticmethod
@@ -597,15 +1135,17 @@ class WorkQueue:
 
     def retry_items(self, statuses: Sequence[str] = (FAILED,), *, reset_attempts: bool = True) -> List[QueueItem]:
         """Put items with the given statuses back to ``new`` (e.g. retry everything that failed)."""
-        with self._lock:
+        with self._txn():
             items = self.by_status(*statuses)
             for it in items:
                 self._reset(it, "requeued", reset_attempts=reset_attempts)
-            self._autosave()
+            if items:
+                self._touch()
             return items
 
-    @staticmethod
-    def _reset(it: QueueItem, event: str, *, reset_attempts: bool) -> None:
+    def _reset(self, it: QueueItem, event: str, *, reset_attempts: bool) -> None:
+        self._end_lease(it)
+        it.worker_id = it.worker_host = it.worker_pid = None
         it.status = NEW
         it.started_at = it.finished_at = None
         it.error = it.error_type = it.traceback = None
@@ -614,21 +1154,23 @@ class WorkQueue:
         it.history.append({"time": _now(), "event": event})
 
     def remove(self, item: Union[QueueItem, str]) -> QueueItem:
-        with self._lock:
+        with self._txn():
             it = self._item(item)
             self._items.remove(it)
             del self._by_id[it.id]
+            self._claims.pop(it.id, None)
             if it.reference is not None and self._by_ref.get(it.reference) is it:
                 del self._by_ref[it.reference]
-            self._autosave()
+            self._touch()
             return it
 
     def clear(self) -> None:
-        with self._lock:
+        with self._txn():
             self._items.clear()
             self._by_id.clear()
             self._by_ref.clear()
-            self._autosave()
+            self._claims.clear()
+            self._touch()
 
     def process(
         self,
@@ -673,91 +1215,145 @@ class WorkQueue:
         (it may be half done), processing stops and the timeout propagates; the
         remaining items stay ``new``.
 
+        Several workers (threads or processes) may call ``process`` on one
+        queue file at once: each claims its items with :meth:`next`, and the
+        lease of the current item is renewed every ``lease_duration / 3``
+        seconds while its handler runs and during retry waits. If the lease is
+        lost anyway (this worker stalled past it and another worker reclaimed
+        the item), the item is left to its new owner and listed in ``lost_ids``.
+
         Returns:
-            :meth:`summary` plus ``processed`` (items finished by this call) and
-            ``processed_ids``.
+            :meth:`summary` (re-read from the file, so it covers every worker)
+            plus ``processed`` (items finished by this call), ``processed_ids``
+            and ``lost_ids``.
         """
         if int(retries) < 0:
             raise ValueError("retries must be >= 0")
         if retry_delay < 0:
             raise ValueError("retry_delay must be >= 0")
         processed: List[str] = []
+        lost: List[str] = []
         while limit is None or len(processed) < int(limit):
             item = self.next()
             if item is None:
                 break
-            delay = float(retry_delay)
-            budget = int(retries) + 1
-            if item.attempts > budget:
-                # Earlier runs already used every attempt (e.g. the item crashed the process each time).
-                self.fail(item, f"retry limit reached: {item.attempts - 1} earlier attempt(s), retries={int(retries)}", business=False)
-                processed.append(item.id)
-                if on_item is not None:
-                    on_item(item)
-                if stop_on_failure:
-                    break
+            heartbeat = self._start_heartbeat(item)
+            try:
+                self._process_one(item, handler, retries=int(retries), retry_delay=float(retry_delay),
+                                  backoff=float(backoff), sleep=sleep)
+            except LeaseLostError:
+                # Another worker took the item over (this one was considered dead): its state is theirs now.
+                lost.append(item.id)
                 continue
-            while True:
-                try:
-                    result = handler(item)
-                except BusinessException as exc:
-                    self.fail(item, exc, business=True)
-                    break
-                except (FailSafeTriggered, KeyboardInterrupt) as exc:
-                    self._interrupted_in_handler(item, exc)
-                    raise
-                except Exception as exc:
-                    if getattr(exc, TASK_DEADLINE_ATTR, False):
-                        # The robot task's deadline: every later attempt would fail at once. Stop here.
-                        self.fail(item, exc, business=False)
-                        raise
-                    if item.attempts >= budget:
-                        self.fail(item, exc, business=False)
-                        break
-                    with self._lock:
-                        self._set_error(item, exc)
-                        item.history.append({"time": _now(), "event": "retry", "attempt": item.attempts, "error": item.error})
-                        item.attempts += 1
-                        self._autosave()
-                    if delay > 0:
-                        try:
-                            if sleep is time.sleep:
-                                # Wakes up at once on abort() (kill hotkey) instead of after the whole delay.
-                                _failsafe.abortable_sleep(delay)
-                            else:
-                                sleep(delay)
-                            _failsafe._raise_if_aborted()
-                        except (FailSafeTriggered, KeyboardInterrupt):
-                            self._interrupted_in_wait(item)  # the attempt it was waiting for never started
-                            raise
-                    delay *= float(backoff)
-                    continue
-                self.complete(item, result if isinstance(result, dict) else None)
-                if result is not None and not isinstance(result, dict):
-                    with self._lock:
-                        item.output["result"] = _jsonable(result)
-                        self._autosave()
-                break
+            finally:
+                if heartbeat is not None:
+                    heartbeat()
             processed.append(item.id)
             if on_item is not None:
                 on_item(item)
             if stop_on_failure and item.status == FAILED:
                 break
+        if self._persistent():
+            self.refresh()  # the summary covers every worker's progress
         stats = self.summary()
         stats["processed"] = len(processed)
         stats["processed_ids"] = processed
+        stats["lost_ids"] = lost
         return stats
 
+    def _process_one(self, item: QueueItem, handler: Callable[[QueueItem], Any], *, retries: int,
+                     retry_delay: float, backoff: float, sleep: Callable[[float], Any]) -> None:
+        delay = retry_delay
+        budget = retries + 1
+        if item.attempts > budget:
+            # Earlier runs already used every attempt (e.g. the item crashed the process each time).
+            self.fail(item, f"retry limit reached: {item.attempts - 1} earlier attempt(s), retries={retries}", business=False)
+            return
+        while True:
+            try:
+                result = handler(item)
+            except BusinessException as exc:
+                self.fail(item, exc, business=True)
+                return
+            except (FailSafeTriggered, KeyboardInterrupt) as exc:
+                self._interrupted_in_handler(item, exc)
+                raise
+            except Exception as exc:
+                if getattr(exc, TASK_DEADLINE_ATTR, False):
+                    # The robot task's deadline: every later attempt would fail at once. Stop here.
+                    try:
+                        self.fail(item, exc, business=False)
+                    except LeaseLostError:
+                        pass
+                    raise
+                if item.attempts >= budget:
+                    self.fail(item, exc, business=False)
+                    return
+                with self._txn():
+                    self._check_owner(item)
+                    self._set_error(item, exc)
+                    item.history.append({"time": _now(), "event": "retry", "attempt": item.attempts, "error": item.error})
+                    item.attempts += 1
+                    self._touch()
+                if delay > 0:
+                    try:
+                        if sleep is time.sleep:
+                            # Wakes up at once on abort() (kill hotkey) instead of after the whole delay.
+                            _failsafe.abortable_sleep(delay)
+                        else:
+                            sleep(delay)
+                        _failsafe._raise_if_aborted()
+                    except (FailSafeTriggered, KeyboardInterrupt):
+                        self._interrupted_in_wait(item)  # the attempt it was waiting for never started
+                        raise
+                delay *= backoff
+                continue
+            if isinstance(result, dict):
+                self.complete(item, result)
+            else:
+                self.complete(item, None if result is None else {"result": _jsonable(result)})
+            return
+
+    def _start_heartbeat(self, item: QueueItem) -> Optional[Callable[[], None]]:
+        """Renew ``item``'s lease every ``lease_duration / 3`` in a thread; returns the function that stops it."""
+        if not self._persistent():
+            return None
+        stop = threading.Event()
+        interval = max(self.lease_duration / 3.0, 0.01)
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                try:
+                    self.renew(item)
+                except LeaseLostError:
+                    return
+                except Exception:  # a lock timeout or a transient I/O error: try again next beat
+                    continue
+
+        thread = threading.Thread(target=beat, name=f"pypilot-queue-lease-{item.id}", daemon=True)
+        thread.start()
+
+        def stop_heartbeat() -> None:
+            stop.set()
+            thread.join()
+
+        return stop_heartbeat
+
     def _interrupted_in_wait(self, item: QueueItem) -> None:
-        with self._lock:
+        with self._txn():
+            if not self._owns(item):
+                return  # another worker has it now
             # Stopped by the human between attempts: no attempt was running, so nothing
             # can be half done. The attempt it was waiting for does not count.
             item.attempts = max(0, item.attempts - 1)
             self._reset(item, "interrupted", reset_attempts=False)
-            self._autosave()
+            self._touch()
 
     def _interrupted_in_handler(self, item: QueueItem, exc: BaseException) -> None:
-        with self._lock:
+        with self._txn():
+            if not self._owns(item):
+                return  # another worker has it now
+            self._touch()
             # Stopped while the handler was running: its side effect (the payment) may
             # already have happened, exactly like a crash mid-transaction -> on_abandoned.
             if self.on_abandoned == "requeue":
@@ -770,9 +1366,9 @@ class WorkQueue:
                               "its side effects may already have happened - check, then retry_items() if needed")
                 item.error_type = "Interrupted"
                 item.traceback = None
+                self._end_lease(item)
                 item.history.append({"time": item.finished_at, "event": "interrupted", "attempt": item.attempts,
                                      "error": item.error})
-            self._autosave()
 
     # -------------------------------------------------------------------- stats
     def summary(self) -> Dict[str, Any]:
@@ -802,6 +1398,8 @@ class WorkQueue:
             return {
                 "format": "pypilot.workqueue",
                 "version": _FORMAT_VERSION,
+                # Keep "generation" third: _peek_generation reads it from the first bytes of the file.
+                "generation": self._generation,
                 "name": self.name,
                 "created_at": self.created_at,
                 "saved": _iso(_now()),
@@ -810,48 +1408,32 @@ class WorkQueue:
             }
 
     def save(self, path: Optional[PathLike] = None) -> str:
-        """Write the queue state to ``path`` (default :attr:`path`) atomically. Returns the path."""
+        """Write the queue state to ``path`` (default :attr:`path`) atomically and durably. Returns the path.
+
+        Saving to the queue's own file (with ``autosave``) first re-reads it under
+        the lock, so other workers' changes are kept, never overwritten by an
+        older snapshot. With ``autosave=False`` this instance's state is written
+        as is (single owner). Another ``path`` gets a copy of this instance's state.
+        Every write goes to a temp file that is fsynced, then renamed over the target.
+        """
         target = pathlib.Path(path).expanduser() if path is not None else self.path
         if target is None:
             raise ValueError("No path given and the queue has no persistence path")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        text = json.dumps(self.to_dict(), indent=2, ensure_ascii=False, default=str)
-        tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, target)
-        return str(target)
-
-    def _autosave(self) -> None:
-        if self.autosave and self.path is not None:
-            self.save()
-
-    def _load_state(self, path: pathlib.Path) -> None:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{path} is not a valid queue file: {exc}") from exc
-        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-            raise ValueError(f"{path} is not a pypilot work queue file (no 'items' list)")
-        self.name = str(data.get("name") or self.name)
-        self.created_at = float(data.get("created_at") or self.created_at)
-        for raw in data["items"]:
-            item = QueueItem.from_dict(raw)
-            if item.status == IN_PROGRESS:  # the previous run died mid-transaction
-                if self.on_abandoned == "requeue":
-                    self._reset(item, "abandoned", reset_attempts=False)
+        with self._lock:
+            if self.path is not None and _same_file(target, self.path):
+                if self._persistent():
+                    with self._txn():
+                        self._touch()
                 else:
-                    item.status = FAILED
-                    item.finished_at = _now()
-                    item.error = ("abandoned: the previous run stopped while processing this item; "
-                                  "its side effects may already have happened - check, then retry_items() if needed")
-                    item.error_type = "Abandoned"
-                    item.traceback = None
-                    item.history.append({"time": item.finished_at, "event": "abandoned", "attempt": item.attempts})
-            if item.id in self._by_id:
-                continue
-            self._append(item)
+                    with _file_lock(self._lock_path(self.path), self.lock_timeout):
+                        self._generation = max(self._generation, _peek_generation(self.path) or 0)
+                        self._write_locked(self.path)
+                return str(target)
+            with _file_lock(self._lock_path(target), self.lock_timeout):
+                snapshot = self.to_dict()
+                snapshot["generation"] = max(self._generation, _peek_generation(target) or 0) + 1
+                _atomic_write(target, json.dumps(snapshot, indent=2, ensure_ascii=False, default=str))
+        return str(target)
 
     def export_csv(self, path: PathLike, *, encoding: str = "utf-8") -> str:
         """Write a flat CSV report: id, reference, status, attempts, error, payload and output fields."""
