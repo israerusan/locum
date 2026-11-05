@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import pathlib
 import time
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 from .types import Match, Monitor, Point, Rect, RectLike
 from . import vision
@@ -249,7 +249,7 @@ class Screen:
         baseline = self.capture(region, monitor=monitor)
         while True:
             elapsed = clock() - start
-            if elapsed >= timeout and timeout > 0:
+            if timeout > 0 and elapsed >= timeout - 1e-9:
                 return False
             if timeout > 0:
                 sleep(max(0.0, min(interval, timeout - elapsed)))
@@ -288,13 +288,14 @@ class Screen:
         start = clock()
         reference = self.capture(region, monitor=monitor)
         quiet_since = start
+        eps = 1e-9  # tolerate float accumulation in clocks
         while True:
             now = clock()
-            if now - quiet_since >= stable_for:
+            if now - quiet_since >= stable_for - eps:
                 return True
-            if now - start >= timeout:
+            if now - start >= timeout - eps:
                 return False
-            sleep(max(0.0, interval))
+            sleep(max(0.0, min(interval, timeout - (now - start))))
             current = self.capture(region, monitor=monitor)
             now = clock()
             if self._difference(reference, current, metric, pixel_tolerance) > threshold:

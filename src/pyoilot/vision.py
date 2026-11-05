@@ -42,7 +42,7 @@ import math
 import os
 import pathlib
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageColor, ImageDraw, ImageFont
@@ -268,8 +268,8 @@ def crop(image: ImageSource, region: RectLike) -> Image.Image:
 # ------------------------------------------------------------------- FFT machinery
 def _fast_len(n: int) -> int:
     """Smallest 5-smooth integer >= n (fast FFT sizes)."""
-    if n <= 16:
-        return max(1, n)
+    if n <= 1:
+        return 1
     best = 1 << (n - 1).bit_length()
     p5 = 1
     while p5 < best:
@@ -442,7 +442,8 @@ def _flat_needle_score(s1: Sequence[np.ndarray], s2: np.ndarray, tmean: np.ndarr
     for k, s in enumerate(s1):
         ssd -= (2.0 * float(tmean[k])) * s
     ssd += n * float((tmean ** 2).sum())
-    np.maximum(ssd, 0.0, out=ssd)
+    # Snap rounding noise (cancellation in the window sums) to an exact match.
+    ssd[ssd < 1e-3 * n * len(s1)] = 0.0
     ssd /= n * len(s1)
     np.sqrt(ssd, out=ssd)
     ssd /= -_FLAT_SCALE
@@ -597,16 +598,23 @@ def locate(
     for score, tw, th, s, dx, dy in _iter_score_maps(needle, haystack, grayscale, scales, region):
         if score.size == 0:
             continue
-        idx = int(np.argmax(score))
+        peak = float(score.max())
+        # among (numerically) tied peaks prefer the first in reading order
+        idx = int(np.argmax(score >= peak - 1e-9))
         y, x = divmod(idx, score.shape[1])
-        val = float(score[y, x])
+        val = peak
         if best is None or val > best[0] + 1e-9:
             best = (val, x + dx, y + dy, tw, th, s)
     if best is None or best[0] < confidence:
         return None
     val, x, y, tw, th, s = best
     ox, oy = int(offset[0]), int(offset[1])
-    return Match(Rect(int(x) + ox, int(y) + oy, tw, th), confidence=max(0.0, min(1.0, val)), scale=s)
+    return Match(Rect(int(x) + ox, int(y) + oy, tw, th), confidence=_conf(val), scale=s)
+
+
+def _conf(value: float) -> float:
+    """Clip to 0..1 and drop floating-point noise (a perfect match reports exactly 1.0)."""
+    return round(max(0.0, min(1.0, float(value))), 9)
 
 
 def _pool_block(th: int, tw: int, overlap: float) -> Tuple[int, int]:
@@ -648,7 +656,7 @@ def _nms(
 ) -> List[int]:
     """Greedy non-max suppression; returns kept indices in descending score order."""
     # Sort by score desc, ties broken top-to-bottom then left-to-right (deterministic).
-    order = np.lexsort((xs, ys, -scores))
+    order = np.lexsort((xs, ys, -np.round(scores, 9)))
     x1, y1 = xs[order].astype(np.float64), ys[order].astype(np.float64)
     x2, y2 = x1 + ws[order], y1 + hs[order]
     areas = (x2 - x1) * (y2 - y1)
@@ -723,7 +731,7 @@ def locate_all(
     return [
         Match(
             Rect(int(xs[i]) + ox, int(ys[i]) + oy, int(ws[i]), int(hs[i])),
-            confidence=max(0.0, min(1.0, float(vs[i]))),
+            confidence=_conf(vs[i]),
             scale=float(ss[i]),
         )
         for i in kept

@@ -147,9 +147,13 @@ class TestLocate:
         assert m is not None and m.confidence == pytest.approx(1.0)
         assert Rect(10, 40, 30, 20).contains(m.rect.center)
         ms = vision.locate_all(needle, hay, overlap=0.0)
-        assert len(ms) == 6  # 3 x 2 non-overlapping tiles fit in 30x20
-        for mm in ms:
+        assert 2 <= len(ms) <= 6  # at most 3 x 2 non-overlapping tiles fit in 30x20
+        assert ms[0].rect == Rect(10, 40, 10, 10)  # exact ties resolve in reading order
+        for i, mm in enumerate(ms):
             assert mm.rect.intersect(Rect(10, 40, 30, 20)) == mm.rect
+            assert mm.confidence == 1.0
+            for other in ms[i + 1 :]:
+                assert mm.rect.iou(other.rect) == 0.0
         # a different solid color does not match
         assert vision.locate(np.full((10, 10, 3), 90, np.uint8), hay) is None
 
@@ -518,3 +522,56 @@ def test_crop():
     c = vision.crop(arr, (5, 6, 7, 8))
     assert c.size == (7, 8)
     assert np.array_equal(np.asarray(c), arr[6:14, 5:12])
+
+
+def test_locate_prefers_reading_order_among_identical_copies():
+    hay = noise(100, 100, seed=90)
+    icon = noise(10, 10, seed=91)
+    for x, y in [(70, 70), (60, 5), (5, 40)]:
+        hay[y : y + 10, x : x + 10] = icon
+    m = vision.locate(icon, hay)
+    assert (m.rect.left, m.rect.top) == (60, 5)
+    assert m.confidence == 1.0
+
+
+def test_cv2_fast_path_is_used_and_post_processed(monkeypatch):
+    """Exercise the optional OpenCV path with a stand-in implementation."""
+    calls = []
+
+    class FakeCV2:
+        TM_CCOEFF_NORMED = 5
+
+        @staticmethod
+        def matchTemplate(hay, ndl, method):
+            calls.append((hay.dtype, hay.shape, ndl.shape, method))
+            h3 = hay if hay.ndim == 3 else hay[:, :, None]
+            n3 = ndl if ndl.ndim == 3 else ndl[:, :, None]
+            th, tw = n3.shape[:2]
+            out = np.zeros((h3.shape[0] - th + 1, h3.shape[1] - tw + 1), np.float32)
+            b = n3 - n3.reshape(-1, n3.shape[2]).mean(0)
+            for y in range(out.shape[0]):
+                for x in range(out.shape[1]):
+                    win = h3[y : y + th, x : x + tw]
+                    a = win - win.reshape(-1, n3.shape[2]).mean(0)
+                    den = np.sqrt((a * a).sum() * (b * b).sum())
+                    out[y, x] = (a * b).sum() / den if den else np.nan  # real cv2 can emit nan/inf here
+            return out
+
+    monkeypatch.delenv("PYOILOT_DISABLE_CV2", raising=False)
+    monkeypatch.setattr(vision, "_CV2", FakeCV2)
+    monkeypatch.setattr(vision, "_CV2_CHECKED", True)
+    hay = noise(30, 30, seed=100)
+    hay[:, 20:] = 77  # flat area -> must score 0, never nan
+    needle = hay[5:12, 3:11].copy()
+    score = vision.match_template(needle, hay)
+    assert calls and calls[0][3] == FakeCV2.TM_CCOEFF_NORMED and calls[0][0] == np.float32
+    assert np.all(np.isfinite(score)) and np.all(score[:, 20:] == 0)
+    assert vision.locate(needle, hay).rect == Rect(3, 5, 8, 7)
+    assert vision.locate(needle, hay, grayscale=True).rect == Rect(3, 5, 8, 7)
+    assert calls[-1][1] == (30, 30) and calls[-1][2] == (7, 8)  # 2-D arrays in grayscale mode
+    # masked needles never use cv2
+    n = len(calls)
+    rgba = np.dstack([needle, np.full(needle.shape[:2], 255, np.uint8)])
+    rgba[0, 0, 3] = 0
+    assert vision.locate(rgba, hay).rect == Rect(3, 5, 8, 7)
+    assert len(calls) == n
