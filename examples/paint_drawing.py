@@ -28,7 +28,8 @@ from locum import Desktop, ElementNotFound, Rect
 
 # Tried in order; the first one that matches inside the Paint window is the canvas.
 CANVAS_SELECTORS = [
-    'pane[name*="canvas" i], custom[name*="canvas" i], image[name*="canvas" i]',
+    'group#image',  # Windows 11 Paint: group "Using Brush tool on Canvas", automation id "image"
+    'group[name*="canvas" i], pane[name*="canvas" i], custom[name*="canvas" i], image[name*="canvas" i]',
     '[class_name="MSPaintView"]',  # classic mspaint
 ]
 

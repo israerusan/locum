@@ -484,14 +484,16 @@ Both ship a mock version of their app, so they run anywhere without touching you
 ```bash
 python examples/calculator_selectors.py --backend mock
 python examples/paint_drawing.py --backend mock
-python tools/make_demo_gif.py                              # re-records docs/demo.gif from the mock runs
+python tools/make_demo_gif.py                              # a GIF of the mock runs
+python tools/make_demo_gif.py --real                       # re-records docs/demo.gif on the real desktop
 ```
 
-![The Calculator and Paint demos running on locum's mock desktop](https://raw.githubusercontent.com/israerusan/locum/main/docs/demo.gif)
+![locum driving the real Windows 11 Calculator and Paint](https://raw.githubusercontent.com/israerusan/locum/main/docs/demo.gif)
 
-*Recorded on locum's in-memory mock desktop (`tools/make_demo_gif.py`), not on a real
-Windows screen: the windows are the demos' mock Calculator and Paint, driven by the same
-selector and drag code that runs against the real apps.*
+*Recorded on a real Windows 11 desktop with `tools/make_demo_gif.py --real`: locum
+launches Calculator, keys in `12+30` by automation id and reads the result, then draws
+on the Paint canvas it finds by selector (`group#image`), and closes only the windows it
+opened.*
 
 ## License
 

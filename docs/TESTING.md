@@ -179,3 +179,9 @@ clipboard is recorded as `***`, and is scrubbed from error and log messages.
 Screenshots show the screen as it is (password fields show bullets, but other
 sensitive data on screen is captured): use `screenshots="errors"` or `False`,
 or `redact=[...]` for known strings in text, where that matters.
+
+Screenshots are of the **whole screen**, so a trace of a test run on your own
+desktop also contains every other window that was visible (a terminal, mail,
+a browser). Keep the trace directory out of version control
+(`.locum-traces/` in `.gitignore`), and run UI tests on a dedicated machine or
+VM, or with `--locum-trace off`, when that matters.
