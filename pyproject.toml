@@ -45,7 +45,9 @@ llm = ["anthropic>=0.40"]
 ocr = ["pytesseract>=0.3.10"]
 record = ["pynput>=1.7"]
 yaml = ["pyyaml>=6.0"]
-all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0"]
+# SAP GUI Scripting bridge (locum.bridges.sap): COM through pywin32. The Java Access Bridge needs nothing extra.
+sap = ["pywin32>=306; sys_platform == 'win32'"]
+all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0", "pywin32>=306; sys_platform == 'win32'"]
 dev = ["pytest>=7", "pyyaml>=6.0"]
 
 [project.scripts]
