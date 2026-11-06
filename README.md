@@ -307,8 +307,11 @@ print(result.success, result.final_text)
 {"mcpServers": {"locum": {"command": "locum", "args": ["mcp", "--policy", "default"]}}}
 ```
 
-or `claude mcp add locum -- locum mcp --policy default` for Claude Code.
-Details, prompting tips and the safety model: [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md).
+or `claude mcp add locum -- locum mcp --policy default` for Claude Code
+(`locum-mcp` and `python -m locum.mcp` start the same server). Setup for
+Claude Code / Claude Desktop, options and timeouts:
+[`docs/MCP.md`](https://github.com/israerusan/locum/blob/main/docs/MCP.md).
+Prompting tips and the safety model: [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md).
 
 ### Safety policy
 

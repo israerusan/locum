@@ -167,8 +167,11 @@ class AccessibleNode(abc.ABC):
 
     def walk(self, max_depth: int = 64) -> Iterator["AccessibleNode"]:
         """Depth-first pre-order traversal including ``self``."""
+        from .._cancel import check
+
         stack = [(self, 0)]
         while stack:
+            check()  # a cancelled / timed-out call stops here, not after the whole tree
             node, depth = stack.pop()
             yield node
             if depth < max_depth:

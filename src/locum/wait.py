@@ -25,6 +25,7 @@ import math
 import time
 from typing import Any, Callable, Optional, Tuple, Type, TypeVar, Union
 
+from ._cancel import check as _cancel_check
 from .errors import ActionTimeout, FailSafeTriggered, PolicyViolation, is_transient
 
 T = TypeVar("T")
@@ -113,6 +114,7 @@ def wait_until(
     attempts = 0
     while True:
         attempts += 1
+        _cancel_check()  # an MCP call that timed out / was cancelled stops polling
         try:
             result = predicate()
         except NEVER_SWALLOWED:
@@ -191,6 +193,7 @@ def retry_call(
     attempt = 0
     while True:
         attempt += 1
+        _cancel_check()
         try:
             return fn(*args, **kwargs)
         except NEVER_SWALLOWED:

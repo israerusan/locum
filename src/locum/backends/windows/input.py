@@ -8,12 +8,14 @@ import ctypes
 import time
 from typing import Any, List, Sequence, Tuple
 
-from ...errors import BackendError
+from ...errors import BackendError, PermissionDenied
 from ...keys import normalize_key, split_text_tokens
 from ...types import MouseButton, Point, Rect
 from ._win32api import (
     ERROR_ACCESS_DENIED,
     INPUT,
+    INPUT_KEYBOARD,
+    INPUT_MOUSE,
     KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE,
@@ -65,9 +67,59 @@ class _Held:
 class _InputMixin:
     """Mouse and keyboard input of :class:`WindowsBackend` (``SendInput``)."""
 
+    def _uipi_check(self, inputs: Sequence[INPUT]) -> None:
+        """Raise :class:`PermissionDenied` when Windows would silently drop ``inputs``
+        because their target window runs at a higher integrity level (UIPI)."""
+        guard = getattr(self, "_uipi", None)
+        if guard is None:
+            from .integrity import UipiGuard
+
+            guard = self._uipi = UipiGuard(self._api)
+        a = self._api
+        targets = []
+        if any(int(i.type) == INPUT_KEYBOARD for i in inputs):
+            fg = getattr(a, "GetForegroundWindow", None)
+            if fg is not None:
+                targets.append(("keyboard input to", fg()))
+        moves_only = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE_NOCOALESCE
+        if any(int(i.type) == INPUT_MOUSE and int(i.u.mi.dwFlags) & ~moves_only for i in inputs):
+            wfp, anc = getattr(a, "WindowFromPoint", None), getattr(a, "GetAncestor", None)
+            if wfp is not None:
+                pt = POINT()
+                if a.GetCursorPos(ctypes.byref(pt)):
+                    h = wfp(pt)
+                    if h and anc is not None:
+                        h = anc(h, 2) or h  # GA_ROOT: the top-level window
+                    targets.append(("clicks on", h))
+        for what, hwnd in targets:
+            if not hwnd:
+                continue
+            try:
+                pid = self._pid(int(hwnd))
+                blocked = guard.block(int(hwnd), pid)
+            except Exception:
+                continue  # a failed check never blocks input
+            if blocked:
+                from .integrity import level_name
+
+                own, target = blocked
+                app = ""
+                try:
+                    app = self._process_name(pid)
+                except Exception:
+                    pass
+                raise PermissionDenied(
+                    f"Windows blocks {what} {app or 'pid ' + str(pid)} (pid {pid}): it runs at "
+                    f"{level_name(target)} integrity (elevated / \"Run as administrator\") and locum runs at "
+                    f"{level_name(own)}, so User Interface Privilege Isolation (UIPI) would silently drop the "
+                    "input. Run locum from an elevated (administrator) process to drive it, or run the "
+                    "application unelevated."
+                )
+
     def _send(self, inputs: Sequence[INPUT]) -> None:
         """SendInput in chunks; raise if Windows rejects the events."""
         self._check()
+        self._uipi_check(inputs)
         for start in range(0, len(inputs), _SENDINPUT_CHUNK):
             chunk = inputs[start:start + _SENDINPUT_CHUNK]
             arr = (INPUT * len(chunk))(*chunk)

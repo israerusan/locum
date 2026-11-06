@@ -786,6 +786,10 @@ class DesktopToolkit:
 
     #: Seconds ``find_elements`` spends building selectors for its listing.
     SELECTOR_BUDGET = 3.0
+    #: Seconds ``observe`` / ``screenshot`` may spend walking the accessibility trees
+    #: (``observe_kwargs={"time_budget": ...}`` overrides; ``None`` = no limit). Past it
+    #: the observation is returned partial, naming the windows it could not finish.
+    OBSERVE_BUDGET: Optional[float] = 8.0
 
     def __init__(
         self,
@@ -1311,6 +1315,7 @@ class DesktopToolkit:
         """
         kw = dict(self.observe_kwargs)
         kw["screenshot"] = bool(include_screenshot)
+        kw.setdefault("time_budget", self.OBSERVE_BUDGET)
         obs = observe(self.desktop, window=window, **kw)
         self.last_observation = obs
         img = obs.image_base64(annotated=True) if obs.screenshot is not None else None
@@ -1325,12 +1330,13 @@ class DesktopToolkit:
         kw = dict(self.observe_kwargs)
         kw["screenshot"] = True
         kw["annotate"] = bool(annotated)
+        kw.setdefault("time_budget", self.OBSERVE_BUDGET)
         obs = observe(self.desktop, **kw)
         self.last_observation = obs
         w, h = obs.image_size
         return ToolResult(
             f"Screenshot {w}x{h} (screen {obs.screen_size[0]}x{obs.screen_size[1]}, scale {obs.scale:.4g}); "
-            f"{len(obs.elements)} element ids refreshed.",
+            f"{len(obs.elements)} element ids refreshed." + "".join(f"\nNote: {n}" for n in obs.notes),
             image_base64=obs.image_base64(annotated=annotated),
             data=obs,
         )

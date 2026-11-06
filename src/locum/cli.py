@@ -831,7 +831,10 @@ def cmd_mcp(ctx: _Ctx) -> int:
     a = ctx.args
     policy = _build_policy(a.policy, dry_run=a.dry_run, allowed_apps=a.allow_app, max_actions=a.max_actions)
     audit = AuditLog(os.path.expanduser(a.audit)) if a.audit else AuditLog()
-    server = MCPServer(ctx.desktop, policy, audit)
+    t = a.call_timeout
+    if t is not None and (t != t or t < 0 or t == float("inf")):
+        raise _UsageError("--call-timeout must be a finite number >= 0")
+    server = MCPServer(ctx.desktop, policy, audit, call_timeout=t or None)
     be = ctx.desktop.backend
     ctx.info(f"locum {__version__} MCP server on stdio (backend={getattr(be, 'name', '?')}, policy={a.policy}"
              + (", dry-run" if a.dry_run else "") + (f", audit={a.audit}" if a.audit else "") + ")")
@@ -1160,6 +1163,13 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--no-confirm", action="store_true",
                            help="never ask on the terminal: actions needing confirmation are blocked")
             p.add_argument("-q", "--quiet", action="store_true", help="no per-step progress on stderr")
+        else:
+            p.description = ("Run an MCP server on stdio. Recommended client command: "
+                             "`locum mcp` (or `locum-mcp`, or `python -m locum mcp` / `python -m locum.mcp`). "
+                             "Claude Code: claude mcp add locum -- locum mcp --policy default")
+            p.add_argument("--call-timeout", type=float, default=60.0, metavar="SEC",
+                           help="seconds a tool call may run before the client gets a timeout error and the "
+                                "call is stopped (default 60; 0 = no limit; wait_for with a longer timeout gets more)")
         p.add_argument("--policy", choices=("strict", "default", "permissive"), default="default",
                        help="safety preset (default: confirmations for pay/submit/delete/...)")
         p.add_argument("--dry-run", action="store_true", help="simulate actions; nothing touches the desktop")

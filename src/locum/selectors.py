@@ -59,6 +59,7 @@ import threading
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .backends.base import AccessibleNode
+from ._cancel import check as _cancel_check
 from .errors import SelectorSyntaxError
 
 __all__ = [
@@ -381,6 +382,7 @@ class _Snapshot:
                 return
             stack = list(reversed(start.children()))
         while stack:
+            _cancel_check()
             e = stack.pop()
             yield e
             if e.depth < md:

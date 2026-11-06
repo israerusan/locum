@@ -223,7 +223,8 @@ Code (`.mcp.json`):
 
 or `claude mcp add locum -- locum mcp --policy default`. If `locum` is
 not on the client's `PATH`, use the interpreter: `"command": "/path/to/python",
-"args": ["-m", "locum", "mcp"]`. Add `--backend mock` for a sandbox the
+"args": ["-m", "locum.mcp"]` (or the `locum-mcp` executable). Step-by-step
+setup, timeouts and cancellation: [MCP.md](MCP.md). Add `--backend mock` for a sandbox the
 model can practice on, `--dry-run` to rehearse, `--policy strict` for
 unattended use, `--allow-app excel` to fence it in.
 

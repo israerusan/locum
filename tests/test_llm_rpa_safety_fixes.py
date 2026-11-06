@@ -176,8 +176,11 @@ def test_mcp_server_keeps_children_and_strays_off_protocol_stdout(tmp_path):
     # every line before the server returned is a JSON-RPC frame; the child read nothing from our stdin
     assert out[-1] == "after-serve"
     frames = [json.loads(line) for line in out[:-1]]
-    assert [f["id"] for f in frames] == [1, 2, 3, 4], proc.stdout
-    assert frames[1]["result"]["isError"] is False
+    # tool calls run on a worker thread, so a ping may be answered before them (JSON-RPC
+    # responses are matched by id, not order)
+    assert sorted(f["id"] for f in frames) == [1, 2, 3, 4], proc.stdout
+    frames = {f["id"]: f for f in frames}
+    assert frames[2]["result"]["isError"] is False
     assert "hello-from-child" not in proc.stdout
     assert "Traceback" not in proc.stderr, proc.stderr
     assert "stray-print" in proc.stderr and "stray-fd-write" in proc.stderr

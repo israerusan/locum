@@ -19,6 +19,7 @@ pixels (and :meth:`Observation.to_image` the other way round).
 from __future__ import annotations
 
 import math
+import time as _time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -203,6 +204,7 @@ class Observation:
         scale: ``image_px = (screen_px - region.left) * scale`` (``<= 1``).
         annotated: The screenshot with numbered boxes, or ``None``.
         region: The captured screen rectangle (virtual screen or one window).
+        notes: Remarks for the model (e.g. windows a ``time_budget`` cut short).
     """
 
     screenshot: Optional["Image"]
@@ -214,6 +216,8 @@ class Observation:
     scale: float
     annotated: Optional["Image"]
     region: Rect = field(default_factory=lambda: Rect(0, 0, 0, 0))
+    #: Remarks for the model, e.g. which windows a ``time_budget`` cut short.
+    notes: List[str] = field(default_factory=list)
     # Live desktop roots + prefix cache from observe(): selectors built later (lazily,
     # add_element, refresh) are proven unique among all windows, not only inside their own.
     _ctx: Optional["_SelectorContext"] = field(default=None, init=False, repr=False, compare=False)
@@ -380,6 +384,7 @@ class Observation:
                 lines.append(f"  ... {len(self.elements) - max_elements} more elements not shown")
         else:
             lines.append("No accessible interactive elements were found (use coordinates from the screenshot).")
+        lines.extend(f"Note: {n}" for n in self.notes)
         return "\n".join(lines)
 
     def image_base64(self, annotated: bool = True) -> str:
@@ -402,6 +407,7 @@ class Observation:
             "active_window": self.active_window.to_dict() if self.active_window else None,
             "windows": [w.to_dict() for w in self.windows],
             "elements": [e.to_dict() for e in self.elements],
+            "notes": list(self.notes),
         }
 
 
@@ -540,6 +546,7 @@ def observe(
     max_visual_tokens: Optional[int] = MAX_VISUAL_TOKENS,
     selectors: bool = True,
     max_depth: int = 32,
+    time_budget: Optional[float] = None,
 ) -> Observation:
     """Snapshot the desktop for an LLM (set-of-marks).
 
@@ -556,6 +563,11 @@ def observe(
         max_visual_tokens: Visual-token budget for the screenshot (``None`` = no limit).
         selectors: Compute a robust selector for every element (slower on huge trees).
         max_depth: Maximum accessibility-tree depth walked.
+        time_budget: Seconds the element walk may take (``None`` = no limit). Windows
+            are walked front-most first and none may use more than its share of what is
+            left, so one huge or hung application (a browser with thousands of nodes)
+            cannot stall the observation; windows cut short are named in
+            :attr:`Observation.notes` and the partial result is returned.
 
     Elements are numbered from 1 in window Z-order (front-most first), then
     document order. Elements whose center is covered by a window in front are
@@ -613,7 +625,10 @@ def observe(
     # the window's selector prefix is unique on the desktop (while the windows are unchanged).
     ctx = _SelectorContext(backend, all_roots)
     limit = max(0, int(max_elements))
-    for root in roots:
+    budget_end = None if time_budget is None else _time.monotonic() + max(0.0, float(time_budget))
+    partial: List[str] = []
+    unscanned: List[str] = []
+    for idx, root in enumerate(roots):
         if len(elements) >= limit:
             break
         handle = _safe(lambda: root.handle)
@@ -621,8 +636,20 @@ def observe(
         win_title = info.title if info is not None else (_safe(lambda: root.name, "") or "")
         app = info.app if info is not None else ""
         zi = z_index.get(handle)
+        win_end = None
+        if budget_end is not None:
+            now = _time.monotonic()
+            left = budget_end - now
+            if left <= 0:
+                unscanned.append(win_title)
+                continue
+            # Front windows may use half of what is left; later ones at least a fair share.
+            win_end = now + max(left / (len(roots) - idx), left * 0.5)
         for node in root.walk(max_depth=max_depth):
             if len(elements) >= limit:
+                break
+            if win_end is not None and _time.monotonic() >= win_end:
+                partial.append(win_title)
                 break
             if node is root and _safe(lambda: node.role, "") == "window":
                 continue  # windows are listed separately
@@ -690,6 +717,17 @@ def observe(
         annotated=annotated_img,
         region=region,
     )
+    if partial or unscanned:
+        def _names(ts: List[str]) -> str:
+            shown = ", ".join(_quote(t) if t else "(untitled)" for t in ts[:8])
+            return shown + (f" and {len(ts) - 8} more" if len(ts) > 8 else "")
+
+        msg = f"Time budget of {float(time_budget):g}s ran out, so this observation is partial:"
+        if partial:
+            msg += f" only part of {_names(partial)} was scanned;"
+        if unscanned:
+            msg += f" {_names(unscanned)} not scanned;"
+        obs.notes.append(msg.rstrip(";") + ". Observe one window (window=...) to see the rest.")
     obs._ctx = ctx
     return obs
 

@@ -50,6 +50,7 @@ dev = ["pytest>=7", "pyyaml>=6.0"]
 
 [project.scripts]
 locum = "locum.cli:main"
+locum-mcp = "locum.mcp:main"
 
 [tool.hatch.version]
 source = "vcs"

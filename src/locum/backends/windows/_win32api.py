@@ -271,6 +271,7 @@ class _Win32:
         dwmapi = opt_dll("dwmapi")
         shell32 = opt_dll("shell32")
         ole32 = opt_dll("ole32")
+        advapi32 = opt_dll("advapi32")
         WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE")
         self.WNDENUMPROC = WINFUNCTYPE(BOOL, HWND, LPARAM)
         self.MONITORENUMPROC = WINFUNCTYPE(BOOL, HMONITOR, HDC, ctypes.POINTER(RECT), LPARAM)
@@ -362,6 +363,14 @@ class _Win32:
             (kernel32, "GetExitCodeProcess", BOOL, [HANDLE, P(DWORD)]),
             (ole32, "CoInitializeEx", HRESULT, [LPVOID, DWORD]),
             (ole32, "CoUninitialize", None, []),
+            # integrity levels (UIPI: input to a higher-integrity window is dropped silently)
+            (kernel32, "GetCurrentProcess", HANDLE, []),
+            (advapi32, "OpenProcessToken", BOOL, [HANDLE, DWORD, P(HANDLE)]),
+            (advapi32, "GetTokenInformation", BOOL, [HANDLE, INT, LPVOID, DWORD, P(DWORD)]),
+            (advapi32, "GetSidSubAuthorityCount", P(ctypes.c_ubyte), [LPVOID]),
+            (advapi32, "GetSidSubAuthority", P(DWORD), [LPVOID, DWORD]),
+            (u, "WindowFromPoint", HWND, [POINT]),
+            (u, "GetAncestor", HWND, [HWND, UINT]),
         ]
         for dll, name, res, args in optional:
             setattr(self, name, _proto(dll, name, res, args, required=False))
