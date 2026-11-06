@@ -103,6 +103,7 @@ OPTIONAL_DEPENDENCIES: Tuple[Tuple[str, str], ...] = (
     ("easyocr", "OCR alternative"),
     ("cv2", "faster template matching"),
     ("openpyxl", "XLSX work queues"),
+    ("keyring", "credentials: OS credential store on macOS/Linux"),
 )
 
 
@@ -380,10 +381,10 @@ class _Ctx:
             self._owned_backend = None
 
     def print(self, *parts: Any) -> None:
-        print(*parts, file=self.out)
+        print(*_scrubbed(parts), file=self.out)
 
     def info(self, *parts: Any) -> None:
-        print(*parts, file=self.err)
+        print(*_scrubbed(parts), file=self.err)
 
     def emit_json(self, data: Any) -> None:
         """Write the command's one JSON document to stdout.
@@ -393,9 +394,21 @@ class _Ctx:
         title cannot break it)."""
         if self.json_emitted:
             raise RuntimeError("a --json command wrote two documents")  # pragma: no cover - programming error
+        from ._secret import scrub_data
+
+        data = scrub_data(data)  # a credential never reaches stdout
         text = json.dumps(data, indent=2, ensure_ascii=not _is_utf8(self.out), default=_json_default)
         self.out.write(text + "\n")
         self.json_emitted = True
+
+
+def _scrubbed(parts: Sequence[Any]) -> List[Any]:
+    """Printed text with credential values (:mod:`locum.rpa.credentials`) masked."""
+    from ._secret import known_secrets, scrub
+
+    if not known_secrets():
+        return list(parts)
+    return [scrub(p) if isinstance(p, str) else p for p in parts]
 
 
 def _is_utf8(stream: Any) -> bool:
@@ -1180,6 +1193,65 @@ def cmd_a11y_audit(ctx: _Ctx) -> int:
     return EXIT_FAILURE if failed else EXIT_OK
 
 
+def _read_secret(ctx: _Ctx, prompt: str) -> str:
+    """A password without echo (``getpass``); with ``--password-stdin`` one line of stdin."""
+    if getattr(ctx.args, "password_stdin", False):
+        line = ctx.inp.readline()
+        return line.rstrip("\r\n")
+    import getpass
+
+    return getpass.getpass(prompt, stream=ctx.err)
+
+
+def cmd_credential(ctx: _Ctx) -> int:
+    from .rpa import credentials as creds
+
+    a = ctx.args
+    action = getattr(a, "cred_action", None)
+    if action == "list":
+        names = creds.list_credentials()
+        if ctx.json:
+            ctx.emit_json({"credentials": names})
+        else:
+            for n in names:
+                ctx.print(n)
+            if not names:
+                ctx.info("no locum credentials stored")
+        return EXIT_OK
+    if action == "delete":
+        found = creds.delete_credential(a.name, missing_ok=True)
+        if ctx.json:
+            ctx.emit_json({"name": a.name, "deleted": found})
+        elif found:
+            ctx.print(f"deleted credential {a.name!r}")
+        else:
+            ctx.info(f"locum: no credential named {a.name!r}")
+        return EXIT_OK if found else EXIT_FAILURE
+    if action == "set":
+        username = a.username
+        if username is None:
+            if a.password_stdin:
+                raise _UsageError("--password-stdin needs --username (stdin holds the password)")
+            ctx.err.write(f"Username for {a.name}: ")
+            ctx.err.flush()
+            username = ctx.inp.readline().rstrip("\r\n")
+        password = _read_secret(ctx, f"Password for {a.name}: ")
+        if not password:
+            raise _UsageError("empty password: nothing was stored")
+        if not a.password_stdin and getattr(ctx.inp, "isatty", lambda: False)():
+            again = _read_secret(ctx, "Repeat the password: ")
+            if again != password:
+                raise _UsageError("the passwords do not match: nothing was stored")
+        creds.set_credential(a.name, username, password)
+        store = getattr(creds.get_store(), "name", "store")
+        if ctx.json:
+            ctx.emit_json({"name": a.name, "username": username, "stored": True, "store": store})
+        else:
+            ctx.print(f"stored credential {a.name!r} (user {username!r}) in {store}")
+        return EXIT_OK
+    raise _UsageError("credential needs an action: set NAME, delete NAME or list")
+
+
 def _rescue_recording(rec: Any, wanted: str) -> Optional[str]:
     import tempfile
 
@@ -1214,6 +1286,7 @@ COMMANDS: Dict[str, Callable[[_Ctx], int]] = {
     "run": cmd_run,
     "record": cmd_record,
     "a11y-audit": cmd_a11y_audit,
+    "credential": cmd_credential,
 }
 
 
@@ -1471,6 +1544,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--time-budget", type=float, default=30.0, metavar="SECONDS",
                    help="stop walking after SECONDS and report partial results (default 30; 0 = no limit)")
     p.add_argument("--no-selectors", action="store_true", help="do not compute a selector per finding (faster)")
+
+    p = add("credential", "store, delete or list credentials in the OS credential store (flows: "
+                          "${credential:NAME.password})")
+    p.formatter_class = argparse.RawDescriptionHelpFormatter
+    p.epilog = "\n".join((
+        "Windows: Credential Manager (target locum:NAME); macOS/Linux: keyring (pip install locum[credentials]).",
+        "",
+        "examples:",
+        "  locum credential set erp --username robot01      # asks for the password (no echo)",
+        "  printf '%s\\n' \"$ERP_PW\" | locum credential set erp --username robot01 --password-stdin",
+        "  locum credential list",
+        "  locum credential delete erp",
+    ))
+    csub = p.add_subparsers(dest="cred_action", metavar="ACTION")
+    cp = csub.add_parser("set", help="store (or replace) a credential; the password is asked without echo",
+                         parents=[common])
+    cp.add_argument("name", metavar="NAME")
+    cp.add_argument("--username", "-u", metavar="USER", help="the username (default: asked)")
+    cp.add_argument("--password-stdin", action="store_true", help="read the password from one line of stdin")
+    cp = csub.add_parser("delete", help="remove a credential", parents=[common])
+    cp.add_argument("name", metavar="NAME")
+    csub.add_parser("list", help="names of the stored credentials (never their values)", parents=[common])
     return parser
 
 
@@ -1555,7 +1650,9 @@ def main(
 
 
 def _describe(exc: BaseException) -> str:
-    text = str(exc).strip()
+    from ._secret import scrub
+
+    text = (scrub(str(exc)) or "").strip()  # never print a credential an error message names
     return text or type(exc).__name__
 
 

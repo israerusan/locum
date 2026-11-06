@@ -563,14 +563,17 @@ class Tracer:
             return True  # cannot tell: err on the side of not recording it
 
     def _scrub(self, text: Optional[str]) -> Optional[str]:
-        if not text or not self._secrets:
+        if not text:
             return text
         for s in sorted(self._secrets, key=len, reverse=True):
             if len(s) >= _MIN_SCRUB and s in text:
                 text = text.replace(s, MASK)
                 for form in (repr(s), json.dumps(s)):
                     text = text.replace(form, repr(MASK))
-        return text
+        # Values held in a Secret (credentials) anywhere in the process.
+        from ._secret import scrub
+
+        return scrub(text)
 
     def _call(self, owner: Any, kind: str, name: str, orig: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
         stack = self._stack()
@@ -650,7 +653,7 @@ class Tracer:
                 if value:
                     self._note_target(step, value[0])
             elif _is_element(value):
-                step.target["element"] = _describe_node(value.node)
+                step.target["element"] = self._scrub(_describe_node(value.node))
                 b = None
                 try:
                     b = value.bounds
@@ -661,7 +664,7 @@ class Tracer:
                 if value.selector is not None and "selector" not in step.target:
                     step.target["selector"] = self._scrub(str(value.selector))
             elif _is_window(value):
-                step.target["window"] = _describe_window(value)
+                step.target["window"] = self._scrub(_describe_window(value))
                 step.target["bounds"] = _rect_list(value.info.rect)
             elif isinstance(value, Match):
                 step.target["bounds"] = _rect_list(value.rect)

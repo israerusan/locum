@@ -37,7 +37,8 @@ Semantics follow PyAutoGUI 0.9.5x:
   keeping the newest :data:`LOG_SCREENSHOTS_LIMIT` (default 10) files.
   ``moveTo``/``moveRel`` log only with ``logScreenshot=True``, as in PyAutoGUI.
   The arguments are part of the file name -- ``write`` puts the typed text
-  there -- so leave it off around passwords.
+  there (a :mod:`locum.rpa.credentials` password is replaced by ``***``) -- so
+  leave it off around other sensitive text.
 
 Improvements that come for free: template matching is grayscale/color
 normalized cross-correlation with alpha masks and multi-monitor support, typing
@@ -202,7 +203,9 @@ def _logScreenshot(logScreenshot: Any, funcName: str, funcArgs: str, folder: str
     """
     if logScreenshot is False or (logScreenshot is None and not LOG_SCREENSHOTS):
         return None
-    funcArgs = str(funcArgs)
+    from .._secret import scrub
+
+    funcArgs = scrub(str(funcArgs)) or ""  # a credential (locum.rpa.credentials) never lands in a file name
     if len(funcArgs) > 128:  # keep the file name under the 255-character limit
         funcArgs = funcArgs[:128] + "..."
     now = _dt.datetime.now()

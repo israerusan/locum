@@ -45,7 +45,9 @@ llm = ["anthropic>=0.40"]
 ocr = ["pytesseract>=0.3.10"]
 record = ["pynput>=1.7"]
 yaml = ["pyyaml>=6.0"]
-all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0"]
+# OS credential store on macOS/Linux (Windows uses Credential Manager directly).
+credentials = ["keyring>=24"]
+all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0", "keyring>=24"]
 dev = ["pytest>=7", "pyyaml>=6.0"]
 
 [project.scripts]

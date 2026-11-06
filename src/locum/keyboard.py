@@ -287,7 +287,12 @@ class Keyboard:
                 the backend adds Shift/AltGr as the active layout needs), ``"clipboard"`` (paste via ``mod+v``,
                 restoring the previous clipboard), or ``"auto"`` (unicode when the backend supports
                 it; otherwise key taps for ASCII and clipboard paste for other characters).
+
+        ``text`` may be a :class:`~locum.rpa.credentials.Secret` (revealed here).
         """
+        from ._secret import reveal
+
+        text = reveal(text)
         if not isinstance(text, str):
             raise TypeError(f"text must be str, not {type(text).__name__}")
         mode = (mode or "auto").lower()

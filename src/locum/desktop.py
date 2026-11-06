@@ -711,19 +711,27 @@ class Desktop:
         repaired. Anything else (no focused element, not a text field,
         password fields, text with Tab/Enter key presses) is typed unverified,
         as before. ``verify=False`` always types raw keystrokes.
+
+        ``text`` may be a :class:`~locum.rpa.credentials.Secret`: it is revealed only
+        to type it, and an error message never shows it.
         """
+        from ._secret import is_secret, reveal, scrubbing_errors
+
+        secret = is_secret(text)
+        text = reveal(text)
         mode = mode or self.typing_mode
         el: Optional[Element] = None
         before: Optional[str] = None
-        if verify and text and self.has(CAP_ACCESSIBILITY):
-            try:
-                el = self.focused()
-                before = el._verify_snapshot(text, mode) if el is not None else None
-            except Exception:
-                el, before = None, None
-        self.keyboard.type(text, interval=interval, mode=mode)
-        if el is not None and before is not None:
-            el._verify_typed(before, text)
+        with scrubbing_errors(secret):
+            if verify and text and self.has(CAP_ACCESSIBILITY):
+                try:
+                    el = self.focused()
+                    before = el._verify_snapshot(text, mode) if el is not None else None
+                except Exception:
+                    el, before = None, None
+            self.keyboard.type(text, interval=interval, mode=mode)
+            if el is not None and before is not None:
+                el._verify_typed(before, text)
 
     def press(self, *keys: Any, presses: int = 1, interval: float = 0.0) -> None:
         """Tap keys in sequence: ``press("tab", "tab", "enter")``; combos like ``"ctrl+a"`` act as hotkeys."""
@@ -1357,7 +1365,10 @@ class Desktop:
         return self.backend.get_clipboard()
 
     def clipboard_set(self, text: str) -> None:
-        """Put ``text`` on the clipboard."""
+        """Put ``text`` (a str or a :class:`~locum.rpa.credentials.Secret`) on the clipboard."""
+        from ._secret import reveal
+
+        text = reveal(text)
         if not isinstance(text, str):
             raise TypeError(f"text must be str, not {type(text).__name__}")
         self.backend.set_clipboard(text)
