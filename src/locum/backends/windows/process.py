@@ -63,6 +63,9 @@ def shell_launch_target(command: str) -> Optional[Tuple[str, str]]:
         return None
     if os.path.isfile(file):
         return None if file.lower().endswith(_PROGRAM_EXTS) else (file, params)
+    if not os.path.splitext(file)[1] and os.path.isfile(file + ".exe"):
+        return None  # CreateProcess appends ".exe" to an extension-less program path
+    # (shutil.which only does that for full paths on Windows with Python >= 3.12)
     if shutil.which(file) is not None:
         return None
     return file, params
