@@ -185,8 +185,10 @@ locum.Window class(info: 'WindowInfo', desktop: "'Desktop'")
     .handle property
     .info property
     .is_active property
+    .is_covered(self) -> 'bool'
     .is_maximized property
     .is_minimized property
+    .is_on_screen(self) -> 'bool'
     .is_visible property
     .maximize(self) -> "'Window'"
     .minimize(self) -> "'Window'"
@@ -196,7 +198,7 @@ locum.Window class(info: 'WindowInfo', desktop: "'Desktop'")
     .refresh(self) -> "'Window'"
     .resize(self, width: 'int', height: 'int') -> "'Window'"
     .restore(self) -> "'Window'"
-    .screenshot(self) -> "'Image'"
+    .screenshot(self, mode: 'str' = 'auto', *, restore_minimized: 'bool' = False) -> "'Image'"
     .set_rect(self, rect: 'RectLike') -> "'Window'"
     .title property
     .to_dict(self) -> 'dict'
@@ -293,7 +295,7 @@ locum.rpa.BUSINESS_EXCEPTION str
 locum.rpa.BusinessException exception(LocumError)
 locum.rpa.FAILED str
 locum.rpa.FlowAssertionError exception(WorkflowError, AssertionError)
-locum.rpa.FlowRunner class(desktop: "'Desktop'", report: 'RunReport', variables: 'Optional[Dict[str, Any]]' = None, *, run_dir: 'Optional[pathlib.Path]' = None, screenshot_on_error: 'bool' = False, logger: 'Optional[logging.Logger]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None)
+locum.rpa.FlowRunner class(desktop: "'Desktop'", report: 'RunReport', variables: 'Optional[Dict[str, Any]]' = None, *, run_dir: 'Optional[pathlib.Path]' = None, screenshot_on_error: 'bool' = False, logger: 'Optional[logging.Logger]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, exempt: 'Any' = ())
     .log(self, message: 'str', level: 'str' = 'info', path: 'str' = '', **fields: 'Any') -> 'None'
     .run_step(self, step: 'Mapping[str, Any]', path: 'str', depth: 'int', scope: '_Scope') -> 'StepResult'
     .run_steps(self, steps: 'Sequence[Any]', path: 'str', depth: 'int', scope: '_Scope') -> 'None'
@@ -325,7 +327,7 @@ locum.rpa.Recorder class(desktop: "Optional['Desktop']" = None, *, use_selectors
     .stop(self) -> 'List[RecordedAction]'
     .to_flow(self, name: 'str' = 'recorded') -> 'Dict[str, Any]'
     .to_python(self, *, desktop_expr: 'str' = 'Desktop()', var: 'str' = 'd') -> 'str'
-locum.rpa.Robot class(desktop: "Optional['Desktop']" = None, name: 'str' = 'robot', run_dir: "Union[str, 'os.PathLike[str]']" = 'locum_runs', screenshot_on_error: 'bool' = True, logger: 'Optional[logging.Logger]' = None, *, save_reports: 'bool' = True, sleep: 'Optional[Callable[[float], Any]]' = None, clock: 'Callable[[], float]' = <built-in function monotonic>, policy: 'Any' = None, confirm: 'Optional[Callable[[str, Dict[str, Any]], bool]]' = None, audit: 'Any' = None)
+locum.rpa.Robot class(desktop: "Optional['Desktop']" = None, name: 'str' = 'robot', run_dir: "Union[str, 'os.PathLike[str]']" = 'locum_runs', screenshot_on_error: 'bool' = True, logger: 'Optional[logging.Logger]' = None, *, save_reports: 'bool' = True, sleep: 'Optional[Callable[[float], Any]]' = None, clock: 'Callable[[], float]' = <built-in function monotonic>, policy: 'Any' = DEFAULT_POLICY, confirm: 'Optional[Callable[[str, Dict[str, Any]], bool]]' = None, audit: 'Any' = None)
     .check_timeout(self) -> 'None'
     .current_path property
     .desktop property
@@ -399,7 +401,7 @@ locum.rpa.WorkQueue class(name: 'str' = 'queue', path: 'Optional[PathLike]' = No
 locum.rpa.default_queue_dir def() -> 'pathlib.Path'
 locum.rpa.interpolate def(value: 'Any', variables: 'Mapping[str, Any]', *, path: 'str' = '') -> 'Any'
 locum.rpa.load_flow def(source: 'Union[PathLike, Mapping[str, Any], Sequence[Any]]') -> 'Tuple[Dict[str, Any], Optional[pathlib.Path]]'
-locum.rpa.run_flow def(path_or_dict: 'Union[PathLike, Mapping[str, Any], Sequence[Any]]', desktop: "Optional['Desktop']" = None, variables: 'Optional[Mapping[str, Any]]' = None, *, base_dir: 'Optional[PathLike]' = None, run_dir: 'Optional[PathLike]' = None, screenshot_on_error: 'Optional[bool]' = None, raise_on_error: 'bool' = False, logger: 'Optional[logging.Logger]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None) -> 'RunReport'
+locum.rpa.run_flow def(path_or_dict: 'Union[PathLike, Mapping[str, Any], Sequence[Any]]', desktop: "Optional['Desktop']" = None, variables: 'Optional[Mapping[str, Any]]' = None, *, base_dir: 'Optional[PathLike]' = None, run_dir: 'Optional[PathLike]' = None, screenshot_on_error: 'Optional[bool]' = None, raise_on_error: 'bool' = False, logger: 'Optional[logging.Logger]' = None, policy: 'Any' = DEFAULT_POLICY, confirm: 'Any' = None, audit: 'Any' = None) -> 'RunReport'
 locum.rpa.synced_location def(path: 'PathLike') -> 'str'
 locum.rpa.validate_flow def(doc: 'Mapping[str, Any]', *, prefix: 'str' = '') -> 'List[str]'
 
@@ -489,14 +491,17 @@ locum.llm.ObservedElement class(id: 'int', role: 'str', name: 'str', value: 'Opt
     .occluded property
     .selector_ready property
     .to_dict(self) -> 'Dict[str, Any]'
-locum.llm.Policy class(allow_tools: 'Optional[Iterable[str]]' = None, deny_tools: 'Iterable[str]' = (), allowed_apps: 'Optional[Iterable[str]]' = None, blocked_apps: 'Iterable[str]' = (), deny_text_patterns: 'Iterable[Union[str, Pattern]]' = (), confirm_patterns: 'Iterable[Union[str, Pattern]]' = <tuple>, confirm: 'Optional[ConfirmCallback]' = None, dry_run: 'bool' = False, max_actions: 'Optional[int]' = None, max_actions_per_minute: 'Optional[int]' = None, region: 'Optional[Any]' = None, *, unknown_target: 'str' = 'confirm', confirm_keys: 'Iterable[Union[str, Sequence[str]]]' = ('ctrl+enter', 'cmd+enter', 'ctrl+s', 'cmd+s'), read_only_tools: 'Iterable[str]' = <frozenset>, clock: 'Callable[[], float]' = <built-in function monotonic>, allow: 'Optional[Iterable[Any]]' = None, launch_options: 'Iterable[str]' = ())
+locum.llm.Policy class(allow_tools: 'Optional[Iterable[str]]' = None, deny_tools: 'Iterable[str]' = (), allowed_apps: 'Optional[Iterable[str]]' = None, blocked_apps: 'Iterable[str]' = (), deny_text_patterns: 'Iterable[Union[str, Pattern]]' = (), confirm_patterns: 'Iterable[Union[str, Pattern]]' = <tuple>, confirm: 'Optional[ConfirmCallback]' = None, dry_run: 'bool' = False, max_actions: 'Optional[int]' = None, max_actions_per_minute: 'Optional[int]' = None, region: 'Optional[Any]' = None, *, unknown_target: 'str' = 'confirm', confirm_keys: 'Iterable[Union[str, Sequence[str]]]' = ('ctrl+enter', 'cmd+enter', 'ctrl+s', 'cmd+s'), read_only_tools: 'Iterable[str]' = <frozenset>, clock: 'Callable[[], float]' = <built-in function monotonic>, allow: 'Optional[Iterable[Any]]' = None, launch_options: 'Iterable[str]' = (), exempt: 'Iterable[Any]' = ())
     .allow_list_mode property
     .allow_rule_for(self, tool_name: 'str', args: 'Dict[str, Any]', context: 'Dict[str, Any]') -> 'Optional[AllowRule]'
     .authorization_reason(self, tool_name: 'str', args: 'Dict[str, Any]', context: 'Dict[str, Any]') -> 'Optional[str]'
     .check(self, tool_name: 'str', args: 'Optional[Dict[str, Any]]' = None, *, context: 'Optional[Dict[str, Any]]' = None, count: 'bool' = True, confirm: 'Optional[ConfirmCallback]' = None) -> 'None'
     .confirmation_reason(self, tool_name: 'str', args: 'Dict[str, Any]', context: 'Dict[str, Any]') -> 'Optional[str]'
+    .default(cls, **kw: 'Any') -> "'Policy'"
+    .exempt_rule_for(self, tool_name: 'str', args: 'Dict[str, Any]', context: 'Dict[str, Any]') -> 'Optional[AllowRule]'
     .is_consequential(self, tool_name: 'str', context: 'Optional[Dict[str, Any]]' = None) -> 'bool'
     .is_read_only(self, tool_name: 'str') -> 'bool'
+    .off() -> 'Any'
     .permissive(cls, **kw: 'Any') -> "'Policy'"
     .reset(self) -> 'None'
     .strict(cls, **kw: 'Any') -> "'Policy'"
@@ -741,3 +746,214 @@ locum.compat.pyautogui.typewrite def(message: 'Union[str, Sequence[str]]', inter
 locum.compat.pyautogui.useImageNotFoundException def(value: 'Optional[bool]' = None) -> 'None'
 locum.compat.pyautogui.vscroll def(clicks: 'float', x: 'Any' = None, y: 'Any' = None, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
 locum.compat.pyautogui.write def(message: 'Union[str, Sequence[str]]', interval: 'float' = 0.0, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+
+# locum.bridges.sap
+locum.bridges.sap.SCRIPTING_HINT str
+locum.bridges.sap.SapButton class(com: 'Any', session: 'SapSession') -> 'None'
+    .press(self) -> "'SapButton'"
+locum.bridges.sap.SapCheckBox class(com: 'Any', session: 'SapSession') -> 'None'
+    .check(self) -> "'SapCheckBox'"
+    .selected property
+    .set_selected(self, value: 'bool') -> "'SapCheckBox'"
+    .uncheck(self) -> "'SapCheckBox'"
+locum.bridges.sap.SapComboBox class(com: 'Any', session: 'SapSession') -> 'None'
+    .entries property
+    .key property
+    .set_key(self, key: 'str') -> "'SapComboBox'"
+    .value property
+locum.bridges.sap.SapComponent class(com: 'Any', session: 'SapSession') -> 'None'
+    .bounds property
+    .changeable property
+    .children(self) -> "List['SapComponent']"
+    .find(self, relative_id: 'str') -> "'SapComponent'"
+    .id property
+    .label property
+    .name property
+    .set_focus(self) -> "'SapComponent'"
+    .sub_type property
+    .text property
+    .to_dict(self) -> 'Dict[str, Any]'
+    .tooltip property
+    .type property
+locum.bridges.sap.SapError exception(LocumError)
+locum.bridges.sap.SapGridView class(com: 'Any', session: 'SapSession') -> 'None'
+    .cell(self, row: 'int', col: 'str') -> 'str'
+    .column_count property
+    .column_title(self, col: 'str') -> 'str'
+    .columns property
+    .double_click_cell(self, row: 'int', col: 'str') -> "'SapGridView'"
+    .press_toolbar_button(self, button_id: 'str') -> "'SapGridView'"
+    .read(self, row: 'int', col: 'str') -> 'str'
+    .row_count property
+    .rows(self, columns: 'Optional[Sequence[str]]' = None, *, limit: 'Optional[int]' = None) -> 'List[Dict[str, str]]'
+    .select_rows(self, rows: 'Sequence[int]') -> "'SapGridView'"
+    .set_current_cell(self, row: 'int', col: 'str') -> "'SapGridView'"
+    .write(self, row: 'int', col: 'str', text: 'str') -> "'SapGridView'"
+locum.bridges.sap.SapGui class(engine_obj: 'Any' = None, *, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, desktop: 'Any' = None, default_timeout: 'float' = 30.0, poll_interval: 'float' = 0.1, sleep: 'Callable[[float], Any]' = <built-in function sleep>, clock: 'Callable[[], float]' = <built-in function monotonic>) -> 'None'
+    .attach(self, *, system: 'Optional[str]' = None, client: 'Optional[Union[str, int]]' = None, connection: 'Optional[Union[int, str]]' = None, session: 'Optional[int]' = None, user: 'Optional[str]' = None) -> "'SapSession'"
+    .connections(self) -> 'List[Any]'
+    .sessions(self) -> 'List[SapSessionInfo]'
+locum.bridges.sap.SapNode class(com: 'Any', session: 'Optional[SapSession]' = None) -> 'None'
+    .attributes(self) -> 'Dict[str, Any]'
+    .automation_id property
+    .bounds property
+    .children(self) -> "Sequence['SapNode']"
+    .class_name property
+    .description property
+    .handle property
+    .invoke(self) -> 'bool'
+    .name property
+    .native_role property
+    .parent property
+    .role property
+    .same_as(self, other: "'AccessibleNode'") -> 'bool'
+    .states property
+    .value property
+locum.bridges.sap.SapRadioButton class(com: 'Any', session: 'SapSession') -> 'None'
+    .select(self) -> "'SapRadioButton'"
+    .selected property
+locum.bridges.sap.SapSession class(com: 'Any', gui: 'SapGui', info: 'Optional[SapSessionInfo]' = None) -> 'None'
+    .active_window property
+    .busy property
+    .check_status(self, raise_on: 'str' = 'EA') -> "'SapStatusbar'"
+    .exists(self, component_id: 'str') -> 'bool'
+    .find(self, component_id: 'str', timeout: 'float' = 0.0) -> "'SapComponent'"
+    .find_all(self, selector: 'Any') -> "List['SapComponent']"
+    .gate property
+    .info property
+    .press(self, component_id: 'str') -> "'SapComponent'"
+    .send_vkey(self, vkey: 'int', window: 'str' = 'wnd[0]') -> "'SapStatusbar'"
+    .set_text(self, component_id: 'str', text: 'str') -> "'SapComponent'"
+    .start_transaction(self, tcode: 'str') -> "'SapStatusbar'"
+    .statusbar property
+    .transaction property
+    .tree(self, max_depth: 'int' = 8) -> 'str'
+    .wait_ready(self, timeout: 'Optional[float]' = None) -> "'SapSession'"
+    .windows(self) -> "List['SapWindow']"
+locum.bridges.sap.SapSessionInfo class(connection: 'int', session: 'int', system: 'str', client: 'str', user: 'str', transaction: 'str', description: 'str', busy: 'bool', disabled_by_server: 'bool' = False) -> None
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.bridges.sap.SapStatusbar class(com: 'Any', session: 'SapSession') -> 'None'
+    .is_error property
+    .message_id property
+    .message_number property
+    .message_type property
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.bridges.sap.SapTab class(com: 'Any', session: 'SapSession') -> 'None'
+    .select(self) -> "'SapTab'"
+locum.bridges.sap.SapTableControl class(com: 'Any', session: 'SapSession') -> 'None'
+    .cell(self, row: 'int', col: 'Union[int, str]') -> 'SapComponent'
+    .columns property
+    .read(self, row: 'int', col: 'Union[int, str]') -> 'str'
+    .row_count property
+    .scroll_to(self, row: 'int') -> "'SapTableControl'"
+    .visible_row_count property
+    .write(self, row: 'int', col: 'Union[int, str]', text: 'str') -> "'SapTableControl'"
+locum.bridges.sap.SapTextField class(com: 'Any', session: 'SapSession') -> 'None'
+    .caret_to_end(self) -> "'SapTextField'"
+    .is_password property
+    .label property
+    .max_length property
+    .set_text(self, text: 'str') -> "'SapTextField'"
+    .text property
+locum.bridges.sap.SapWindow class(com: 'Any', session: 'SapSession') -> 'None'
+    .close(self) -> "'SapWindow'"
+    .handle property
+    .send_vkey(self, vkey: 'int') -> "'SapStatusbar'"
+    .title property
+locum.bridges.sap.VKEYS dict
+locum.bridges.sap.attach def(*, system: 'Optional[str]' = None, client: 'Optional[Union[str, int]]' = None, connection: 'Optional[Union[int, str]]' = None, session: 'Optional[int]' = None, user: 'Optional[str]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, desktop: 'Any' = None, default_timeout: 'float' = 30.0) -> "'SapSession'"
+locum.bridges.sap.engine def() -> 'Any'
+locum.bridges.sap.sessions def() -> 'List[SapSessionInfo]'
+locum.bridges.sap.vkey_combo def(vkey: 'int') -> 'str'
+
+# locum.bridges.java
+locum.bridges.java.AccessibleActionInfo class(...)
+locum.bridges.java.AccessibleActions class(...)
+locum.bridges.java.AccessibleActionsToDo class(...)
+locum.bridges.java.AccessibleContextInfo class(...)
+locum.bridges.java.AccessibleTextInfo class(...)
+locum.bridges.java.ENABLE_HINT str
+locum.bridges.java.JOBJECT64 class(...)
+locum.bridges.java.JavaBridge class(desktop: 'Any' = None, *, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, dll_path: 'Optional[str]' = None, pump: 'bool' = True, settle: 'float' = 0.3, max_children: 'int' = 2000, sleep: 'Callable[[float], Any]' = <built-in function sleep>, clock: 'Callable[[], float]' = <built-in function monotonic>) -> 'None'
+    .close(self) -> 'None'
+    .from_hwnd(self, hwnd: 'Any', *, timeout: 'float' = 3.0, title: 'str' = '') -> "'JavaElement'"
+    .is_java_window(self, hwnd: 'Any') -> 'bool'
+    .live_references property
+    .release(self, vm: 'int', ac: 'int') -> 'None'
+    .release_all(self) -> 'None'
+    .window(self, title: 'Optional[str]' = None, *, timeout: 'float' = 10.0) -> "'JavaElement'"
+    .windows(self) -> 'List[Any]'
+locum.bridges.java.JavaElement class(node: 'JavaNode') -> 'None'
+    .actions(self) -> 'List[str]'
+    .bounds property
+    .bridge property
+    .children(self) -> "List['JavaElement']"
+    .click(self, *, native: 'Any' = 'auto') -> "'JavaElement'"
+    .description property
+    .do_action(self, name: 'str') -> "'JavaElement'"
+    .exists(self, selector: 'Any') -> 'bool'
+    .find(self, selector: 'Any', timeout: 'float' = 0.0) -> "'JavaElement'"
+    .find_all(self, selector: 'Any', *, max_depth: 'int' = 64) -> "List['JavaElement']"
+    .focus(self) -> "'JavaElement'"
+    .is_enabled property
+    .java_role property
+    .name property
+    .parent property
+    .rect property
+    .release(self) -> 'None'
+    .role property
+    .set_text(self, text: 'str', *, verify: 'bool' = True) -> "'JavaElement'"
+    .states property
+    .text property
+    .to_dict(self) -> 'Dict[str, Any]'
+    .tree(self, max_depth: 'int' = 8) -> 'str'
+    .walk(self, max_depth: 'int' = 64) -> "Iterator['JavaElement']"
+locum.bridges.java.JavaNode class(bridge: 'JavaBridge', vm: 'int', ac: 'int', parent: "Optional['JavaNode']", *, hwnd: 'Any' = None) -> 'None'
+    .actions(self) -> 'List[str]'
+    .attributes(self) -> 'Dict[str, Any]'
+    .bounds property
+    .children(self) -> "Sequence['JavaNode']"
+    .click_action(self) -> 'Optional[str]'
+    .description property
+    .do_action(self, name: 'str') -> 'bool'
+    .focus(self) -> 'bool'
+    .handle property
+    .info property
+    .invoke(self) -> 'bool'
+    .java_role property
+    .java_states property
+    .name property
+    .native_role property
+    .parent property
+    .refresh(self) -> "'JavaNode'"
+    .release(self) -> 'None'
+    .role property
+    .same_as(self, other: "'AccessibleNode'") -> 'bool'
+    .set_value(self, text: 'str') -> 'bool'
+    .states property
+    .text(self, chunk: 'int' = 1000) -> 'str'
+    .value property
+    .window_handle property
+locum.bridges.java.MAX_ACTIONS_TO_DO int
+locum.bridges.java.MAX_ACTION_INFO int
+locum.bridges.java.MAX_STRING_SIZE int
+locum.bridges.java.SHORT_STRING_SIZE int
+locum.bridges.java.dll_name def() -> 'str'
+
+# locum.bridges.remote
+locum.bridges.remote.ImageSession class(window: 'Any', desktop: 'Any' = None, *, activate: 'bool' = True, default_timeout: 'Optional[float]' = None) -> 'None'
+    .bound(self) -> 'Iterator[None]'
+    .click(self, x: 'int', y: 'int', *, button: 'str' = 'left', clicks: 'int' = 1) -> 'Point'
+    .click_image(self, image: 'Any', *, timeout: 'Optional[float]' = None, region: 'Any' = None, offset: 'Tuple[int, int]' = (0, 0), **kw: 'Any') -> 'Match'
+    .click_text(self, text: 'str', *, timeout: 'Optional[float]' = None, region: 'Any' = None, offset: 'Tuple[int, int]' = (0, 0), **kw: 'Any') -> 'Match'
+    .find_text(self, text: 'str', *, region: 'Any' = None, timeout: 'float' = 0.0, **kw: 'Any') -> 'Optional[Match]'
+    .hotkey(self, *keys: 'Any', **kw: 'Any') -> 'None'
+    .locate(self, image: 'Any', *, region: 'Any' = None, **kw: 'Any') -> 'Optional[Match]'
+    .locate_all(self, image: 'Any', *, region: 'Any' = None, **kw: 'Any') -> 'List[Match]'
+    .press(self, *keys: 'Any', **kw: 'Any') -> 'None'
+    .read_text(self, region: 'Any' = None, **kw: 'Any') -> 'str'
+    .rect property
+    .screenshot(self) -> 'Any'
+    .to_screen(self, x: 'int', y: 'int') -> 'Point'
+    .type(self, text: 'str', *, interval: 'float' = 0.0, mode: 'Optional[str]' = None) -> 'None'
+    .wait_image(self, image: 'Any', *, timeout: 'Optional[float]' = None, region: 'Any' = None, **kw: 'Any') -> 'Match'
