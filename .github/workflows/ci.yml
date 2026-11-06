@@ -139,7 +139,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             xvfb xauth openbox dbus-x11 at-spi2-core libatk-adaptor \
-            python3-venv python3-gi gir1.2-atspi-2.0 mousepad xclip x11-utils \n            x11-xserver-utils x11-apps
+            python3-venv python3-gi gir1.2-atspi-2.0 mousepad xclip x11-utils \
+            x11-xserver-utils x11-apps
 
       # PyGObject (gi) comes from the distro: a venv that sees the system site-packages.
       - name: Install locum
