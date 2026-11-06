@@ -179,7 +179,9 @@ def test_toolkit_tool_names(app):
     _, _, tk, _ = app
     expected = {"observe", "screenshot", "click", "double_click", "right_click", "type_text", "press_keys", "hotkey", "scroll",
                 "move_mouse", "drag", "set_value", "find_elements", "wait_for", "list_windows", "focus_window", "launch_app",
-                "read_clipboard", "write_clipboard", "read_text", "wait"}
+                "read_clipboard", "write_clipboard", "read_text", "wait",
+                "browser_pages", "browser_launch", "browser_observe", "browser_click", "browser_type",
+                "browser_navigate", "browser_read"}
     assert set(tk.names()) == expected
     mcp = {t["name"]: t for t in tk.to_mcp()}
     assert mcp["observe"]["annotations"] == {"readOnlyHint": True}

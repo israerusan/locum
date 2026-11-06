@@ -528,6 +528,25 @@ def _is_interactive(node: AccessibleNode) -> bool:
     return "editable" in (_safe(lambda: node.states, frozenset()) or frozenset())
 
 
+def _walk_without_documents(root: AccessibleNode, max_depth: int) -> Any:
+    """Pre-order walk of ``root`` that skips every ``document`` subtree (web page content)."""
+    from .._cancel import check
+
+    stack = [(root, 0)]
+    while stack:
+        check()
+        node, depth = stack.pop()
+        if node is not root and (_safe(lambda: node.role, "") or "").lower() == "document":
+            continue
+        yield node
+        if depth < max_depth:
+            try:
+                kids = list(node.children())
+            except Exception:
+                kids = []
+            stack.extend((k, depth + 1) for k in reversed(kids))
+
+
 def _resolve_window(desktop: "Desktop", window: Any) -> Any:
     """``window`` -> :class:`~locum.window.Window` (accepts Window, WindowInfo or a title query)."""
     from ..window import Window
@@ -553,6 +572,7 @@ def observe(
     max_depth: int = 32,
     time_budget: Optional[float] = None,
     reuse: Optional[Observation] = None,
+    prune_documents: Optional[Sequence[int]] = None,
 ) -> Observation:
     """Snapshot the desktop for an LLM (set-of-marks).
 
@@ -580,6 +600,9 @@ def observe(
             whose process raised no event since then and whose rectangle and title are
             unchanged, and only within :data:`REUSE_MAX_AGE` seconds. Occlusion is
             recomputed. Without events this does nothing.
+        prune_documents: Process ids (browsers connected over DevTools) whose windows are
+            walked without their ``document`` subtrees -- the page content, read far
+            more cheaply with ``browser_observe``. Their tabs and toolbars are kept.
 
     Elements are numbered from 1 in window Z-order (front-most first), then
     document order. Elements whose center is covered by a window in front are
@@ -641,6 +664,7 @@ def observe(
     budget_end = None if time_budget is None else taken + max(0.0, float(time_budget))
     partial: List[str] = []
     unscanned: List[str] = []
+    pruned: List[str] = []
 
     # Reuse of unchanged windows (change events say which processes changed since `reuse`).
     try:
@@ -648,7 +672,7 @@ def observe(
     except Exception:
         tracker = None
     gen0 = tracker.generation if tracker is not None else None  # read before walking
-    opts = (bool(interactive_only), int(max_depth), region, bool(selectors))
+    opts = (bool(interactive_only), int(max_depth), region, bool(selectors), tuple(sorted(set(prune_documents or ()))))
     dirty = None
     if (reuse is not None and tracker is not None and getattr(reuse, "_gen", None) is not None
             and getattr(reuse, "_opts", None) == opts and taken - getattr(reuse, "_taken", 0.0) <= REUSE_MAX_AGE):
@@ -694,7 +718,10 @@ def observe(
                 continue
             # Front windows may use half of what is left; later ones at least a fair share.
             win_end = now + max(left / (len(roots) - idx), left * 0.5)
-        for node in root.walk(max_depth=max_depth):
+        prune = bool(prune_documents) and info is not None and info.pid in set(prune_documents)
+        if prune:
+            pruned.append(win_title)
+        for node in (_walk_without_documents(root, max_depth) if prune else root.walk(max_depth=max_depth)):
             if len(elements) >= limit:
                 complete = False
                 break
@@ -774,6 +801,10 @@ def observe(
     obs.capped = limit > 0 and len(elements) >= limit
     obs._groups, obs._gen, obs._opts, obs._taken = groups, gen0, opts, taken
     obs.reused_windows = reused
+    if pruned:
+        shown = ", ".join(_quote(t) for t in pruned[:5]) + (f" and {len(pruned) - 5} more" if len(pruned) > 5 else "")
+        obs.notes.append(f"Page content of the browser window(s) {shown} is not listed here: read and act on it "
+                         "with browser_observe / browser_click / browser_type (faster and more precise).")
     if partial or unscanned:
         def _names(ts: List[str]) -> str:
             shown = ", ".join(_quote(t) if t else "(untitled)" for t in ts[:8])

@@ -101,7 +101,7 @@ STRICT_CONFIRM: tuple = DEFAULT_CONFIRM + (
 READ_ONLY_TOOLS: frozenset = frozenset(
     {
         "observe", "screenshot", "find_elements", "list_windows", "read_clipboard", "read_text", "wait",
-        "wait_for", "done", "finish", "zoom", "cursor_position",
+        "wait_for", "done", "finish", "zoom", "cursor_position", "browser_pages", "browser_observe", "browser_read",
     }
 )
 

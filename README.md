@@ -313,6 +313,13 @@ Claude Code / Claude Desktop, options and timeouts:
 [`docs/MCP.md`](https://github.com/israerusan/locum/blob/main/docs/MCP.md).
 Prompting tips and the safety model: [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md).
 
+Web pages in Edge / Chrome are read and driven over the DevTools protocol
+(`browser_launch`, `browser_observe`, `browser_click`, `browser_type`, ... or
+`locum.browser.Browser` in Python), with a separate locum-managed browser
+profile, instead of the browser's huge accessibility tree. After an action,
+`observe(changes_only=true)` returns only what changed, with a cropped
+screenshot.
+
 ### Safety policy
 
 ```python

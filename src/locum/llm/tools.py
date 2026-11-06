@@ -40,6 +40,7 @@ import inspect
 import json
 import logging
 import re
+import sys
 import threading
 import time
 import types
@@ -858,11 +859,19 @@ class DesktopToolkit:
         ("write_clipboard", "tool_write_clipboard"),
         ("read_text", "tool_read_text"),
         ("wait", "tool_wait"),
+        ("browser_pages", "tool_browser_pages"),
+        ("browser_launch", "tool_browser_launch"),
+        ("browser_observe", "tool_browser_observe"),
+        ("browser_click", "tool_browser_click"),
+        ("browser_type", "tool_browser_type"),
+        ("browser_navigate", "tool_browser_navigate"),
+        ("browser_read", "tool_browser_read"),
     )
 
     #: Built-in tools that do not go through ``_act`` (so ``_wrap`` runs their policy check).
     _QUERY_TOOLS: frozenset = frozenset(
-        {"observe", "screenshot", "find_elements", "wait_for", "list_windows", "read_clipboard", "read_text", "wait"}
+        {"observe", "screenshot", "find_elements", "wait_for", "list_windows", "read_clipboard", "read_text", "wait",
+         "browser_pages", "browser_observe", "browser_read"}
     )
 
     def _build(self) -> None:
@@ -1255,7 +1264,8 @@ class DesktopToolkit:
         ctx.update({k: v for k, v in extra.items() if v is not None})
         return ctx
 
-    def _act(self, tool: str, args: Dict[str, Any], ctx: Dict[str, Any], description: str, action: Callable[[], Any]) -> ToolResult:
+    def _act(self, tool: str, args: Dict[str, Any], ctx: Dict[str, Any], description: str, action: Callable[[], Any],
+             *, feedback: bool = True) -> ToolResult:
         """Policy check, then dry-run report or the real action (+ feedback)."""
         ctx.setdefault("description", description)
         self.policy.check(tool, {k: v for k, v in args.items() if v is not None}, context=ctx)
@@ -1264,7 +1274,7 @@ class DesktopToolkit:
             return ToolResult(f"[dry-run] Would {description}{note}. Nothing was done.", data={"dry_run": True, "description": description})
         out = action()
         text = out if isinstance(out, str) and out else description[0].upper() + description[1:] + "."
-        return ToolResult(text + self._feedback_text())
+        return ToolResult(text + (self._feedback_text() if feedback else ""))
 
     def _recheck_focus(self, tool: str, args: Dict[str, Any], activates: bool, description: str, *, enter: bool = False,
                        activating: Optional[bool] = None, **extra: Any) -> None:
@@ -1323,6 +1333,7 @@ class DesktopToolkit:
         kw.setdefault("time_budget", self.OBSERVE_BUDGET)
         prev = self.last_observation
         kw.setdefault("reuse", prev)  # unchanged windows are not re-walked (Windows: UIA change events)
+        self._prune_browser(kw)
         obs = observe(self.desktop, window=window, **kw)
         if changes_only:
             if prev is not None and prev.region == obs.region and prev.image_size == obs.image_size and prev.elements is not obs.elements:
@@ -1332,6 +1343,18 @@ class DesktopToolkit:
         self.last_observation = obs
         img = obs.image_base64(annotated=True) if obs.screenshot is not None else None
         return ToolResult(obs.text(kw.get("max_elements", 300)), image_base64=img, data=obs)
+
+    def _prune_browser(self, kw: Dict[str, Any]) -> None:
+        """While a browser is connected over DevTools, observe skips its page content (use browser_observe)."""
+        b = getattr(self, "_browser", None)
+        if b is None or "prune_documents" in kw:
+            return
+        try:
+            pid = b.pid if b.alive else None
+        except Exception:
+            pid = None
+        if pid:
+            kw["prune_documents"] = [pid]
 
     def _observe_changes(self, prev: Observation, obs: Observation, include_screenshot: bool) -> ToolResult:
         from ..vision import crop as _crop, to_base64_png
@@ -1359,6 +1382,7 @@ class DesktopToolkit:
         kw["annotate"] = bool(annotated)
         kw.setdefault("time_budget", self.OBSERVE_BUDGET)
         kw.setdefault("reuse", self.last_observation)
+        self._prune_browser(kw)
         obs = observe(self.desktop, **kw)
         self.last_observation = obs
         w, h = obs.image_size
@@ -1959,6 +1983,199 @@ class DesktopToolkit:
 
         args = {"command": command, "wait_window": wait_window, "timeout": timeout}
         return self._act("launch_app", args, self._context(command=command, target=command), f"launch {command!r}", run)
+
+    # ======================================================== browser (CDP)
+    def _browser_conn(self) -> Any:
+        """The DevTools connection (attaching to a browser with an open port on first use)."""
+        from ..browser import Browser, CDPError
+
+        b = getattr(self, "_browser", None)
+        if b is not None and b.alive:
+            return b
+        self._browser = None
+        try:
+            self._browser = Browser.attach()
+        except CDPError as exc:
+            raise CDPError(f"{exc} (browser_launch starts a locum-managed browser)") from None
+        return self._browser
+
+    def _browser_page(self, tab: Optional[str]) -> Any:
+        b = self._browser_conn()
+        return b, b.page(tab)
+
+    def _browser_ctx(self, b: Any, page: Any, target: Optional[str] = None) -> Dict[str, Any]:
+        return self._context(app=b.app, window_title=page.info.title, target=target, target_app=b.app,
+                             target_apps=[b.app], url=page.info.url)
+
+    def tool_browser_pages(self) -> ToolResult:
+        """List the tabs of the browser locum is connected to over DevTools (Edge/Chrome).
+
+        Connects on first use to a browser that exposes a DevTools port; see browser_launch.
+        """
+        b = self._browser_conn()
+        pages = b.pages()
+        kind = "locum-managed profile" if b.managed else "attached"
+        lines = [f"Browser: {b.version.get('Browser', b.name)} ({kind}, DevTools port {b.port})"]
+        lines += [f"  {i}. {p.title!r} <{p.url}>" for i, p in enumerate(pages, 1)] or ["  (no tabs)"]
+        lines.append("Use browser_observe(tab=...) with part of a title or URL (default: the first tab).")
+        return ToolResult("\n".join(lines))
+
+    def tool_browser_launch(self, browser: str = "edge", url: Optional[str] = None, headless: bool = False) -> ToolResult:
+        """Start Edge or Chrome with a separate, locum-managed profile and a DevTools port, so its pages
+        can be read and driven with the browser_* tools (much faster than the screen's accessibility tree).
+        Reuses that browser if it is already running. Your everyday browser profile is not touched.
+
+        Args:
+            browser: "edge", "chrome" or "chromium".
+            url: Page to open.
+            headless: Run without a window.
+        """
+        from ..browser import Browser, find_executable
+
+        name = str(browser or "edge").lower()
+        app = {"edge": "msedge.exe", "chrome": "chrome.exe", "chromium": "chrome.exe"}.get(name, name)
+        if sys.platform != "win32":
+            app = {"edge": "Microsoft Edge", "chrome": "Google Chrome", "chromium": "Chromium"}.get(name, name)
+        exe = find_executable(name) or name
+
+        def run() -> str:
+            self._browser = Browser.launch(name, url=url, headless=bool(headless))
+            pages = self._browser.pages()
+            first = f" Tab: {pages[0].title!r} <{pages[0].url}>." if pages else ""
+            return f"Started {name} (locum-managed profile, DevTools port {self._browser.port}).{first}"
+
+        args = {"browser": name, "url": url, "headless": bool(headless)}
+        ctx = self._context(command=exe, target=f"{name} (locum profile)" + (f" {url}" if url else ""),
+                            target_app=app, target_apps=[app])
+        return self._act("browser_launch", args, ctx, f"start {name} with a locum-managed profile", run, feedback=False)
+
+    def tool_browser_observe(self, tab: Optional[str] = None, max_elements: int = 150, include_text: bool = True,
+                             include_screenshot: bool = False) -> ToolResult:
+        """Read a browser page over DevTools: its interactive elements (with ids for browser_click /
+        browser_type), title, URL and visible text. Ids are valid until the next browser_observe.
+
+        Args:
+            tab: Part of the tab's title or URL (default: the first tab).
+            max_elements: Maximum elements listed (1-500).
+            include_text: Include the page's text (first 3000 characters).
+            include_screenshot: Include a screenshot of the page.
+        """
+        import base64
+
+        b, page = self._browser_page(tab)
+        snap = page.snapshot(min(max(int(max_elements), 1), 500))
+        lines = [f"Page {snap['title']!r} <{snap['url']}> (viewport {snap['vw']}x{snap['vh']}, "
+                 f"scrolled to {snap['scrollY']} of {snap['docH']} px)"]
+        els = snap.get("elements") or []
+        if els:
+            lines.append("Elements (ids for browser_click/browser_type; valid until the next browser_observe):")
+            for e in els:
+                part = f"  [{e['id']}] {e['role']}"
+                if e.get("name"):
+                    part += f" {e['name']!r}"
+                if e.get("value") not in (None, ""):
+                    part += f" value={e['value']!r}"
+                part += f" at ({e['x']}, {e['y']})"
+                if e.get("states"):
+                    part += " [" + ", ".join(e["states"]) + "]"
+                lines.append(part)
+        else:
+            lines.append("No interactive elements found on the page.")
+        if include_text:
+            text = page.text(max_chars=3000).strip()
+            if text:
+                lines.append("Text:\n" + text)
+        img = base64.b64encode(page.screenshot_png()).decode("ascii") if include_screenshot else None
+        self._browser_snapshot = (page.info.id, {e["id"]: e for e in els})
+        return ToolResult("\n".join(lines), image_base64=img)
+
+    def _browser_target(self, page: Any, element: Optional[int], selector: Optional[str]) -> Tuple[Any, Dict[str, Any]]:
+        if (element is None) == (selector is None):
+            raise ValueError("Give exactly one of element (an id from browser_observe) or selector (CSS)")
+        target: Any = int(element) if element is not None else str(selector)
+        return target, page.resolve(target, scroll=False)
+
+    def tool_browser_click(self, element: Optional[int] = None, selector: Optional[str] = None,
+                           tab: Optional[str] = None) -> ToolResult:
+        """Click an element of a browser page (real mouse events inside the page, no screen input).
+
+        Args:
+            element: Element id from the last browser_observe.
+            selector: CSS selector instead of an id.
+            tab: Part of the tab's title or URL (default: the first tab).
+        """
+        b, page = self._browser_page(tab)
+        target, info = self._browser_target(page, element, selector)
+        name = info.get("name") or info.get("tag") or str(target)
+        args = {"element": element, "selector": selector, "tab": tab}
+        return self._act("browser_click", args, self._browser_ctx(b, page, name),
+                         f"click {name!r} on {page.info.title!r}",
+                         lambda: (page.click(target), f"Clicked {name!r}; the tab is now {page.title!r} <{page.url}>.")[1],
+                         feedback=False)
+
+    def tool_browser_type(self, text: str, element: Optional[int] = None, selector: Optional[str] = None,
+                          clear: bool = False, submit: bool = False, tab: Optional[str] = None) -> ToolResult:
+        """Type text into a browser page field (clicks it first), optionally clearing it or pressing Enter.
+
+        Args:
+            text: Text to insert.
+            element: Element id from the last browser_observe (default: the focused field).
+            selector: CSS selector instead of an id.
+            clear: Empty the field first.
+            submit: Press Enter afterwards.
+            tab: Part of the tab's title or URL (default: the first tab).
+        """
+        b, page = self._browser_page(tab)
+        info: Dict[str, Any] = {}
+        target = None
+        if element is not None or selector is not None:
+            target, info = self._browser_target(page, element, selector)
+        secret = bool(info.get("password")) if target is not None else page.focused_is_password()
+        if secret:
+            self._redact("text")
+        shown = _REDACTED if secret else (text if len(text) <= 60 else text[:57] + "...")
+        name = info.get("name") or info.get("tag") or "the focused field"
+        desc = f"type {shown!r} into {name!r} on {page.info.title!r}" + (" and press Enter" if submit else "")
+        args = {"text": text, "element": element, "selector": selector, "clear": bool(clear), "submit": bool(submit), "tab": tab}
+        ctx = self._browser_ctx(b, page, name)
+        if submit:
+            ctx["enter"] = True
+        return self._act("browser_type", args, ctx, desc,
+                         lambda: (page.type(text, target, clear=bool(clear), submit=bool(submit)),
+                                  f"{desc[0].upper()}{desc[1:]}; the tab is now {page.title!r}.")[1],
+                         feedback=False)
+
+    def tool_browser_navigate(self, url: str, tab: Optional[str] = None) -> ToolResult:
+        """Open a URL in a browser tab and wait for it to load.
+
+        Args:
+            url: The address to open.
+            tab: Part of the tab's title or URL (default: the first tab).
+        """
+        b, page = self._browser_page(tab)
+
+        def run() -> str:
+            page.navigate(url)
+            return f"Opened {url!r}; the tab is now {page.title!r}."
+
+        return self._act("browser_navigate", {"url": url, "tab": tab}, self._browser_ctx(b, page, url),
+                         f"open {url!r} in {page.info.title!r}", run, feedback=False)
+
+    def tool_browser_read(self, selector: Optional[str] = None, tab: Optional[str] = None, max_chars: int = 8000) -> ToolResult:
+        """Read the text of a browser page, or of one element (CSS selector).
+
+        Args:
+            selector: CSS selector (default: the whole page).
+            tab: Part of the tab's title or URL (default: the first tab).
+            max_chars: Maximum characters returned (1-50000).
+        """
+        b, page = self._browser_page(tab)
+        if selector is not None:
+            info = page.resolve(selector, scroll=False)
+            if info.get("password"):
+                return ToolResult("(a password field: its value is not shown)")
+        text = page.text(selector, max_chars=min(max(int(max_chars), 1), 50000))
+        return ToolResult(text if text.strip() else "(no text)", data=text)
 
     def tool_read_clipboard(self) -> ToolResult:
         """Return the text currently on the clipboard."""

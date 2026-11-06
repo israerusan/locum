@@ -85,12 +85,48 @@ Restart Claude Desktop after editing.
   desktop that is ~1-2 KB of text and ~160 KB of image instead of ~24 KB and
   ~1.5 MB. Changes hidden behind other windows add no image; tiny isolated
   pixel changes (a caret, the clock) are ignored.
+* On Windows, waits for elements and windows wake on UI Automation change
+  events instead of re-searching the tree every 0.1 s, and `observe` reuses the
+  elements of windows whose app raised no event since the previous call
+  (`LOCUM_UIA_EVENTS=0` turns events off).
 * Tool calls run one at a time on a worker thread, so `ping`, `tools/list`
   and cancellation are answered even while a long call runs.
 * A call past `--call-timeout` returns `isError` with "Timed out ... The
   server is still serving"; the call is stopped at its next step.
 * The client's cancel (`notifications/cancelled`) stops the running call.
   Requests that carry a progress token get `notifications/progress` every 2 s.
+
+## Web pages (Edge / Chrome over DevTools)
+
+A browser tab's accessibility tree can hold thousands of nodes. For page
+content locum talks to the browser directly over the Chrome DevTools Protocol
+(standard library only) with the `browser_*` tools:
+
+| Tool | Does |
+|---|---|
+| `browser_launch(browser="edge", url=None, headless=False)` | start Edge/Chrome with a **separate, locum-managed profile** (`~/.locum/browser/<name>`, override with `LOCUM_BROWSER_PROFILES`) and a DevTools port; reuses it if running |
+| `browser_pages()` | list the tabs |
+| `browser_observe(tab=None)` | the page's interactive elements with ids, title, URL, visible text (optional screenshot) |
+| `browser_click(element=… \| selector=…)` | click (real mouse events inside the page; nothing on your screen moves) |
+| `browser_type(text, element=…, clear=, submit=)` | type into a field, optionally press Enter |
+| `browser_navigate(url)` / `browser_read(selector=None)` | open a URL / read text |
+
+Two ways to connect, both opt-in:
+
+* **locum-managed profile** (`browser_launch`): the recommended way. Your
+  everyday profile is never touched; sign in once in the managed profile and
+  it stays signed in there.
+* **attach** to a browser you started yourself with a DevTools port, e.g.
+  `msedge --remote-debugging-port=9222 --user-data-dir=C:\automation-profile`
+  (Chrome 136+ ignores the port on the default profile). locum finds it through
+  its `DevToolsActivePort` file, `$LOCUM_CDP_PORT`, or port 9222.
+
+While a browser is connected, `observe` skips that browser window's page
+content (its tabs and toolbar stay listed) and says to use `browser_observe`.
+The browser tools go through the same safety policy as everything else
+(app allow-lists use `msedge.exe` / `chrome.exe`; a "Pay now" click asks for
+confirmation; passwords are redacted). DevTools gives full control of that
+browser, so only connect to browsers you started for automation.
 
 ## Elevated (administrator) windows
 
