@@ -103,6 +103,7 @@ OPTIONAL_DEPENDENCIES: Tuple[Tuple[str, str], ...] = (
     ("easyocr", "OCR alternative"),
     ("cv2", "faster template matching"),
     ("openpyxl", "XLSX work queues"),
+    ("jeepney", "wayland: native Wayland backend (xdg-desktop-portal)"),
 )
 
 
@@ -630,6 +631,9 @@ def cmd_info(ctx: _Ctx) -> int:
         "failsafe": bool(d.failsafe.enabled),
         "optional_dependencies": deps,
     }
+    limits = getattr(be, "limitations", None)
+    if callable(limits):
+        data["limitations"] = [str(x) for x in (safe(limits) or [])]
     if ctx.json:
         ctx.emit_json(data)
         return EXIT_OK
@@ -643,6 +647,8 @@ def cmd_info(ctx: _Ctx) -> int:
         ctx.print(f"cursor:       ({cursor.x}, {cursor.y})")
     if active is not None:
         ctx.print(f"active:       {active.title!r} [{active.app}]")
+    for note in data.get("limitations", []):
+        ctx.print(f"limitation:   {note}")
     ctx.print(f"failsafe:     {'on' if data['failsafe'] else 'off'}")
     ctx.print("optional:     " + ", ".join(f"{mod} {'yes' if ok else 'no'}" for mod, ok in deps.items()))
     return EXIT_OK

@@ -2,8 +2,9 @@
 
 ``get_backend()`` returns a process-wide default backend chosen from, in order:
 
-1. the ``LOCUM_BACKEND`` environment variable (``mock``, ``x11``, ``windows``, ``macos``)
-2. the current platform (``win32`` -> windows, ``darwin`` -> macos, otherwise x11)
+1. the ``LOCUM_BACKEND`` environment variable (``mock``, ``x11``, ``wayland``, ``windows``, ``macos``)
+2. the current platform (``win32`` -> windows, ``darwin`` -> macos, otherwise x11 --
+   or wayland in a Wayland session, see :func:`select_platform_backend`)
 
 Third-party backends can be registered with :func:`register_backend`.
 """
@@ -14,7 +15,7 @@ import importlib
 import os
 import sys
 import threading
-from typing import Callable, Dict, Optional, Union
+from typing import Callable, Dict, Mapping, Optional, Union
 
 from ..errors import BackendUnavailable
 from .base import AccessibleNode, Backend
@@ -22,6 +23,7 @@ from .base import AccessibleNode, Backend
 _REGISTRY: Dict[str, Union[str, Callable[[], Backend]]] = {
     "mock": "locum.backends.mock:MockBackend",
     "x11": "locum.backends.x11:X11Backend",
+    "wayland": "locum.backends.wayland:WaylandBackend",
     "windows": "locum.backends.windows:WindowsBackend",
     "macos": "locum.backends.macos:MacOSBackend",
 }
@@ -39,12 +41,51 @@ def available_backends() -> list:
     return sorted(_REGISTRY)
 
 
-def platform_backend_name() -> str:
-    if sys.platform == "win32":
+def is_wayland_session(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the desktop session is Wayland (``XDG_SESSION_TYPE=wayland``; when that is
+    unset, a ``WAYLAND_DISPLAY`` counts)."""
+    env = os.environ if environ is None else environ
+    kind = (env.get("XDG_SESSION_TYPE") or "").strip().lower()
+    if kind:
+        return kind == "wayland"
+    return bool(env.get("WAYLAND_DISPLAY"))
+
+
+def _jeepney_available() -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("jeepney") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def select_platform_backend(platform: Optional[str] = None, environ: Optional[Mapping[str, str]] = None,
+                            jeepney_available: Optional[bool] = None) -> str:
+    """The default backend name for ``platform`` (default: this one) and ``environ``.
+
+    The ``wayland`` backend is experimental, so it is never chosen over a working
+    X server: a Wayland session with ``$DISPLAY`` set (XWayland) keeps the tested
+    ``x11`` backend, which reaches XWayland clients. Opt in with
+    ``LOCUM_BACKEND=wayland``. Only a Wayland session with no X server gets
+    ``wayland`` automatically, because ``x11`` could not work there at all. An X11
+    session always gets ``x11``.
+    """
+    plat = sys.platform if platform is None else platform
+    if plat == "win32":
         return "windows"
-    if sys.platform == "darwin":
+    if plat == "darwin":
         return "macos"
-    return "x11"
+    env = os.environ if environ is None else environ
+    if not is_wayland_session(env):
+        return "x11"
+    if env.get("DISPLAY"):
+        return "x11"
+    return "wayland"
+
+
+def platform_backend_name() -> str:
+    return select_platform_backend()
 
 
 def create_backend(name: Optional[str] = None, **kwargs) -> Backend:
@@ -92,7 +133,9 @@ __all__ = [
     "available_backends",
     "create_backend",
     "get_backend",
+    "is_wayland_session",
     "platform_backend_name",
     "register_backend",
+    "select_platform_backend",
     "set_backend",
 ]

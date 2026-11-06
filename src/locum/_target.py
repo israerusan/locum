@@ -26,6 +26,8 @@ When the backend cannot tell (no window support, a failed query) a *strict*
 target refuses (explicit bindings: the CLI's ``--window``) and a lenient one lets
 the input through (the automatic binding of :class:`~locum.element.Element`
 actions, which already proved focus before typing).
+A backend that declares ``strict_input_targets = True`` (the Wayland backend,
+which can never see window geometry) makes every target strict.
 """
 
 from __future__ import annotations
@@ -82,7 +84,9 @@ class InputTarget:
         return bool(res) if ok else None
 
     def _unknown(self, what: str) -> None:
-        if self.strict:
+        # A backend that can never verify where input goes (Wayland: no window geometry or
+        # stacking order) makes every target strict: lenient would mean "always let it through".
+        if self.strict or getattr(self.backend, "strict_input_targets", False):
             raise TargetLost(f"{what} for {self._what()} was not sent: the backend cannot tell which window "
                              "would receive it, so it cannot be kept from reaching another application")
 

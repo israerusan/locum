@@ -34,7 +34,8 @@ before the primitive returns. A lost X connection raises
 :class:`~locum.errors.BackendError`.
 
 Under a pure Wayland session XTEST only reaches XWayland clients; use the
-backend inside an X11 session for full-desktop control.
+backend inside an X11 session for full-desktop control, or the (experimental)
+portal-based :mod:`locum.backends.wayland` backend.
 """
 
 from __future__ import annotations

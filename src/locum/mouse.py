@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional, Union
 from . import _inputlock
 from ._cancel import check as _cancel_check
 from ._target import check_input as _target_check
+from .errors import NotSupported
 from .failsafe import FailSafe
 from .motion import Humanize, fitts_duration, plan_path
 from .types import MouseButton, Point, coerce_point
@@ -109,7 +110,13 @@ class Mouse:
         """
         self._check(ignore=ignore)
         h = self._resolve_humanize(humanize)
-        start = self.backend.mouse_position()
+        try:
+            start = self.backend.mouse_position()
+        except NotSupported:
+            # The backend cannot read the pointer (Wayland before locum first moved it):
+            # there is no start for a path, so jump straight to the target.
+            self.backend.mouse_move(target.x, target.y)
+            return target
         if duration is None:
             duration = fitts_duration(Point(*start).distance(target), speed=h.speed) if h is not None else 0.0
         duration = max(0.0, float(duration))
