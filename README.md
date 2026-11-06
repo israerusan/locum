@@ -446,17 +446,42 @@ ScreenCast) support is not implemented yet.
 ```text
 locum [--backend NAME] [--timeout S] [--json] [--no-failsafe] [--humanize] [--kill-hotkey] COMMAND
   info | screenshot [-o PNG] [--region L,T,W,H] [--monitor N] | windows | tree [--window T] [--depth N] [--all]
-  find SELECTOR [--all] | click TARGET | move TARGET | type TEXT [-e] [--into SEL] | hotkey COMBO | press KEY...
-  scroll DY [--at TARGET] | wait SELECTOR [--state S] | locate IMAGE [--confidence C] [--click]
-  observe [--json] [--screenshot PNG] | inspect [X,Y]
+  find SELECTOR [--all] | click TARGET [--window T | --anywhere] | move TARGET
+  type TEXT [-e] (--into SEL | --window T | --focused) | hotkey COMBO (--window T | --focused)
+  press KEY... (--window T | --focused) | scroll DY [--at TARGET] | wait SELECTOR [--state S]
+  locate IMAGE [--confidence C] [--click --anywhere] | observe [--json] [--window T] [--screenshot PNG] | inspect [X,Y]
   mcp [--policy strict|default|permissive] [--dry-run] [--audit FILE]
   agent TASK [--model M] [--max-steps N] [--dry-run] [--mode tools|computer_use] [--replay FILE]
   run FLOW.yaml [--var k=v] [--report-dir DIR] [--validate] | record [-o out.py|out.yaml] [--duration S]
 ```
 
-Exit codes: 0 ok · 1 failed (not found, timeout, policy, failed flow/agent) ·
+Exit codes: 0 ok · 1 failed (not found, timeout, policy, failed flow/agent, target lost) ·
 2 usage/invalid input · 3 unavailable (backend, capability, missing extra) ·
 4 fail-safe abort · 130 interrupted.
+
+**Input goes to a named target.** Keystrokes go wherever the focus is, and a click
+lands on whatever window is at the point. So `type`, `press` and `hotkey` need
+`--window TITLE` (or `--into SELECTOR` for `type`), and a click on coordinates or
+an image needs `--window TITLE`. The window is brought to the front, and every
+key press, typed text chunk and click is checked against it right before it is
+sent: if another window takes the focus (a chat, a notification, another app's
+dialog) or covers the click point, nothing more is sent and the command exits
+with 1 (`TargetLost`). `--focused` / `--anywhere` send to whatever has the focus
+or is under the point now, and still stop if another window takes the focus
+while typing. Selectors (`click 'button "Save"'`, `--into`) are always bound to
+their element's window. Library calls work the same way: `Element.type`,
+`click`, `press` and `set_text` are bound to the element's window and focus,
+and the LLM tools bind each input to the window the policy judged.
+`Desktop.type()` without an element goes to the focus, as documented.
+
+**`--json` is a contract.** stdout carries exactly one JSON document, also on
+failure (`{"ok": false, "error": {"type", "message", "exit_code"}}`); diagnostics
+go to stderr; the exit code is non-zero on failure. Non-ASCII text is escaped
+(`\u280b`) unless stdout is UTF-8, and text output never fails on a legacy
+console code page (characters it cannot show become `?`).
+
+`observe --window T` shows that window only: no other window's title, and the
+parts of it covered by other windows are blanked out of the screenshot.
 
 ## Examples
 

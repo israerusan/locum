@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple, Uni
 
 from .backends.base import CAP_CLIPBOARD, CAP_UNICODE_TYPING
 from ._cancel import check as _cancel_check
+from ._target import check_input as _target_check
 from .errors import NotSupported
 from .failsafe import FailSafe
 from .keys import check_combo, lower_combo_letters, normalize_key, parse_hotkey, press_actions, split_text_tokens
@@ -108,6 +109,7 @@ class Keyboard:
         # Every key press goes through here (taps, hotkeys, typed characters, paste):
         # a cancelled / timed-out call stops before the press. Releases never check.
         _cancel_check()
+        _target_check("key", key=key)
         added = key not in self._pressed
         if added:
             self._pressed.append(key)
@@ -381,6 +383,7 @@ class Keyboard:
                     self._sleep(interval)
                 self._check()
                 if kind == "text":
+                    _target_check("text")
                     self.backend.type_text(value)
                 elif kind == "char":
                     self._tap(value)

@@ -837,10 +837,13 @@ def observe(
     shot = None
     annotated_img = None
     scale = 1.0
+    blanked = False
     if screenshot:
         tw, th = fit_image_size(region.width, region.height, max_long_edge, max_visual_tokens)
         scale = tw / float(region.width) if region.width else 1.0
         raw = desktop.screenshot(region)
+        if target_window is not None:
+            raw, blanked = _blank_other_windows(raw, backend, target_window, region)
         if raw.size != (tw, th):
             from PIL import Image as _PILImage
 
@@ -853,11 +856,19 @@ def observe(
 
             boxes = [(el.bounds, str(el.id)) for el in elements if not el.occluded]
             annotated_img = _annotate(shot, boxes, color=None, offset=(region.left, region.top), scale=scale) if boxes else shot.copy()
+    shown_windows, shown_active = all_windows, active
+    if target_window is not None:
+        # Observing one window shows that window only: the titles of the other windows
+        # (and which one has the focus) are not the model's business.
+        th_ = target_window.handle
+        shown_windows = [w for w in all_windows if w.handle == th_] or [_safe(lambda: target_window.info)]
+        shown_windows = [w for w in shown_windows if w is not None]
+        shown_active = active if active is not None and active.handle == th_ else None
     obs = Observation(
         screenshot=shot,
         elements=elements,
-        windows=all_windows,
-        active_window=active,
+        windows=shown_windows,
+        active_window=shown_active,
         cursor=desktop.position(),
         screen_size=(region.width, region.height),
         scale=scale,
@@ -883,8 +894,34 @@ def observe(
         if unscanned:
             msg += f" {_names(unscanned)} not scanned;"
         obs.notes.append(msg.rstrip(";") + ". Observe one window (window=...) to see the rest.")
+    if target_window is not None and (active is None or active.handle != target_window.handle):
+        obs.notes.append("This window is not in the foreground (another window has the keyboard focus): "
+                         "keyboard input goes to that other window until this one is focused.")
+    if blanked:
+        obs.notes.append("Parts of this window covered by other windows are blanked out in the screenshot.")
     obs._ctx = ctx
     return obs
+
+
+def _blank_other_windows(img: Any, backend: Any, window: Any, region: Rect) -> Tuple[Any, bool]:
+    """``img`` (a capture of ``region``) with every window in front of ``window`` painted over:
+    a window-scoped observation must not show the content of other applications."""
+    try:
+        covers = list(backend.windows_above(window.handle))
+    except Exception:
+        covers = []
+    hits = [r.intersect(region) for r in covers]
+    hits = [r for r in hits if r is not None and r.width > 0 and r.height > 0]
+    if not hits:
+        return img, False
+    from PIL import ImageDraw
+
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    for r in hits:
+        x0, y0 = r.left - region.left, r.top - region.top
+        draw.rectangle([x0, y0, x0 + r.width - 1, y0 + r.height - 1], fill=(96, 96, 96))
+    return out, True
 
 
 __all__ = [

@@ -38,6 +38,7 @@ from .errors import (
     SelectorSyntaxError,
     WindowNotFound,
     WorkflowError,
+    TargetLost,
 )
 from .types import Match, Monitor, MouseButton, Point, Rect, WindowInfo, coerce_point
 
@@ -361,6 +362,7 @@ __all__ = [
     "SelectorSyntaxError",
     "PolicyViolation",
     "WorkflowError",
+    "TargetLost",
     # safety / helpers
     "abort",
     "reset_abort",

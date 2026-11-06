@@ -283,6 +283,34 @@ class Backend(abc.ABC):
                 return w
         return None
 
+    def foreground_handle(self) -> Any:
+        """Handle of the window that receives keyboard input (``None``: none / unknown)."""
+        w = self.active_window()
+        return w.handle if w is not None else None
+
+    def window_handle_at(self, x: int, y: int) -> Any:
+        """Handle of the top-level window that a click at ``(x, y)`` would reach (``None``: none)."""
+        for w in self.list_windows():
+            if w.is_visible and not w.is_minimized and w.rect.contains((x, y)):
+                return w.handle
+        return None
+
+    def window_belongs_to(self, handle: Any, target: Any) -> bool:
+        """Whether input reaching top-level window ``handle`` is input for window ``target``:
+        the same window or one it owns (its dialog, its pop-up menu)."""
+        return handle == target
+
+    def windows_above(self, handle: Any) -> List[Rect]:
+        """Screen rectangles of the windows in front of ``handle`` that are not part of it
+        (they cover it in a screenshot of its area)."""
+        out: List[Rect] = []
+        for w in self.list_windows():
+            if w.handle == handle:
+                return out
+            if w.is_visible and not w.is_minimized and not self.window_belongs_to(w.handle, handle):
+                out.append(w.rect)
+        return out
+
     def activate_window(self, handle: Any) -> None:
         raise NotSupported(f"{self.name} backend cannot activate windows")
 

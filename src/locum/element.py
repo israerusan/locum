@@ -47,9 +47,11 @@ The ``desktop`` argument only needs the parts of
 
 from __future__ import annotations
 
+import functools
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
+from . import _target
 from ._cancel import check as _cancel_check
 from .backends.base import CAP_CLIPBOARD, AccessibleNode
 from .errors import (
@@ -138,6 +140,21 @@ def _native_mode(native: NativeMode) -> Union[bool, str]:
     if v in ("false", "mouse", "keyboard", "typing", "0", "no"):
         return False
     raise ValueError(f"native must be True, False or 'auto', got {native!r}")
+
+
+def _bound_input(keyboard: bool) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Run an :class:`Element` input method with its input bound to the element's window
+    (and, for keyboard methods, to the element's focus): see :mod:`locum._target`."""
+
+    def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def wrapper(self: "Element", *args: Any, **kwargs: Any) -> Any:
+            with _target.bind(self._input_target(keyboard)):
+                return fn(self, *args, **kwargs)
+
+        return wrapper
+
+    return deco
 
 
 def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
@@ -655,6 +672,26 @@ class Element:
             return False  # hit-testing is coarser than our element
         return True
 
+    def _input_target(self, keyboard: bool) -> Optional["_target.InputTarget"]:
+        """The input target for this element's window (``None``: unknown window, or the same
+        target is already bound by an enclosing call)."""
+        cur = _target.current()
+        if cur is not None and (not keyboard or cur.element is self):
+            mine = _safe(lambda: self._node.handle)
+            if cur.element is self or (mine is not None and mine == cur.handle):
+                return None
+        from ._nodeinfo import owning_window
+
+        info = _safe(lambda: owning_window(self.backend, self._node, guess=False))
+        if info is None or info.handle is None:
+            return None
+        if cur is not None and cur.handle == info.handle and (not keyboard or cur.element is self):
+            return None
+        # Lenient: focus was proven before typing; a backend that cannot tell where input
+        # goes is not a reason to refuse here (explicit bindings -- the CLI's --window -- are strict).
+        return _target.InputTarget(self.backend, info.handle, element=self if keyboard else None,
+                                   title=info.title or "", strict=False)
+
     def _guard(self) -> None:
         """Honour the fail-safe (global abort flag + screen corners) before a native action.
 
@@ -801,6 +838,7 @@ class Element:
         self._last_click_point = point  # what Desktop.click reports as the clicked point
 
     # --------------------------------------------------------------- actions
+    @_bound_input(keyboard=False)
     def click(self, button: str = "left", clicks: int = 1, *, offset: Tuple[int, int] = (0, 0), native: NativeMode = "auto") -> "Element":
         """Click the element.
 
@@ -876,6 +914,7 @@ class Element:
             raise NotSupported(f"{self!r} does not support native invoke")
         return self
 
+    @_bound_input(keyboard=False)
     def focus(self) -> "Element":
         """Give keyboard focus natively; editable elements fall back to a mouse click.
 
@@ -1020,6 +1059,7 @@ class Element:
     def _typing_mode(self, mode: Optional[str]) -> str:
         return mode or getattr(self.desktop, "typing_mode", None) or "auto"
 
+    @_bound_input(keyboard=True)
     def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: bool = True,
                  require_focus: Optional[bool] = None, _typing_mode: Optional[str] = None) -> "Element":
         """Replace (``clear=True``) or extend the element's text.
@@ -1110,6 +1150,7 @@ class Element:
         except ActionTimeout:
             self._raise_mismatch(target, last[0])
 
+    @_bound_input(keyboard=True)
     def type(self, text: str, *, verify: bool = True, require_focus: Optional[bool] = None,
              **kw: Any) -> "Element":
         """Focus the element (if needed) and type ``text`` (keyword args go to ``Keyboard.type``).
@@ -1213,6 +1254,7 @@ class Element:
     def clear(self) -> "Element":
         return self.set_text("", clear=True)
 
+    @_bound_input(keyboard=True)
     def press(self, *keys: Any, require_focus: Optional[bool] = None, **kw: Any) -> "Element":
         """Focus the element (if needed) and press keys: ``el.press("ctrl+a", "delete")``.
 
@@ -1306,6 +1348,7 @@ class Element:
         self._native(lambda: self._node.scroll_into_view(), False)
         return self
 
+    @_bound_input(keyboard=False)
     def scroll(self, dy: int, dx: int = 0) -> "Element":
         """Scroll ``dy`` wheel notches (``>0`` = up) with the cursor over the element."""
         self._guard()

@@ -205,13 +205,13 @@ def test_click_selector_drives_the_app(desk, be):
 
 
 def test_click_coordinates_button_clicks_offset(desk, be):
-    code, out, _ = run(["--json", "click", "300,200", "--button", "right", "--clicks", "2", "--offset", "5,-5"], desk)
+    code, out, _ = run(["--json", "click", "300,200", "--anywhere", "--button", "right", "--clicks", "2", "--offset", "5,-5"], desk)
     assert code == EXIT_OK
-    assert json.loads(out) == {"clicked": {"x": 305, "y": 195}, "button": "right", "clicks": 2}
+    assert json.loads(out) == {"clicked": {"x": 305, "y": 195}, "button": "right", "clicks": 2, "window": None}
     downs = [e for e in be.events if e[0] == "down"]
     assert downs == [("down", "right", 305, 195), ("down", "right", 305, 195)]
-    assert run(["click", "1,2", "--clicks", "0"], desk)[0] == EXIT_USAGE
-    assert run(["click", "1,2", "--offset", "nope"], desk)[0] == EXIT_USAGE
+    assert run(["click", "1,2", "--anywhere", "--clicks", "0"], desk)[0] == EXIT_USAGE
+    assert run(["click", "1,2", "--anywhere", "--offset", "nope"], desk)[0] == EXIT_USAGE
 
 
 def test_move_and_scroll(desk, be):
@@ -233,21 +233,21 @@ def test_type_into_with_escapes_and_replace(desk, be):
     assert code == EXIT_OK and be._fields["vendor"].value == "Globex"
     code, _, _ = run(["type", " Inc", "--into", "edit#vendor"], desk)  # without --replace: appends
     assert be._fields["vendor"].value == "Globex Inc"
-    code, _, _ = run(["type", "!"], desk)  # into whatever has the focus now
+    code, _, _ = run(["type", "!", "--focused"], desk)  # into whatever has the focus now
     assert be._fields["vendor"].value == "Globex Inc!"
 
 
 def test_hotkey_and_press(desk, be):
     be._focus = be._fields["vendor"]
-    code, out, _ = run(["hotkey", "ctrl+a"], desk)
+    code, out, _ = run(["hotkey", "ctrl+a", "--focused"], desk)
     assert code == EXIT_OK and "pressed ctrl+a" in out
     assert ("key_down", "ctrl") in be.events and ("key_up", "ctrl") in be.events
-    code, out, _ = run(["press", "tab", "--presses", "2"], desk)
+    code, out, _ = run(["press", "tab", "--presses", "2", "--focused"], desk)
     assert code == EXIT_OK and be.focused_widget is be._fields["amount"]
-    code, out, _ = run(["--json", "hotkey", "shift", "tab"], desk)
-    assert json.loads(out) == {"hotkey": ["shift", "tab"]}
+    code, out, _ = run(["--json", "hotkey", "shift", "tab", "--focused"], desk)
+    assert json.loads(out) == {"hotkey": ["shift", "tab"], "window": None}
     assert be.focused_widget is be._fields["invoice_no"]
-    assert run(["press", "tab", "--presses", "0"], desk)[0] == EXIT_USAGE
+    assert run(["press", "tab", "--presses", "0", "--focused"], desk)[0] == EXIT_USAGE
 
 
 def test_wait_visible_and_gone(desk, be):
@@ -283,7 +283,7 @@ def test_locate_found_click_all_and_missing(desk, be, tmp_path):
     data = json.loads(out)
     assert data and data[0]["rect"] == {"left": 180, "top": 268, "width": 100, "height": 32}
     be.clear_events()
-    code, out, _ = run(["locate", str(needle), "--click", *region], desk)
+    code, out, _ = run(["locate", str(needle), "--click", "--anywhere", *region], desk)
     assert code == EXIT_OK and "clicked (230, 284)" in out
     assert ("down", "left", 230, 284) in be.events
     from PIL import Image
@@ -505,7 +505,7 @@ def test_record_errors(desk, tmp_path, monkeypatch):
 def test_failsafe_abort_exit_code(be):
     d = Desktop(be, sleep=_noop, default_timeout=0)
     be.mouse_move(0, 0)  # cursor in a fail-safe corner
-    code, _, err = run(["click", "100,100"], d)
+    code, _, err = run(["click", "100,100", "--anywhere"], d)
     assert code == EXIT_ABORTED and "aborted" in err
 
 

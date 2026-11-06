@@ -7,13 +7,15 @@ from __future__ import annotations
 import ctypes
 from typing import Any, Dict, List, Optional, Sequence
 
-from ...errors import BackendError, WindowNotFound
+from ...errors import BackendError, NotSupported, WindowNotFound
 from ...types import Rect, WindowInfo
 from ._win32api import (
     DWMWA_CLOAKED,
     DWMWA_EXTENDED_FRAME_BOUNDS,
     DWORD,
     GWL_EXSTYLE,
+    GWL_STYLE,
+    POINT,
     PROCESS_QUERY_LIMITED_INFORMATION,
     RECT,
     SW_HIDE,
@@ -24,6 +26,7 @@ from ._win32api import (
     WM_CLOSE,
     WS_EX_APPWINDOW,
     WS_EX_TOOLWINDOW,
+    WS_POPUP,
 )
 from .keys import VK_MENU
 
@@ -171,6 +174,66 @@ class _WindowsMixin:
         """Visible, titled, non-tool, non-cloaked top-level windows, front-most first."""
         self._check()
         return self._windows_from(self._toplevel_hwnds(), {})
+
+    # ---------------------------------------------------------- input targets
+    def foreground_handle(self) -> Any:
+        fg = self._api.GetForegroundWindow()
+        return int(fg) if fg else None
+
+    def window_handle_at(self, x: int, y: int) -> Any:
+        a = self._api
+        wfp, anc = getattr(a, "WindowFromPoint", None), getattr(a, "GetAncestor", None)
+        if wfp is None or anc is None:
+            raise NotSupported("WindowFromPoint is unavailable")
+        h = wfp(POINT(int(x), int(y)))
+        if not h:
+            return None
+        return int(anc(h, 2) or h)  # GA_ROOT: the top-level window
+
+    def _owners(self, hwnd: int) -> List[int]:
+        get = getattr(self._api, "GetWindow", None)
+        out: List[int] = []
+        if get is None:
+            return out
+        h = hwnd
+        for _ in range(16):
+            h = get(h, 4)  # GW_OWNER
+            if not h:
+                break
+            out.append(int(h))
+        return out
+
+    def window_belongs_to(self, handle: Any, target: Any) -> bool:
+        """The same window, a window it owns (a dialog, a pop-up), or an untitled pop-up of
+        its process (menus, drop-down lists and tooltips have no owner)."""
+        h, t = int(handle), int(target)
+        if h == t or t in self._owners(h):
+            return True
+        a = self._api
+        try:
+            untitled_popup = int(a.GetWindowTextLengthW(h)) <= 0 and bool(int(a.GetWindowLongPtrW(h, GWL_STYLE)) & WS_POPUP)
+            return untitled_popup and self._pid(h) == self._pid(t)
+        except Exception:
+            return False
+
+    def windows_above(self, handle: Any) -> List[Rect]:
+        """Every visible, uncloaked top-level window in front of ``handle`` (titled or not:
+        notifications and tool windows too) that is not part of it."""
+        target = int(handle)
+        out: List[Rect] = []
+        a = self._api
+        for h in self._toplevel_hwnds():
+            if h == target:
+                return out
+            try:
+                if not a.IsWindowVisible(h) or a.IsIconic(h) or self._is_cloaked(h) or self.window_belongs_to(h, target):
+                    continue
+                r = self._frame_rect(h)
+            except Exception:
+                continue
+            if r.width > 0 and r.height > 0:
+                out.append(r)
+        return out
 
     def active_window(self) -> Optional[WindowInfo]:
         self._check()

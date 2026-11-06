@@ -147,6 +147,19 @@ name -- the submit is treated like a click on an unidentified control (asks). A 
 or timed-out tool call sends no further input to the page. DevTools gives full
 control of that browser, so only connect to browsers you started for automation.
 
+## Input goes where the policy looked
+
+Every input tool is bound to the window the safety policy judged: `type_text`
+and `press_keys` without an element to the window that had the focus when the
+call was checked, a click or scroll on coordinates to the window under that
+point, and element actions to the element's window and focus. Each key press,
+typed text chunk and click is checked against it right before it is sent; if a
+chat, a notification or another app's dialog took the focus in between (or
+during a long text), nothing more is sent and the call fails with `TargetLost`
+instead of typing into that window. `observe(window=...)` shows that window
+only: no other window's title, and covering windows are blanked out of the
+screenshot.
+
 ## Elevated (administrator) windows
 
 Windows silently drops input that an unelevated process sends to an elevated

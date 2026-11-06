@@ -371,6 +371,7 @@ class _Win32:
             (advapi32, "GetSidSubAuthority", P(DWORD), [LPVOID, DWORD]),
             (u, "WindowFromPoint", HWND, [POINT]),
             (u, "GetAncestor", HWND, [HWND, UINT]),
+            (u, "GetWindow", HWND, [HWND, UINT]),
         ]
         for dll, name, res, args in optional:
             setattr(self, name, _proto(dll, name, res, args, required=False))

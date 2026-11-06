@@ -61,6 +61,7 @@ __all__ = [
     "SelectorSyntaxError",
     "PolicyViolation",
     "WorkflowError",
+    "TargetLost",
     "STOP_ERRORS",
     "FATAL_ERRORS",
     "TRANSIENT_ERRORS",
@@ -141,9 +142,15 @@ class WorkflowError(LocumError):
     """A workflow step failed after exhausting its retries."""
 
 
+class TargetLost(LocumError):
+    """Input meant for one window or element was not sent because it would reach
+    another one: the focus moved to another window (or control) after the target
+    was found, or another window covers the point to click. Never retried."""
+
+
 # ------------------------------------------------------------ classification
 #: Stop requests: fatal even when marked ``transient=True``.
-STOP_ERRORS: Tuple[Type[BaseException], ...] = (FailSafeTriggered, PolicyViolation)
+STOP_ERRORS: Tuple[Type[BaseException], ...] = (FailSafeTriggered, PolicyViolation, TargetLost)
 
 #: Always fatal (checked before :data:`TRANSIENT_ERRORS`, so these win over
 #: their transient base classes: ``PermissionError`` is an ``OSError``,

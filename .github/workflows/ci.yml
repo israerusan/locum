@@ -116,6 +116,15 @@ jobs:
         continue-on-error: true
         run: python -m locum.selftest --yes --out selftest-report
 
+      # Another window takes the focus between finding a target and typing, and in the
+      # middle of typing: nothing may reach it (real SendInput on the runner's desktop).
+      - name: Focus-steal tests against the real desktop
+        env:
+          LOCUM_TEST_DESKTOP: "1"
+        run: |
+          python -m pip install pytest
+          python -m pytest -q -p no:cacheprovider tests/test_real_focus_steal.py
+
       - name: Flag a failed self-test (non-blocking)
         if: steps.selftest.outcome == 'failure'
         shell: bash

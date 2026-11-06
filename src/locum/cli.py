@@ -7,13 +7,14 @@
     locum windows --json
     locum tree --window "Invoice Entry" --depth 6 --all
     locum find 'edit#amount' --json
-    locum click 'button "Save"'                  # selector, "x,y" or an image file
+    locum click 'button "Save"'                  # a selector: bound to its element's window
+    locum click 300,200 --window "Invoice"       # "x,y" or an image: only inside that window
     locum type "hello\\n" -e --into 'edit "Vendor"'
-    locum hotkey ctrl+s
+    locum hotkey ctrl+s --window "Invoice"       # keys only while "Invoice" has the focus
     locum locate ok_button.png --confidence 0.85
     locum observe --json                         # what an LLM agent sees (set-of-marks)
     locum inspect 120,340                        # selector of the element under a point
-    locum click -1200,300                        # negative x: a monitor left of the primary
+    locum click -1200,300 --anywhere             # negative x: a monitor left of the primary
     locum mcp --policy strict                    # MCP server over stdio (Claude Desktop / Code)
     locum agent "Enter invoice INV-7 for ACME, 120.50" --dry-run
     locum run flow.yaml --var customer=ACME --report-dir runs
@@ -25,8 +26,15 @@ in-memory demo desktop with an ERP form, a spreadsheet and a text editor, ideal
 for trying locum, CI and tests), ``--timeout``, ``--json``, ``--no-failsafe``,
 ``--humanize``, ``--pause``, ``--kill-hotkey``/``--kill-combo`` and ``--debug``.
 
+Input commands need a target: ``type``/``press``/``hotkey`` take ``--window``
+(``type`` also ``--into``) and a click on coordinates or an image takes
+``--window``; every key press and click is checked against that target right
+before it is sent (exit ``1``, ``TargetLost``, when another window took the focus
+or covers the point). ``--focused`` / ``--anywhere`` opt into the focus / pointer.
+With ``--json``, stdout holds exactly one JSON document, also on failure.
+
 Exit codes: ``0`` success, ``1`` the action failed (element/image/window not
-found, timeout, policy violation, failed flow or agent run), ``2`` usage error
+found, timeout, policy violation, failed flow or agent run, target lost), ``2`` usage error
 (bad arguments, invalid selector or flow), ``3`` unavailable (no usable backend,
 unsupported capability or missing optional dependency), ``4`` aborted by the
 fail-safe, ``130`` interrupted (Ctrl+C).
@@ -334,6 +342,9 @@ class _Ctx:
         self.client = client
         self._desktop = desktop
         self._owned_backend: Optional[Backend] = None
+        self.json_emitted = False
+        #: The stdout stream as given (``mcp`` speaks UTF-8 JSON-RPC on it itself).
+        self.raw_out = getattr(out, "wrapped", out)
 
     @property
     def json(self) -> bool:
@@ -375,7 +386,47 @@ class _Ctx:
         print(*parts, file=self.err)
 
     def emit_json(self, data: Any) -> None:
-        self.out.write(json.dumps(data, indent=2, ensure_ascii=False, default=_json_default) + "\n")
+        """Write the command's one JSON document to stdout.
+
+        Non-ASCII text is escaped (``\\u280b``) unless stdout is UTF-8, so the document
+        is valid and complete on any console code page (a braille spinner in a window
+        title cannot break it)."""
+        if self.json_emitted:
+            raise RuntimeError("a --json command wrote two documents")  # pragma: no cover - programming error
+        text = json.dumps(data, indent=2, ensure_ascii=not _is_utf8(self.out), default=_json_default)
+        self.out.write(text + "\n")
+        self.json_emitted = True
+
+
+def _is_utf8(stream: Any) -> bool:
+    enc = (getattr(stream, "encoding", None) or "utf-8").lower().replace("-", "").replace("_", "")
+    return enc in ("utf8", "utf8sig", "cp65001")
+
+
+class _SafeText:
+    """A text stream that never fails on characters its encoding lacks.
+
+    A Windows console or pipe with a legacy code page (cp1252, cp437) cannot encode
+    a braille spinner or an emoji in a window title: such a character is written as
+    ``?`` instead of crashing the command (JSON output escapes them instead, see
+    :meth:`_Ctx.emit_json`)."""
+
+    def __init__(self, stream: Any) -> None:
+        self.wrapped = stream
+
+    @property
+    def encoding(self) -> Optional[str]:
+        return getattr(self.wrapped, "encoding", None)
+
+    def write(self, text: str) -> int:
+        try:
+            return self.wrapped.write(text)
+        except UnicodeEncodeError:
+            enc = self.encoding or "ascii"
+            return self.wrapped.write(text.encode(enc, "replace").decode(enc, "replace"))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.wrapped, name)
 
 
 def _json_default(value: Any) -> Any:
@@ -481,6 +532,71 @@ def _build_policy(name: str, *, dry_run: bool = False, confirm: Optional[Callabl
 def _short_json(value: Any, limit: int = 160) -> str:
     text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
     return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+# =============================================================================== input targets
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")
+
+
+def _is_image_target(text: str) -> bool:
+    return text.lower().endswith(_IMAGE_EXTS) or (os.path.isfile(os.path.expanduser(text)) and not _is_point(text))
+
+
+def _target_window(ctx: _Ctx) -> Any:
+    """``--window TITLE``: the window, brought to the foreground and verified to be there.
+
+    Input sent while it is bound (:func:`_bound`) reaches this window or nothing: if
+    another window takes the focus (or covers a click point) before or during the
+    input, the command stops with exit code 1 instead of typing into it."""
+    from .errors import TargetLost
+
+    a = ctx.args
+    d = ctx.desktop
+    w = d.window(a.window, timeout=a.timeout)
+    w.activate()
+    try:
+        fg = d.backend.foreground_handle()
+    except Exception:
+        fg = None
+    if fg is None or not (fg == w.handle or d.backend.window_belongs_to(fg, w.handle)):
+        raise TargetLost(f"could not bring {w.title!r} to the foreground (another window keeps the focus); "
+                         "nothing was sent")
+    return w
+
+
+def _bound(ctx: _Ctx, window: Any) -> Any:
+    from . import _target
+
+    if window is None:
+        return contextlib.nullcontext()
+    return _target.bind(_target.for_window(window, strict=True))
+
+
+def _require_scope(ctx: _Ctx, what: str, *, flag: str, allowed: str) -> None:
+    a = ctx.args
+    if getattr(a, "window", None) or getattr(a, flag, False) or getattr(a, "into", None):
+        return
+    raise _UsageError(
+        f"{what} go to whatever has the focus (or is under the pointer) when they are sent, which may be "
+        f"another application than the one you meant (a chat window that just took the focus). "
+        f"Name the target with {allowed}, or pass --{flag.replace('_', '-')} to send them there anyway."
+    )
+
+
+def _unscoped_target(ctx: _Ctx) -> Any:
+    """``--focused`` / ``--anywhere``: still bound to the window that has the focus (or is under
+    the point) when the command starts, so a focus change *during* the input stops it."""
+    from . import _target
+
+    try:
+        h = ctx.desktop.backend.foreground_handle()
+    except Exception:
+        h = None
+    if h is None:
+        return contextlib.nullcontext()
+    return _target.bind(_target.InputTarget(ctx.desktop.backend, h, title="the window that had the focus when "
+                                            "the command started", strict=False))
 
 
 # =============================================================================== commands
@@ -640,12 +756,26 @@ def cmd_click(ctx: _Ctx) -> int:
     if a.clicks < 1:
         raise _UsageError("--clicks must be >= 1")
     offset = tuple(_parse_numbers(a.offset, 2, "--offset")) if a.offset else (0, 0)
+    positional = _is_point(a.target) or _is_image_target(a.target)
+    if positional:
+        # A selector names its element (and is bound to its window); a point or an image
+        # clicks whatever window is there.
+        _require_scope(ctx, "Clicks at coordinates or on an image", flag="anywhere", allowed="--window TITLE")
     target: Any = _parse_point(a.target, "TARGET") if _is_point(a.target) else a.target
-    point = ctx.desktop.click(target, button=a.button, clicks=a.clicks, offset=offset)
+    window = _target_window(ctx) if a.window else None
+    if window is not None and not positional:
+        target = window.find(a.target, timeout=a.timeout)
+    with _bound(ctx, window):
+        if target is a.target or isinstance(target, Point):
+            point = ctx.desktop.click(target, button=a.button, clicks=a.clicks, offset=offset)
+        else:
+            target.click(a.button, a.clicks, offset=offset)
+            point = getattr(target, "_last_click_point", None) or target.center
     if ctx.json:
-        ctx.emit_json({"clicked": point.to_dict(), "button": a.button, "clicks": a.clicks})
+        ctx.emit_json({"clicked": point.to_dict(), "button": a.button, "clicks": a.clicks,
+                       "window": window.title if window is not None else None})
     else:
-        ctx.print(f"clicked ({point.x}, {point.y})")
+        ctx.print(f"clicked ({point.x}, {point.y})" + (f" in {window.title!r}" if window is not None else ""))
     return EXIT_OK
 
 
@@ -664,28 +794,44 @@ def cmd_type(ctx: _Ctx) -> int:
     a = ctx.args
     text = _unescape(a.text) if a.escapes else a.text
     d = ctx.desktop
+    if a.replace and not a.into:
+        raise _UsageError("--replace needs --into SELECTOR")
+    _require_scope(ctx, "Typed keystrokes", flag="focused", allowed="--window TITLE or --into SELECTOR")
+    window = _target_window(ctx) if a.window else None
+    verified: Optional[bool] = None
     if a.into:
-        el = d.find(a.into, timeout=a.timeout)
-        if a.replace:
-            el.set_text(text)
-        else:
-            el.type(text, interval=a.interval, mode=a.mode)
+        # The element (inside --window when given) keeps the input: every keystroke is
+        # checked against its window and focus, and the field is read back afterwards.
+        el = window.find(a.into, timeout=a.timeout) if window is not None else d.find(a.into, timeout=a.timeout)
+        with _bound(ctx, window):
+            if a.replace:
+                el.set_text(text)
+            else:
+                el.type(text, interval=a.interval, mode=a.mode)
+        verified = el._value_for_verify() is not None
     else:
-        d.type(text, interval=a.interval, mode=a.mode)
+        with (_bound(ctx, window) if window is not None else _unscoped_target(ctx)):
+            d.type(text, interval=a.interval, mode=a.mode)
     if ctx.json:
-        ctx.emit_json({"typed": len(text), "into": a.into})
+        ctx.emit_json({"typed": len(text), "into": a.into, "window": window.title if window is not None else None,
+                       "verified": verified})
     else:
-        ctx.print(f"typed {len(text)} character(s)" + (f" into {a.into!r}" if a.into else ""))
+        ctx.print(f"typed {len(text)} character(s)" + (f" into {a.into!r}" if a.into else "")
+                  + (f" in {window.title!r}" if window is not None else "")
+                  + (" (read back and verified)" if verified else ""))
     return EXIT_OK
 
 
 def cmd_hotkey(ctx: _Ctx) -> int:
     keys = ctx.args.keys
-    ctx.desktop.hotkey(*keys)
+    _require_scope(ctx, "Key combinations", flag="focused", allowed="--window TITLE")
+    window = _target_window(ctx) if ctx.args.window else None
+    with (_bound(ctx, window) if window is not None else _unscoped_target(ctx)):
+        ctx.desktop.hotkey(*keys)
     if ctx.json:
-        ctx.emit_json({"hotkey": keys})
+        ctx.emit_json({"hotkey": keys, "window": window.title if window is not None else None})
     else:
-        ctx.print("pressed " + "+".join(keys))
+        ctx.print("pressed " + "+".join(keys) + (f" in {window.title!r}" if window is not None else ""))
     return EXIT_OK
 
 
@@ -693,11 +839,15 @@ def cmd_press(ctx: _Ctx) -> int:
     a = ctx.args
     if a.presses < 1:
         raise _UsageError("--presses must be >= 1")
-    ctx.desktop.press(*a.keys, presses=a.presses, interval=a.interval)
+    _require_scope(ctx, "Key presses", flag="focused", allowed="--window TITLE")
+    window = _target_window(ctx) if a.window else None
+    with (_bound(ctx, window) if window is not None else _unscoped_target(ctx)):
+        ctx.desktop.press(*a.keys, presses=a.presses, interval=a.interval)
     if ctx.json:
-        ctx.emit_json({"pressed": a.keys, "presses": a.presses})
+        ctx.emit_json({"pressed": a.keys, "presses": a.presses, "window": window.title if window is not None else None})
     else:
-        ctx.print("pressed " + " ".join(a.keys) + (f" x{a.presses}" if a.presses > 1 else ""))
+        ctx.print("pressed " + " ".join(a.keys) + (f" x{a.presses}" if a.presses > 1 else "")
+                  + (f" in {window.title!r}" if window is not None else ""))
     return EXIT_OK
 
 
@@ -749,7 +899,11 @@ def cmd_locate(ctx: _Ctx) -> int:
         m = d.locate(a.image, region=region, confidence=a.confidence, grayscale=a.grayscale, timeout=a.timeout or 0.0)
         matches = [m] if m is not None else []
     if matches and a.click:
-        d.mouse.click(matches[0].center)
+        if not a.anywhere:
+            raise _UsageError("locate --click clicks whatever window is at the match: pass --anywhere to click it "
+                              "anyway, or use `locum click IMAGE --window TITLE`")
+        with _unscoped_target(ctx):
+            d.mouse.click(matches[0].center)
     if ctx.json:
         ctx.emit_json([m.to_dict() for m in matches])
     else:
@@ -839,7 +993,7 @@ def cmd_mcp(ctx: _Ctx) -> int:
     be = ctx.desktop.backend
     ctx.info(f"locum {__version__} MCP server on stdio (backend={getattr(be, 'name', '?')}, policy={a.policy}"
              + (", dry-run" if a.dry_run else "") + (f", audit={a.audit}" if a.audit else "") + ")")
-    server.serve(ctx.inp, ctx.out)
+    server.serve(ctx.inp, ctx.raw_out)
     return EXIT_OK
 
 
@@ -1117,32 +1271,47 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS",
                    help="seconds to wait (default: global --timeout)")
 
-    p = add("click", "click a selector, 'x,y' coordinates or an image file")
+    p = add("click", "click a selector, or 'x,y' coordinates / an image file in --window")
     p.add_argument("target")
     p.add_argument("--button", choices=("left", "right", "middle"), default="left")
     p.add_argument("--clicks", type=int, default=1)
     p.add_argument("--offset", metavar="DX,DY", help="offset from the target's center")
+    p.add_argument("--window", metavar="TITLE", help="bring this window to the front and click only inside it "
+                   "(a selector is searched in it; a point or image is refused if another window covers it)")
+    p.add_argument("--anywhere", action="store_true",
+                   help="click a point or image without --window: whatever window is there gets the click")
+    p.add_argument("--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS")
 
     p = add("move", "move the mouse to a selector, 'x,y' or an image")
     p.add_argument("target")
     p.add_argument("--duration", type=float, default=None, metavar="SECONDS")
 
-    p = add("type", "type text into the focused control (or --into an element)")
+    p = add("type", "type text --into an element or into --window (--focused: wherever the focus is)")
     p.add_argument("text")
     p.add_argument("-e", "--escapes", action="store_true", help=r"interpret \n \t \\ \uXXXX escapes")
-    p.add_argument("--into", metavar="SELECTOR", help="focus this element first")
+    p.add_argument("--into", metavar="SELECTOR", help="focus this element and type only while it keeps the focus")
+    p.add_argument("--window", metavar="TITLE", help="bring this window to the front and type only while it has the "
+                   "focus (with --into: the element is searched in it)")
+    p.add_argument("--focused", action="store_true",
+                   help="type into whatever control has the focus now (stops if another window takes it)")
     p.add_argument("--replace", action="store_true", help="with --into: replace the element's text (native set-value when possible)")
     p.add_argument("--interval", type=float, default=0.0, metavar="SECONDS", help="delay between characters")
     p.add_argument("--mode", choices=("auto", "unicode", "keys", "clipboard"), default=None)
     p.add_argument("--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS")
 
-    p = add("hotkey", "press a key combination, e.g. ctrl+s or 'ctrl shift esc' (mod = ctrl/cmd)")
+    p = add("hotkey", "press a key combination in --window, e.g. ctrl+s or 'ctrl shift esc' (mod = ctrl/cmd)")
     p.add_argument("keys", nargs="+", metavar="COMBO")
+    p.add_argument("--window", metavar="TITLE", help="bring this window to the front and press only while it has the focus")
+    p.add_argument("--focused", action="store_true", help="press in whatever window has the focus now")
+    p.add_argument("--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS")
 
-    p = add("press", "tap keys in sequence, e.g. tab tab enter")
+    p = add("press", "tap keys in sequence in --window, e.g. tab tab enter")
     p.add_argument("keys", nargs="+", metavar="KEY")
     p.add_argument("--presses", type=int, default=1)
     p.add_argument("--interval", type=float, default=0.0, metavar="SECONDS")
+    p.add_argument("--window", metavar="TITLE", help="bring this window to the front and press only while it has the focus")
+    p.add_argument("--focused", action="store_true", help="press in whatever window has the focus now")
+    p.add_argument("--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS")
 
     p = add("scroll", "scroll the wheel (positive = up)")
     p.add_argument("dy", type=int)
@@ -1161,7 +1330,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grayscale", action="store_true")
     p.add_argument("--region", metavar="L,T,W,H")
     p.add_argument("--all", action="store_true", help="list every occurrence")
-    p.add_argument("--click", action="store_true", help="click the best match")
+    p.add_argument("--click", action="store_true", help="click the best match (needs --anywhere)")
+    p.add_argument("--anywhere", action="store_true", help="with --click: click whatever window is at the match")
     p.add_argument("--timeout", type=float, default=argparse.SUPPRESS, metavar="SECONDS")
 
     p = add("observe", "print what an LLM agent sees: numbered interactive elements")
@@ -1290,8 +1460,8 @@ def main(
         client: LLM client for ``agent`` (default: ``anthropic.Anthropic()``).
         sleep: Sleep function for ``record`` (tests).
     """
-    out = stdout if stdout is not None else sys.stdout
-    err = stderr if stderr is not None else sys.stderr
+    out = _SafeText(stdout if stdout is not None else sys.stdout)
+    err = _SafeText(stderr if stderr is not None else sys.stderr)
     inp = stdin if stdin is not None else sys.stdin
     parser = build_parser()
     try:
@@ -1334,6 +1504,14 @@ def main(
             traceback.print_exc(file=err)
         code, label = _classify(exc)
         print(f"locum: {label}: {_describe(exc)}", file=err)
+        if ctx.json and not ctx.json_emitted and handler is not cmd_mcp:
+            # --json is a contract: stdout carries exactly one JSON document, also when
+            # the command failed (the diagnostic stays on stderr).
+            try:
+                ctx.emit_json({"ok": False, "error": {"type": type(exc).__name__, "label": label,
+                                                      "message": _describe(exc), "exit_code": code}})
+            except Exception:
+                pass
         return code
     finally:
         ctx.close()

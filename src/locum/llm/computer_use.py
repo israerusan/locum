@@ -23,6 +23,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+from .. import _target as _input_target
 from ..errors import FailSafeTriggered, PolicyViolation
 from ..keys import normalize_key
 from ..types import Point, Rect
@@ -53,6 +54,9 @@ ACTIONS: Tuple[str, ...] = (
     "type", "key", "hold_key", "wait",
 )
 READ_ONLY_ACTIONS = frozenset({"screenshot", "zoom", "cursor_position", "wait"})
+_KEYBOARD_ACTIONS = frozenset({"type", "key", "hold_key"})
+_POINTER_ACTIONS = frozenset({"left_click", "right_click", "middle_click", "double_click", "triple_click",
+                              "left_click_drag", "left_mouse_down", "scroll"})
 _MAX_DURATION = 300.0
 
 # xdotool keysym names (lowercased) -> locum canonical key names.
@@ -275,6 +279,9 @@ class ComputerUseAdapter:
         status = "ok"
         result: Optional[ToolResult] = None
         self._local.secret = False
+        import contextlib
+
+        self._local.binds = contextlib.ExitStack()
         try:
             if action not in ACTIONS:
                 result = ToolResult.error(f"Unknown computer action {action!r}. Supported: {', '.join(ACTIONS)}")
@@ -291,6 +298,9 @@ class ComputerUseAdapter:
             result = ToolResult.error(f"Blocked by policy: {exc}", data={"blocked": True})
         except Exception as exc:
             result = ToolResult.error(f"{type(exc).__name__}: {exc}")
+        finally:
+            binds, self._local.binds = self._local.binds, None
+            binds.close()
         if result.is_error and status == "ok":
             status = "error"
         elif isinstance(result.data, dict) and result.data.get("dry_run"):
@@ -490,10 +500,32 @@ class ComputerUseAdapter:
         if ctx.get("default_button"):
             description += f" (Enter activates the default button {ctx['default_button']!r})"
         ctx.setdefault("description", description)
+        # What the policy judged: the focused window (keyboard actions) or the window under
+        # the first point (presses, scrolls). The input of this action is only sent there.
+        bind = None
+        be = self.desktop.backend
+        try:
+            if action in _KEYBOARD_ACTIONS:
+                h = be.foreground_handle()
+                if h is not None:
+                    bind = _input_target.InputTarget(be, h, title="the window that had the focus when this action "
+                                                     "was checked", strict=True)
+            elif action in _POINTER_ACTIONS and ctx.get("points"):
+                p0 = ctx["points"][0]
+                h = be.window_handle_at(int(p0.x), int(p0.y))
+                if h is not None:
+                    bind = _input_target.InputTarget(be, h, title="the window under the point when this action "
+                                                     "was checked", strict=True)
+        except Exception:
+            bind = None
         self.policy.check(action, params, context=ctx)
         if self.policy.dry_run and action not in READ_ONLY_ACTIONS:
             note = f" (this would require human confirmation: {ctx['needs_confirmation']})" if ctx.get("needs_confirmation") else ""
             return ToolResult(f"[dry-run] Would {description}{note}. Nothing was done.", data={"dry_run": True, "description": description})
+        if bind is not None:
+            stack = getattr(self._local, "binds", None)
+            if stack is not None:
+                stack.enter_context(_input_target.bind(bind))
         return None
 
     def _done(self, text: str = "OK") -> ToolResult:

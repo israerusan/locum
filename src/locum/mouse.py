@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Optional, Union
 
 from ._cancel import check as _cancel_check
+from ._target import check_input as _target_check
 from .failsafe import FailSafe
 from .motion import Humanize, fitts_duration, plan_path
 from .types import MouseButton, Point, coerce_point
@@ -166,6 +167,7 @@ class Mouse:
         self._check()
         # Recorded before the backend call, so an interrupt inside it (after the press
         # reached the OS) still leaves release_all() knowing about the button.
+        _target_check("button")
         added = btn not in self._pressed
         if added:
             self._pressed.append(btn)
@@ -248,6 +250,7 @@ class Mouse:
             if i and interval > 0:
                 self._sleep(interval)
             self._check(ignore=target)
+            _target_check("button", point=(target.x, target.y))
             down = False
             try:
                 self.backend.mouse_down(btn)
@@ -309,6 +312,7 @@ class Mouse:
             self._check()
         target = self._point(end)
         _cancel_check()  # the move to ``start`` may have outlived the call's deadline
+        _target_check("button")
         down = False
         try:
             self.backend.mouse_down(btn)
@@ -335,6 +339,7 @@ class Mouse:
         self._check(ignore=target)
         dy, dx = int(dy), int(dx)
         if dy or dx:
+            _target_check("scroll", point=(target.x, target.y) if target is not None else None)
             self.backend.scroll(dx=dx, dy=dy)
         self._pause()
 

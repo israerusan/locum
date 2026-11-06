@@ -48,6 +48,7 @@ import typing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
+from .. import _target as _input_target
 from ..errors import ActionTimeout, ElementNotFound, FailSafeTriggered, NotSupported, PolicyViolation, LocumError
 from ..types import Match, Point, Rect, WindowInfo
 from .observe import Observation, ObservedElement, observe
@@ -1275,16 +1276,50 @@ class DesktopToolkit:
         return ctx
 
     def _act(self, tool: str, args: Dict[str, Any], ctx: Dict[str, Any], description: str, action: Callable[[], Any],
-             *, feedback: bool = True) -> ToolResult:
-        """Policy check, then dry-run report or the real action (+ feedback)."""
+             *, feedback: bool = True, bind: Optional[_input_target.InputTarget] = None) -> ToolResult:
+        """Policy check, then dry-run report or the real action (+ feedback).
+
+        ``bind``: the window the policy judged (the foreground window for keyboard input
+        to the focused control, the window under the point for a coordinate click). The
+        input is only sent while it still goes there (see :mod:`locum._target`): a window
+        that takes the focus between the check and the input -- or during it -- gets none.
+        """
         ctx.setdefault("description", description)
         self.policy.check(tool, {k: v for k, v in args.items() if v is not None}, context=ctx)
         if self.policy.dry_run:
             note = f" (this would require human confirmation: {ctx['needs_confirmation']})" if ctx.get("needs_confirmation") else ""
             return ToolResult(f"[dry-run] Would {description}{note}. Nothing was done.", data={"dry_run": True, "description": description})
-        out = action()
+        with _input_target.bind(bind):
+            out = action()
         text = out if isinstance(out, str) and out else description[0].upper() + description[1:] + "."
         return ToolResult(text + (self._feedback_text() if feedback else ""))
+
+    def _bind_foreground(self) -> Optional[_input_target.InputTarget]:
+        """Keyboard input for "the focused control": bound to the window that has the
+        focus now, while the policy judges that control."""
+        be = self.desktop.backend
+        try:
+            handle = be.foreground_handle()
+        except Exception:
+            return None
+        if handle is None:
+            return None
+        return _input_target.InputTarget(be, handle, title="the window that had the focus when this action was "
+                                         "checked", strict=True)
+
+    def _bind_point(self, point: Optional[Point]) -> Optional[_input_target.InputTarget]:
+        """Pointer input at a coordinate: bound to the window under it now."""
+        if point is None:
+            return None
+        be = self.desktop.backend
+        try:
+            handle = be.window_handle_at(int(point.x), int(point.y))
+        except Exception:
+            return None
+        if handle is None:
+            return None
+        return _input_target.InputTarget(be, handle, title="the window under the point when this action was checked",
+                                         strict=True)
 
     def _recheck_focus(self, tool: str, args: Dict[str, Any], activates: bool, description: str, *, enter: bool = False,
                        activating: Optional[bool] = None, **extra: Any) -> None:
@@ -1433,7 +1468,8 @@ class DesktopToolkit:
                 self.desktop.click(t.point, button=button, clicks=clicks)
             return ""
 
-        return self._act(tool, args, self._context(t), description, run)
+        bind = self._bind_point(t.point) if t.element is None else None
+        return self._act(tool, args, self._context(t), description, run, bind=bind)
 
     def tool_click(
         self,
@@ -1587,7 +1623,8 @@ class DesktopToolkit:
             ctx = self._context(_with_default_button(t, t.element.node) if enter_here else t)
         else:
             ctx = self._context(focus)
-        return self._act("type_text", args, ctx, description, run)
+        return self._act("type_text", args, ctx, description, run,
+                         bind=self._bind_foreground() if t.element is None else None)
 
     def tool_press_keys(self, keys: List[str], presses: int = 1) -> ToolResult:
         """Press keys one after another, e.g. ["tab", "tab", "enter"]. An item like "ctrl+a" is
@@ -1634,7 +1671,7 @@ class DesktopToolkit:
                     moved = moved or keys_may_move_focus(parts)
 
         return self._act("press_keys", args, self._context(focus, keys=combos, shortcut_targets=pressed or None),
-                         description, run)
+                         description, run, bind=self._bind_foreground())
 
     def tool_hotkey(self, combo: str) -> ToolResult:
         """Press a keyboard shortcut such as "ctrl+s", "ctrl+shift+t", "alt+tab", "mod+c"
@@ -1656,7 +1693,8 @@ class DesktopToolkit:
         if pressed:
             description += f" (presses {', '.join(map(repr, pressed))})"
         ctx = self._context(focus, keys="+".join(parts), shortcut_targets=pressed or None)
-        return self._act("hotkey", {"combo": combo}, ctx, description, lambda: self.desktop.hotkey(combo))
+        return self._act("hotkey", {"combo": combo}, ctx, description, lambda: self.desktop.hotkey(combo),
+                         bind=self._bind_foreground())
 
     def tool_scroll(
         self,
@@ -1702,7 +1740,8 @@ class DesktopToolkit:
                 self.desktop.scroll(dy, dx, at=point)
 
         args = {"direction": direction, "amount": amount, "element_id": element_id, "x": x, "y": y, "selector": selector}
-        return self._act("scroll", args, self._context(t), description, run)
+        return self._act("scroll", args, self._context(t), description, run,
+                         bind=self._bind_point(point) if el is None else None)
 
     def tool_move_mouse(
         self,
@@ -1790,7 +1829,8 @@ class DesktopToolkit:
                 )
             self.desktop.drag(start, end, duration=duration)
 
-        return self._act("drag", args, ctx, f"drag from {s.description} to {e.description}", run)
+        return self._act("drag", args, ctx, f"drag from {s.description} to {e.description}", run,
+                         bind=self._bind_point(sp) if s.element is None else None)
 
     def tool_set_value(self, value: str, element_id: Optional[int] = None, selector: Optional[str] = None) -> ToolResult:
         """Replace the content of a text field (uses the accessibility API when possible, else types).

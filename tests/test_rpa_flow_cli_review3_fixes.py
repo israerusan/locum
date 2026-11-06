@@ -259,18 +259,18 @@ def test_negative_coordinates(be, desk):
 
     # A second monitor left of the primary one: negative x is on screen.
     be._monitors.append(Monitor(1, Rect(-1920, 0, 1920, 1080), 1.0, False, "MOCK1"))
-    code, out, err = cli(["click", "-5,10"], desktop=desk)
+    code, out, err = cli(["click", "-5,10", "--anywhere"], desktop=desk)
     assert code == EXIT_OK, err
     assert "(-5, 10)" in out
     code, out, err = cli(["move", "-1200,300"], desktop=desk)
     assert code == EXIT_OK and "(-1200, 300)" in out
     code, out, err = cli(["scroll", "-3", "--at", "-5,10"], desktop=desk)
     assert code == EXIT_OK, err
-    code, out, err = cli(["click", "-5,10", "--offset", "-2,-3"], desktop=desk)
+    code, out, err = cli(["click", "-5,10", "--anywhere", "--offset", "-2,-3"], desktop=desk)
     assert code == EXIT_OK and "(-7, 7)" in out
     code, _out, err = cli(["click", "--bogus"], desktop=desk)
     assert code == 2
-    code, _out, err = cli(["click", "-5,2000"], desktop=desk)  # on no monitor: refused, not clamped
+    code, _out, err = cli(["click", "-5,2000", "--anywhere"], desktop=desk)  # on no monitor: refused, not clamped
     assert code == 2 and "off-screen" in err
 
 
