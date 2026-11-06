@@ -78,6 +78,13 @@ Restart Claude Desktop after editing.
   browser tab with thousands of nodes) may use more than its share; anything
   cut short is named in a `Note:` line of the result. Observe one window
   (`observe(window="Calculator")`) to see the rest.
+* `observe(changes_only=true)` after an earlier observe returns only what
+  changed: new, changed and gone elements (elements still there keep their
+  ids, new ones never reuse an id) and a screenshot cropped to the visible
+  change, or no image at all when nothing visible changed. On a busy 1080p
+  desktop that is ~1-2 KB of text and ~160 KB of image instead of ~24 KB and
+  ~1.5 MB. Changes hidden behind other windows add no image; tiny isolated
+  pixel changes (a caret, the clock) are ignored.
 * Tool calls run one at a time on a worker thread, so `ping`, `tools/list`
   and cancellation are answered even while a long call runs.
 * A call past `--call-timeout` returns `isError` with "Timed out ... The

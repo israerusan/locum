@@ -1302,7 +1302,8 @@ class DesktopToolkit:
         return (" [" + "; ".join(parts) + "]") if parts else ""
 
     # =================================================================== tools
-    def tool_observe(self, window: Optional[str] = None, include_screenshot: bool = True) -> ToolResult:
+    def tool_observe(self, window: Optional[str] = None, include_screenshot: bool = True,
+                     changes_only: bool = False) -> ToolResult:
         """Look at the screen: returns the visible interactive elements with numeric ids, the windows,
         and a screenshot with each element's id drawn in a box (set-of-marks).
 
@@ -1312,14 +1313,39 @@ class DesktopToolkit:
         Args:
             window: Only observe the window whose title matches (substring/glob); default: whole screen.
             include_screenshot: Include the annotated screenshot image.
+            changes_only: After an earlier observe of the same area, return only what changed:
+                new, changed and gone elements (elements that are still there keep their ids)
+                and a screenshot cropped to the changed area, or none if nothing visible changed.
+                Much smaller than a full observation; use it after each action.
         """
         kw = dict(self.observe_kwargs)
         kw["screenshot"] = bool(include_screenshot)
         kw.setdefault("time_budget", self.OBSERVE_BUDGET)
+        prev = self.last_observation
         obs = observe(self.desktop, window=window, **kw)
+        if changes_only:
+            if prev is not None and prev.region == obs.region and prev.image_size == obs.image_size and prev.elements is not obs.elements:
+                return self._observe_changes(prev, obs, include_screenshot)
+            obs.notes.append("changes_only: there is no earlier observation of the same area to compare with, "
+                             "so this is a full observation; later calls will return only changes.")
         self.last_observation = obs
         img = obs.image_base64(annotated=True) if obs.screenshot is not None else None
         return ToolResult(obs.text(kw.get("max_elements", 300)), image_base64=img, data=obs)
+
+    def _observe_changes(self, prev: Observation, obs: Observation, include_screenshot: bool) -> ToolResult:
+        from ..vision import crop as _crop, to_base64_png
+        from .obsdiff import compare
+
+        diff = compare(prev, obs)
+        self.last_observation = obs
+        img = None
+        if include_screenshot and obs.screenshot is not None:
+            src = obs.annotated if obs.annotated is not None else obs.screenshot
+            if diff.full_image:
+                img = to_base64_png(src)
+            elif diff.crop is not None:
+                img = to_base64_png(_crop(src, diff.crop))
+        return ToolResult(diff.text(obs), image_base64=img, data=obs)
 
     def tool_screenshot(self, annotated: bool = False) -> ToolResult:
         """Take a screenshot of the whole screen (also refreshes element ids and the coordinate space).

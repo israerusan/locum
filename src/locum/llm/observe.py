@@ -286,9 +286,11 @@ class Observation:
         for el in self.elements:
             if el.id == key:
                 return el
-        hi = max((e.id for e in self.elements), default=0)
+        ids = sorted(e.id for e in self.elements)
+        valid = f"1..{ids[-1]}" if ids == list(range(1, len(ids) + 1)) and ids else (
+            ", ".join(map(str, ids[:20])) + (" ..." if len(ids) > 20 else "") if ids else "none")
         raise ElementNotFound(
-            f"No element with id {key} in the last observation (valid ids: 1..{hi}). "
+            f"No element with id {key} in the last observation (valid ids: {valid}). "
             "Call observe again if the screen changed."
         )
 
@@ -717,6 +719,7 @@ def observe(
         annotated=annotated_img,
         region=region,
     )
+    obs.capped = limit > 0 and len(elements) >= limit
     if partial or unscanned:
         def _names(ts: List[str]) -> str:
             shown = ", ".join(_quote(t) if t else "(untitled)" for t in ts[:8])

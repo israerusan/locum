@@ -60,7 +60,9 @@ _INSTRUCTIONS = (
     "Desktop automation tools. Call `observe` first: it returns the interactive elements with numeric ids "
     "and an annotated screenshot. Act on element ids (click, type_text, set_value), selectors, visible text "
     "or screenshot coordinates. Element ids and coordinates refer to the latest observe/screenshot call; "
-    "observe again after the screen changes. Some actions may be blocked by the safety policy."
+    "observe again after the screen changes -- with changes_only=true after an action, which returns just "
+    "what changed (ids of unchanged elements stay valid) and a cropped image. "
+    "Some actions may be blocked by the safety policy."
 )
 
 
