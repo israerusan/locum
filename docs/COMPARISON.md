@@ -19,7 +19,7 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 | | PyAutoGUI | UiPath | locum |
 |---|---|---|---|
 | Coordinates | ✓ | ✓ | ✓ (any "target": point, rect, element, selector, image) |
-| Accessibility tree | — | ✓ UIA / MSAA / browser DOM / SAP / Java bridges | ✓ UIA (Windows), AX (macOS), AT-SPI (Linux) |
+| Accessibility tree | — | ✓ UIA / MSAA / browser DOM / SAP / Java bridges | ✓ UIA (Windows), AX (macOS), AT-SPI (Linux), browser DOM over DevTools (`locum.browser`) <!--BRIDGES--> |
 | Selectors | — | XML selectors, fuzzy & anchor-based targeting | CSS-like (`window "ERP" button:has-text("Save")`), **UiPath-XML compatible subset** (`<wnd app='x' title='*'/><ctrl name='OK' role='push button'/>`), dict form |
 | Selector generation | — | Studio "Indicate element" | `locum inspect`, `selector_for(node)`, the recorder |
 | Native actions (invoke / set value / toggle / expand) | — | ✓ ("simulate" input) | ✓ with automatic mouse fallback |
@@ -78,17 +78,26 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 
 ## Honest gaps (today)
 
-* Alpha (0.1): APIs may still change.
-* Validation depth differs by platform: Windows is exercised by the self-test
-  on a real Windows 11 machine; Linux/X11 is tested under Xvfb; the macOS
-  backend is tested only against a fake Quartz/AX API and has not yet been
-  validated on a real Mac.
+* Alpha (0.x): breaking changes only in minor releases, listed in
+  [CHANGELOG.md](../CHANGELOG.md); the public API is frozen by a snapshot test
+  ([API.md](API.md)).
+* Validation depth differs by platform, and CI says which. Every push runs
+  the built-in self-test against a real desktop on all three OSes, and a
+  failure (or a skipped capability) fails the build. Windows runs on the
+  GitHub Windows runner and a real Windows 11 machine. macOS runs on the
+  GitHub macOS runner, and 0.1.1 passed it on a real Apple Silicon Mac.
+  Linux runs Xvfb with a window manager, a real AT-SPI registry and a GTK
+  editor. That is real X11 and AT-SPI, but not a full desktop session.
 * No visual designer, no central orchestrator or credential vault.
 * Native Wayland sessions cannot be driven (Wayland forbids it by design;
   XWayland apps and X11 sessions work).
 * No dedicated Citrix/RDP "remote runtime"; inside remote sessions use vision,
   OCR or computer-use mode.
-* No built-in browser DOM automation — pair with Playwright for web pages;
-  browsers' accessibility trees still work for basic control.
+* Browser DOM automation (`locum.browser`, since 0.1.5) speaks the DevTools
+  protocol to Edge/Chrome: launch with a separate profile or attach, navigate,
+  evaluate, click, type, shadow roots and same-origin frames. It goes
+  through the same safety policy. It is not a Playwright replacement: no
+  Firefox/WebKit, no network interception, no auto-waiting test runner. Pair
+  with Playwright for heavy web testing.
 * SAP GUI is driven through UI Automation like any app; for SAP GUI
   Scripting-only fields, call the scripting API (pywin32) from the same robot.

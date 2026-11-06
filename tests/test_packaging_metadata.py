@@ -47,26 +47,21 @@ def test_ci_matrix_does_not_fail_fast():
     assert {"ubuntu-latest", "windows-latest", "macos-latest"} <= set(test["strategy"]["matrix"]["os"])
 
 
-def test_ci_native_selftest_job_is_non_blocking_and_uploads_its_report():
-    job = _workflow()["jobs"]["windows-native-selftest"]
-    assert job["runs-on"] == "windows-latest"
-    assert job["continue-on-error"] is True
+@pytest.mark.parametrize("job_name, runner", [
+    ("windows-native-selftest", "windows-latest"),
+    ("linux-native-selftest", "ubuntu-24.04"),
+    ("macos-native-selftest", "macos-latest"),
+])
+def test_ci_real_desktop_selftests_block_the_build_and_upload_their_report(job_name, runner):
+    # A real-desktop failure must fail CI: no continue-on-error at job or step level,
+    # and a skipped capability counts as a failure (--strict).
+    job = _workflow()["jobs"][job_name]
+    assert job["runs-on"] == runner
+    assert "continue-on-error" not in job
     steps = job["steps"]
-    run = next(s["run"] for s in steps if "locum.selftest" in s.get("run", ""))
-    assert "--yes" in run and "--out selftest-report" in run and "--backend" not in run
+    selftest = next(s for s in steps if "locum.selftest" in s.get("run", ""))
+    run = selftest["run"]
+    assert "continue-on-error" not in selftest
+    assert "--yes" in run and "--strict" in run and "--out selftest-report" in run and "--backend" not in run
     upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@v4"))
     assert upload["if"] == "always()" and upload["with"]["path"] == "selftest-report"
-
-
-def test_ci_native_selftest_failure_does_not_turn_the_pr_check_red():
-    # Job-level continue-on-error still records the job's check run as failed;
-    # the self-test step itself must swallow the failure and surface a warning.
-    steps = _workflow()["jobs"]["windows-native-selftest"]["steps"]
-    selftest = next(s for s in steps if "locum.selftest" in s.get("run", ""))
-    assert selftest["continue-on-error"] is True
-    sid = selftest["id"]
-    warn = next(s for s in steps if s.get("if") == f"steps.{sid}.outcome == 'failure'")
-    assert "::warning" in warn["run"]
-    names = [s.get("name") for s in steps]
-    assert names.index(warn["name"]) < next(i for i, s in enumerate(steps)
-                                            if s.get("uses", "").startswith("actions/upload-artifact"))

@@ -164,6 +164,30 @@ def _iface(acc: Any, name: str) -> Any:
     return None
 
 
+def _read_text(atspi: Any, acc: Any, iface: Any) -> Optional[str]:
+    """The full text of an accessible's Text interface, or ``None`` if it cannot be read.
+
+    Call ``Atspi.Text.get_text`` through the interface class. With
+    GObject introspection, ``get_text_iface()`` returns the same
+    ``Atspi.Accessible`` object, and ``Atspi.Accessible.get_text()`` is a
+    deprecated zero-argument alias of ``get_text_iface``. So ``iface.get_text(0, -1)``
+    raises ``TypeError`` on current libatspi, and every text field read as
+    ``None``. The real-desktop CI job found this.
+    """
+    text_cls = getattr(atspi, "Text", None) if atspi is not None else None
+    fn = getattr(text_cls, "get_text", None)
+    if callable(fn):
+        try:
+            count = text_cls.get_character_count(acc) if hasattr(text_cls, "get_character_count") else -1
+            return str(fn(acc, 0, count if isinstance(count, int) and count >= 0 else -1) or "")
+        except Exception:
+            pass
+    try:  # pyatspi-style wrappers and fakes: the interface object has the method
+        return str(iface.get_text(0, -1) or "")
+    except Exception:
+        return None
+
+
 def _proc_comm(pid: Optional[int]) -> str:
     """Process name of ``pid`` from ``/proc/<pid>/comm`` (``""`` if unavailable)."""
     if not pid:
@@ -253,10 +277,10 @@ class AtspiNode(AccessibleNode):
                     pass
         t = _iface(self._acc, "text")
         if t is not None:
-            try:
-                return str(t.get_text(0, -1) or "")
-            except Exception:
-                return None
+            text = _read_text(self._atspi, self._acc, t)
+            if text is not None:
+                return text
+            return None
         v = _iface(self._acc, "value")
         if v is not None:
             try:

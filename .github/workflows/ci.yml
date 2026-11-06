@@ -139,7 +139,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             xvfb xauth openbox dbus-x11 at-spi2-core libatk-adaptor \
-            python3-venv python3-gi gir1.2-atspi-2.0 mousepad xclip x11-utils
+            python3-venv python3-gi gir1.2-atspi-2.0 mousepad xclip x11-utils \n            x11-xserver-utils x11-apps
 
       # PyGObject (gi) comes from the distro: a venv that sees the system site-packages.
       - name: Install locum
@@ -155,21 +155,16 @@ jobs:
             export DISPLAY=:99
             for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
             openbox &
+            # A real desktop is never one flat colour with no windows: a patterned
+            # root and one ordinary X window for the screenshot and window-list checks.
+            xsetroot -mod 16 16 -fg grey45 -bg grey25
+            xclock -geometry 160x160+1100+20 &
             /usr/libexec/at-spi-bus-launcher --launch-immediately &
             export GTK_MODULES=gail:atk-bridge NO_AT_BRIDGE=0
             gsettings set org.gnome.desktop.interface toolkit-accessibility true || true
             sleep 2
             .venv/bin/python -m locum.selftest --yes --strict --retries 2 --out selftest-report
           '
-
-      - name: PROBE atspi
-        if: always()
-        run: |
-          dbus-run-session -- bash -c '
-            Xvfb :98 -screen 0 1280x800x24 -nolisten tcp &
-            export DISPLAY=:98; sleep 1; openbox & /usr/libexec/at-spi-bus-launcher --launch-immediately &
-            export GTK_MODULES=gail:atk-bridge NO_AT_BRIDGE=0; sleep 2
-            .venv/bin/python probe_atspi.py'
 
       - name: Upload self-test report
         if: always()
@@ -184,7 +179,7 @@ jobs:
   # the runner's shell (TCC); the strict self-test fails if they ever stop doing so.
   macos-native-selftest:
     name: macos-native-selftest (real desktop, blocking)
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 20
     env:
       PYTHONUTF8: "1"
