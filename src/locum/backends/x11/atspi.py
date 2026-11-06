@@ -204,6 +204,13 @@ class AtspiNode(AccessibleNode):
         self._resolver = handle_resolver
         self._max_children = max_children
 
+    def _wrap(self, acc: Any, parent: Optional["AtspiNode"]) -> "AtspiNode":
+        """Wrap a related accessible (child, parent, hit-test result) as a node of the same kind.
+
+        Subclasses (the Wayland backend's node) override this to keep their behaviour
+        across the whole tree."""
+        return AtspiNode(acc, self._atspi, parent, None, self._max_children)
+
     @property
     def accessible(self) -> Any:
         """The underlying ``Atspi.Accessible``."""
@@ -401,7 +408,7 @@ class AtspiNode(AccessibleNode):
         for i in range(max(0, count)):
             child = self._call("get_child_at_index", i)
             if child is not None:
-                out.append(AtspiNode(child, self._atspi, self, None, self._max_children))
+                out.append(self._wrap(child, self))
         return out
 
     @property
@@ -411,7 +418,7 @@ class AtspiNode(AccessibleNode):
         p = self._call("get_parent")
         if p is None:
             return None
-        return AtspiNode(p, self._atspi, None, None, self._max_children)
+        return self._wrap(p, None)
 
     # --------------------------------------------------------------- actions
     def _action_names(self) -> List[str]:
@@ -549,7 +556,7 @@ class AtspiNode(AccessibleNode):
             return None
         if child is None or child == self._acc:
             return None
-        return AtspiNode(child, self._atspi, self, None, self._max_children)
+        return self._wrap(child, self)
 
     def same_as(self, other: AccessibleNode) -> bool:
         if not isinstance(other, AtspiNode):

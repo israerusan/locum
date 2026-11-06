@@ -7,7 +7,7 @@ name = "locum"
 # The version comes from git tags (hatch-vcs): a build of tag v0.1.1 is 0.1.1; any
 # other commit builds as e.g. 0.1.2.dev3+g1a2b3c4, so it can never pass for a release.
 dynamic = ["version"]
-description = "Desktop automation for Python (Windows first; macOS and Linux/X11 backends): input, vision, accessibility selectors, RPA workflows, and LLM agent control."
+description = "Desktop automation for Python (Windows first; macOS, Linux/X11 and experimental Wayland backends): input, vision, accessibility selectors, RPA workflows, and LLM agent control."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -45,8 +45,11 @@ llm = ["anthropic>=0.40"]
 ocr = ["pytesseract>=0.3.10"]
 record = ["pynput>=1.7"]
 yaml = ["pyyaml>=6.0"]
-all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0"]
-dev = ["pytest>=7", "pyyaml>=6.0"]
+# Native Wayland backend (xdg-desktop-portal over D-Bus); experimental.
+wayland = ["jeepney>=0.8"]
+all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0", "jeepney>=0.8; sys_platform == 'linux'"]
+# jeepney: the Wayland backend's D-Bus adapter test (pure Python, imports on every OS).
+dev = ["pytest>=7", "pyyaml>=6.0", "jeepney>=0.8"]
 
 [project.scripts]
 locum = "locum.cli:main"
@@ -73,4 +76,5 @@ packages = ["src/locum"]
 testpaths = ["tests"]
 markers = [
   "x11: requires a real X11 display (run under Xvfb)",
+  "wayland: requires a real Wayland session with xdg-desktop-portal (RemoteDesktop/ScreenCast/Screenshot)",
 ]
