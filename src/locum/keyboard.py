@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .backends.base import CAP_CLIPBOARD, CAP_UNICODE_TYPING
+from . import _inputlock
 from ._cancel import check as _cancel_check
 from ._target import check_input as _target_check
 from .errors import NotSupported
@@ -193,6 +194,7 @@ class Keyboard:
             raise err
 
     # --------------------------------------------------------------- public API
+    @_inputlock.locked
     def down(self, key: str) -> None:
         """Press and hold ``key`` (aliases accepted)."""
         k = normalize_key(key)
@@ -205,6 +207,7 @@ class Keyboard:
         self._raw_up(normalize_key(key))
         self._pause()
 
+    @_inputlock.locked
     def press(self, *keys: KeySpec, presses: int = 1, interval: float = 0.0) -> None:
         """Tap each key in sequence, ``presses`` times: ``press("tab", "tab", "enter")``.
 
@@ -236,6 +239,7 @@ class Keyboard:
                     self._tap(action)
         self._pause()
 
+    @_inputlock.locked
     def hotkey(self, *keys: KeySpec, interval: float = 0.0) -> None:
         """Press a key combination: ``hotkey("ctrl+shift+s")`` or ``hotkey("ctrl", "c")``.
 
@@ -254,7 +258,7 @@ class Keyboard:
         """Context manager holding ``keys`` down: ``with kb.hold("shift"): mouse.click(...)``."""
         parsed = self._parse_keys(keys)
         self._check()
-        with self._held(parsed) as held:
+        with _inputlock.hold(self), self._held(parsed) as held:  # the whole chord is one input action
             yield held
         self._pause()
 
@@ -271,6 +275,7 @@ class Keyboard:
         return keys
 
     # --------------------------------------------------------------------- typing
+    @_inputlock.locked
     def type(self, text: str, *, interval: float = 0.0, mode: str = "auto") -> None:
         """Type ``text``.
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Optional, Union
 
+from . import _inputlock
 from ._cancel import check as _cancel_check
 from ._target import check_input as _target_check
 from .failsafe import FailSafe
@@ -137,6 +138,7 @@ class Mouse:
         p = self.backend.mouse_position()
         return Point(int(p[0]), int(p[1]))
 
+    @_inputlock.locked
     def move(
         self,
         x: Any,
@@ -161,6 +163,7 @@ class Mouse:
         cur = self.position()
         return self.move(Point(int(round(cur.x + dx)), int(round(cur.y + dy))), **kw)
 
+    @_inputlock.locked
     def down(self, button: Union[str, MouseButton] = "left") -> None:
         """Press (and hold) a mouse button at the current position."""
         btn = MouseButton.coerce(button)
@@ -219,6 +222,7 @@ class Mouse:
             raise first
         return released
 
+    @_inputlock.locked
     def click(
         self,
         x: Any = None,
@@ -285,6 +289,7 @@ class Mouse:
         kw["button"] = "middle"
         return self.click(x, y, **kw)
 
+    @_inputlock.locked
     def drag(
         self,
         start: Any,
@@ -331,6 +336,7 @@ class Mouse:
         self._pause()
         return target
 
+    @_inputlock.locked
     def scroll(self, dy: int = 0, dx: int = 0, *, at: Any = None) -> None:
         """Scroll by wheel notches (``dy > 0`` = up, ``dx > 0`` = right), optionally after moving to ``at``."""
         target: Optional[Point] = None

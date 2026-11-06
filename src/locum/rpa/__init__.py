@@ -30,6 +30,8 @@ from .queue import (
     BusinessException,
     QueueItem,
     WorkQueue,
+    default_queue_dir,
+    synced_location,
 )
 from .recorder import RecordedAction, Recorder
 from .report import RunReport, StepResult
@@ -42,6 +44,8 @@ __all__ = [
     "RunReport",
     "StepResult",
     "WorkQueue",
+    "default_queue_dir",
+    "synced_location",
     "QueueItem",
     "BusinessException",
     "NEW",

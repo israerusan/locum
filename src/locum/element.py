@@ -48,10 +48,11 @@ The ``desktop`` argument only needs the parts of
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import _target
+from . import _inputlock, _target
 from ._cancel import check as _cancel_check
 from .backends.base import CAP_CLIPBOARD, AccessibleNode
 from .errors import (
@@ -61,6 +62,7 @@ from .errors import (
     NotSupported,
     PolicyViolation,
     SelectorSyntaxError,
+    VerificationUnavailable,
     is_transient,
 )
 from .types import Point, Rect
@@ -72,7 +74,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from .desktop import Desktop
     from .window import Window
 
-__all__ = ["Element", "ELEMENT_STATES", "NATIVE_ACTIONS", "add_action_listener", "remove_action_listener"]
+__all__ = ["Element", "ELEMENT_STATES", "NATIVE_ACTIONS", "VERIFY_MODES", "VerifyResult", "add_action_listener",
+           "remove_action_listener"]
 
 #: Native (accessibility-API) actions reported to action listeners.
 NATIVE_ACTIONS = ("invoke", "set_text", "toggle", "select", "expand", "collapse")
@@ -142,15 +145,23 @@ def _native_mode(native: NativeMode) -> Union[bool, str]:
     raise ValueError(f"native must be True, False or 'auto', got {native!r}")
 
 
-def _bound_input(keyboard: bool) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+def _bound_input(keyboard: bool, lock: bool = True) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Run an :class:`Element` input method with its input bound to the element's window
-    (and, for keyboard methods, to the element's focus): see :mod:`locum._target`."""
+    (and, for keyboard methods, to the element's focus): see :mod:`locum._target`.
+
+    With ``lock=True`` the whole method (focus, clicks, keys, read-back) holds the
+    desktop input lock (:mod:`locum._inputlock`), so input from another thread
+    or process cannot land between its steps. ``lock=False`` methods take it
+    themselves around their input part only."""
 
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
         def wrapper(self: "Element", *args: Any, **kwargs: Any) -> Any:
             with _target.bind(self._input_target(keyboard)):
-                return fn(self, *args, **kwargs)
+                if not lock:
+                    return fn(self, *args, **kwargs)
+                with _inputlock.hold(self.desktop):
+                    return fn(self, *args, **kwargs)
 
         return wrapper
 
@@ -184,13 +195,19 @@ def _same(a: Any, b: Any) -> bool:
         return False
 
 
-def _parse_number(text: str) -> "set":
+def _parse_number(text: str, decimal: Optional[str] = None) -> "set":
     """Numeric readings of ``text`` (``"1,250.00"``, ``"1.250,00-"``, ``"00123"``); empty if not a number.
 
     Grouping separators are only accepted in groups of three digits, so
     ``"1,25"`` reads as 1.25 and never as 125. Currency symbols/codes
     (``$1,250.00``, ``1.250,00 EUR``) and accounting parentheses are ignored.
+
+    Without ``decimal`` both conventions are tried, so ``"1,000"`` has two
+    readings (1000 and 1.000). With ``decimal="."`` or ``","`` only that
+    convention is used and the result has at most one element.
     """
+    if decimal not in (None, ".", ","):
+        raise ValueError(f"decimal must be '.' or ',', got {decimal!r}")
     import re
     from decimal import Decimal, InvalidOperation
 
@@ -207,6 +224,8 @@ def _parse_number(text: str) -> "set":
         return set()
     out = set()
     for dec, grp in ((".", ","), (",", ".")):
+        if decimal is not None and dec != decimal:
+            continue
         whole, _, frac = t.partition(dec)
         if grp in frac or dec in frac:
             continue
@@ -220,19 +239,88 @@ def _parse_number(text: str) -> "set":
     return out
 
 
-def _same_text(actual: str, expected: str) -> bool:
+def _same_text(actual: str, expected: str, decimal: Optional[str] = None) -> bool:
     """Whether a field reading ``actual`` holds ``expected`` up to the app's normalisation.
 
     Fields commonly upper-case, collapse whitespace/line breaks, or reformat
     numbers (``1250`` -> ``1,250.00``); a truncated, refused or different value
     does not count.
+
+    Numbers are compared by value only when that value is unambiguous: with a
+    known ``decimal`` separator, or when neither side can be read two ways.
+    ``"1,000"`` is 1000 in one locale and 1.000 in another, so without a
+    separator it never "equals" ``"1"`` or ``"1.00"`` (a 1000x error).
     """
     if actual == expected:
         return True
     if " ".join(actual.split()).casefold() == " ".join(expected.split()).casefold():
         return True
+    a, e = _parse_number(actual, decimal), _parse_number(expected, decimal)
+    if len(a) != 1 or len(e) != 1:
+        return False
+    return a == e
+
+
+def _same_text_lenient(actual: str, expected: str) -> bool:
+    """The previous rule (any numeric reading overlaps): only used to decide whether a
+    native set-value "took" when the caller asked for no verification at all."""
+    if _same_text(actual, expected):
+        return True
     a, e = _parse_number(actual), _parse_number(expected)
     return bool(a and e and a & e)
+
+
+#: Read-back verification modes of :meth:`Element.set_text` / :meth:`Element.type`.
+VERIFY_MODES = ("normalized", "exact", "amount")
+
+VerifyMode = Union[bool, str, None]
+
+
+def _verify_mode(verify: VerifyMode) -> Optional[str]:
+    """``verify=`` -> a mode name, or ``None`` for no verification."""
+    if verify is None or verify is False:
+        return None
+    if verify is True:
+        return "normalized"
+    if isinstance(verify, str) and verify.lower() in VERIFY_MODES:
+        return verify.lower()
+    raise ValueError(f"verify must be True, False or one of {', '.join(VERIFY_MODES)}, got {verify!r}")
+
+
+def _matches(actual: str, expected: str, mode: str, decimal: Optional[str]) -> bool:
+    """Whether a read-back ``actual`` satisfies ``expected`` under verification ``mode``."""
+    if mode == "exact":
+        return actual == expected
+    if mode == "amount":
+        a, e = _parse_number(actual, decimal), _parse_number(expected, decimal)
+        return len(a) == 1 and a == e
+    return _same_text(actual, expected, decimal)
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    """Outcome of the read-back of the last :meth:`Element.set_text` / :meth:`Element.type`.
+
+    ``status`` is ``"verified"`` (the field was read back and matched),
+    ``"unverified"`` (it could not be read back: no value pattern, a password
+    field, text typed as Tab/Enter key presses -- the action is *not* proven)
+    or ``"skipped"`` (``verify=False``). A mismatch never produces a result:
+    it raises :class:`~locum.errors.ActionTimeout`.
+    """
+
+    status: str
+    mode: Optional[str]
+    expected: str
+    actual: Optional[str] = None
+    reason: str = ""
+
+    @property
+    def verified(self) -> bool:
+        return self.status == "verified"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "mode": self.mode, "expected": self.expected,
+                "actual": self.actual, "reason": self.reason}
 
 
 def _norm_newlines(s: str) -> str:
@@ -391,10 +479,14 @@ class Element:
         healed: A :class:`~locum.heal.HealInfo` when the element was found by a
             self-repaired selector (its :attr:`selector` is then the new one),
             else ``None``.
+        last_verification: The :class:`VerifyResult` of the last
+            :meth:`set_text`/:meth:`type` on this element (``None`` before one).
     """
 
     #: Set by a healed lookup (see :mod:`locum.heal`); ``None`` for normal matches.
     healed: Any = None
+    #: Outcome of the last :meth:`set_text` / :meth:`type` read-back.
+    last_verification: Optional["VerifyResult"] = None
 
     def __init__(
         self,
@@ -1059,9 +1151,10 @@ class Element:
     def _typing_mode(self, mode: Optional[str]) -> str:
         return mode or getattr(self.desktop, "typing_mode", None) or "auto"
 
-    @_bound_input(keyboard=True)
-    def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: bool = True,
-                 require_focus: Optional[bool] = None, _typing_mode: Optional[str] = None) -> "Element":
+    @_bound_input(keyboard=True, lock=False)  # the native path needs no input lock: taken for typing only
+    def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: VerifyMode = True,
+                 decimal: Optional[str] = None, require_focus: Optional[bool] = None,
+                 _typing_mode: Optional[str] = None) -> "Element":
         """Replace (``clear=True``) or extend the element's text.
 
         ``native="auto"`` uses the accessibility set-value action and verifies
@@ -1081,10 +1174,32 @@ class Element:
         on the typing path (the native set-value needs no focus) when keyboard
         focus cannot be proven -- ``require_focus=False`` opts out, see the
         module docstring.
+
+        Verification modes (``verify=``):
+
+        * ``True`` / ``"normalized"``: the read-back may differ by case, white
+          space and number formatting (``1250`` -> ``1,250.00``). Numbers are
+          compared by value only when the value is unambiguous: ``"1,000"`` is
+          1000 or 1.000 depending on the locale, so it matches ``"1"`` only
+          with ``decimal=","`` (or ``Desktop.decimal_separator``).
+        * ``"exact"``: the read-back must equal ``text`` character for
+          character (document numbers, vendor ids: ``0001234`` is not ``1234``).
+        * ``"amount"``: both sides are parsed with **one** decimal separator
+          (``decimal=`` or ``Desktop.decimal_separator``; ``ValueError`` if
+          neither is set) and compared as :class:`~decimal.Decimal` values;
+          SAP's trailing minus and accounting parentheses are understood.
+        * ``False``: no read-back.
+
+        A field that cannot be read back (no value, a password field) is never
+        reported as verified: ``"exact"``/``"amount"`` raise
+        :class:`VerificationUnavailable`; ``"normalized"`` returns with
+        :attr:`last_verification` ``.status == "unverified"``.
         """
         if not isinstance(text, str):
             raise TypeError(f"text must be str, not {type(text).__name__}")
         mode = _native_mode(native)
+        vmode = _verify_mode(verify)
+        dec = self._decimal(decimal, vmode)
         self._guard()
         self._check_writable()
         target = text if clear else (self.value or "") + text
@@ -1092,11 +1207,16 @@ class Element:
         if mode is not False:
             ok = bool(self._native(lambda: self._node.set_value(target), False))
             if ok:
-                current = self.value
-                if current is None or _same_text(current, target) or mode is True:
-                    if verify and current is not None and not _same_text(current, target):
-                        self._raise_mismatch(target, current)  # native only: nothing to fall back to
-                    _notify(self, "set_text", text=target)
+                current = self._read_back()[0]
+                if vmode is None:
+                    took = current is None or _same_text_lenient(current, target)
+                else:
+                    took = current is None or _matches(current, target, vmode, dec)
+                if took or mode is True:
+                    if vmode is not None and current is not None and not took:
+                        self._raise_mismatch(target, current, vmode)  # native only: nothing to fall back to
+                    result = self._conclude(target, vmode, dec, current)
+                    _notify(self, "set_text", text=target, verification=result)
                     return self
                 # The app accepted the call but reads back something else (it ignored
                 # the value, or the native set did not reach its model): the field may
@@ -1115,40 +1235,92 @@ class Element:
                     "clipboard, which this backend does not support"
                 )
             typing_mode = "clipboard"
-        self._ensure_focus(require_focus)
-        if clear:
-            kb.hotkey("mod+a")
-            kb.press("backspace")
-        if typed:
-            kb.type(typed, mode=typing_mode)
-        if verify:
-            self._verify_text(target)
+        # Focus, select-all, delete, type and read back are one action: no other
+        # thread or process may move the mouse or type in between.
+        with _inputlock.hold(self.desktop):
+            self._ensure_focus(require_focus)
+            if clear:
+                kb.hotkey("mod+a")
+                kb.press("backspace")
+            if typed:
+                kb.type(typed, mode=typing_mode)
+            if vmode is None:
+                self.last_verification = VerifyResult("skipped", None, target, reason="verify=False")
+            else:
+                self._verify_text(target, vmode, dec)
         return self
 
-    def _raise_mismatch(self, target: str, actual: Optional[str]) -> None:
-        raise ActionTimeout(
-            f"{self!r} holds {actual!r} after set_text, expected {target!r} (the field refused, "
-            "truncated or changed the input); pass verify=False if the app legitimately reformats it"
-        )
+    def _decimal(self, decimal: Optional[str], vmode: Optional[str]) -> Optional[str]:
+        """The decimal separator for a read-back: the argument, else ``Desktop.decimal_separator``."""
+        if decimal is None:
+            decimal = _safe(lambda: getattr(self.desktop, "decimal_separator", None))
+        if decimal not in (None, ".", ","):
+            raise ValueError(f"decimal must be '.' or ',', got {decimal!r}")
+        if vmode == "amount" and decimal is None:
+            raise ValueError(
+                "verify='amount' needs the field's decimal separator: pass decimal='.' or decimal=',' "
+                "(or set Desktop(decimal_separator=...)); guessing it is how 1,000 passes for 1.00"
+            )
+        return decimal
 
-    def _verify_text(self, target: str) -> None:
-        """Wait briefly for the field to read ``target`` (typed keys may be processed asynchronously)."""
+    def _read_back(self) -> Tuple[Optional[str], str]:
+        """``(value, reason)``: the field's value, or ``None`` and why it cannot be verified."""
         from ._nodeinfo import is_password
 
-        if is_password(self._node):
-            return  # masked: the read-back says nothing about what was typed
+        if _safe(lambda: is_password(self._node), False):
+            return None, "password field: the read-back is masked"
+        v = self.value
+        if v is None:
+            return None, "the field exposes no readable value"
+        return v, ""
+
+    def _conclude(self, target: str, vmode: Optional[str], decimal: Optional[str], actual: Optional[str],
+                  reason: str = "") -> VerifyResult:
+        """Record (and for strict modes enforce) the outcome of a read-back that did not mismatch."""
+        if vmode is None:
+            result = VerifyResult("skipped", None, target, actual, "verify=False")
+        elif actual is None:
+            result = VerifyResult("unverified", vmode, target, None, reason or "the field exposes no readable value")
+        else:
+            result = VerifyResult("verified", vmode, target, actual)
+        self.last_verification = result
+        if result.status == "unverified":
+            _notify(self, "verify", verification=result)
+            if vmode != "normalized":
+                raise VerificationUnavailable(
+                    f"{self!r}: cannot verify {target!r} with verify={vmode!r} ({result.reason}); the input is "
+                    "not proven. Use a readable field, or verify=True to accept an unverified result"
+                )
+        return result
+
+    def _raise_mismatch(self, target: str, actual: Optional[str], vmode: str = "normalized") -> None:
+        hint = "pass verify=False if the app legitimately reformats it"
+        if vmode == "normalized" and actual is not None and len(_parse_number(actual)) > 1:
+            hint = (f"{actual!r} reads as a different number per locale; pass decimal='.' or decimal=',' "
+                    "(or verify='amount') to compare it by value")
+        raise ActionTimeout(
+            f"{self!r} holds {actual!r} after set_text, expected {target!r} (verify={vmode!r}: the field "
+            f"refused, truncated or changed the input); {hint}"
+        )
+
+    def _verify_text(self, target: str, vmode: str = "normalized", decimal: Optional[str] = None) -> VerifyResult:
+        """Wait briefly for the field to read ``target`` (typed keys may be processed asynchronously)."""
+        first, reason = self._read_back()
+        if first is None and reason.startswith("password"):
+            return self._conclude(target, vmode, decimal, None, reason)  # masked: says nothing about the input
         last: List[Optional[str]] = [None]
 
         def holds() -> bool:
             v = self.value
             last[0] = v
-            return v is None or _same_text(v, target)
+            return v is None or _matches(v, target, vmode, decimal)
 
         try:
             wait_until(holds, 1.0, _desktop_interval(self.desktop) or 0.05,
                        sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
         except ActionTimeout:
-            self._raise_mismatch(target, last[0])
+            self._raise_mismatch(target, last[0], vmode)
+        return self._conclude(target, vmode, decimal, last[0])
 
     @_bound_input(keyboard=True)
     def type(self, text: str, *, verify: bool = True, require_focus: Optional[bool] = None,
@@ -1177,15 +1349,35 @@ class Element:
         ``desktop.require_focus = False``) accepts a backend that cannot
         report focus (a repair's ``set_text`` inherits it); see the module
         docstring.
+
+        ``verify="exact"`` accepts only the old text with ``text`` inserted
+        verbatim (no autocomplete, masks or re-casing); ``verify="amount"``
+        (with ``decimal=``) needs an empty field and compares the result as a
+        number. Both refuse to type at all (:class:`VerificationUnavailable`)
+        into a field whose result cannot be read back. With ``verify=True``
+        such a field is typed into and :attr:`last_verification` says
+        ``"unverified"``.
         """
+        decimal = kw.pop("decimal", None)
+        vmode = _verify_mode(verify)
+        dec = self._decimal(decimal, vmode)
         self._guard()
         self._check_writable()
         self._ensure_focus(require_focus)
         kw["mode"] = self._typing_mode(kw.get("mode"))
-        before = self._verify_snapshot(text, kw["mode"]) if verify else None
+        before = self._verify_snapshot(text, kw["mode"]) if vmode else None
+        if vmode is None:
+            self.last_verification = VerifyResult("skipped", None, text, reason="verify=False")
+        elif before is None:
+            # Strict modes raise here, before a single key is sent.
+            self._conclude(text, vmode, dec, None, "the field's result cannot be read back (not a readable text "
+                           "field, a password, disabled/read-only, or Tab/Enter typed as key presses)")
+        elif vmode == "amount" and before != "":
+            raise ValueError(f"{self!r}: verify='amount' types into an empty field only (it holds {before!r}); "
+                             "use set_text(..., verify='amount') to replace the value")
         self.desktop.keyboard.type(text, **kw)
         if before is not None:
-            self._verify_typed(before, text, require_focus)
+            self._verify_typed(before, text, require_focus, vmode or "normalized", dec)
         return self
 
     def _verify_snapshot(self, text: str, mode: Optional[str]) -> Optional[str]:
@@ -1220,25 +1412,37 @@ class Element:
             return None
         return v
 
-    def _verify_typed(self, before: str, text: str, require_focus: Optional[bool] = None) -> None:
+    def _verify_typed(self, before: str, text: str, require_focus: Optional[bool] = None,
+                      vmode: str = "normalized", decimal: Optional[str] = None) -> None:
         b, t = _norm_newlines(before), _norm_newlines(text)
         last: List[Optional[str]] = [None]
+
+        def arrived(v: str) -> bool:
+            if vmode == "amount":
+                return _matches(v, text, "amount", decimal)
+            return _typed_into(b, _norm_newlines(v), t)
 
         def holds() -> bool:
             v = _safe(lambda: self.value, None)
             last[0] = v
-            return v is None or _typed_into(b, _norm_newlines(v), t)
+            return v is None or arrived(v)
 
         try:
             wait_until(holds, 1.0, _desktop_interval(self.desktop) or 0.05,
                        sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
+            self._conclude(text, vmode, decimal, last[0])
             return
         except ActionTimeout:
             pass
         after = _norm_newlines(last[0] or "")
-        if _looks_reformatted(b, after, t):
-            return  # every keystroke arrived; the app completed/masked/re-cased them
-        intended = _repair_candidates(b, after, t)
+        if vmode == "normalized" and _looks_reformatted(b, after, t):
+            # every keystroke arrived; the app completed/masked/re-cased them
+            self._conclude(text, vmode, decimal, last[0])
+            return
+        if vmode == "amount":
+            intended = {text}  # the field was empty: the whole value is the amount
+        else:
+            intended = _repair_candidates(b, after, t)
         if len(intended) != 1:
             raise ActionTimeout(
                 f"{self!r} holds {last[0]!r} after typing {text!r} into {before!r}: the app dropped or "
@@ -1248,7 +1452,7 @@ class Element:
         # Native set-value first; if the app needs keystrokes, paste rather than retype
         # (the same keystroke path just failed).
         can_paste = bool(_safe(lambda: self.backend.has(CAP_CLIPBOARD), False))
-        self.set_text(intended.pop(), clear=True, verify=True, require_focus=require_focus,
+        self.set_text(intended.pop(), clear=True, verify=vmode, decimal=decimal, require_focus=require_focus,
                       _typing_mode="clipboard" if can_paste else None)
 
     def clear(self) -> "Element":

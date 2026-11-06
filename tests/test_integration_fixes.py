@@ -318,7 +318,10 @@ def test_action_listener_registry():
     remove_action_listener(be, listener)
     remove_action_listener(be, listener)  # idempotent
     d.find('edit "Amount"').set_text("8")
-    assert seen == [("set_text", "Amount", {"text": "7"}), ("invoke", "Submit Payment", {})]
+    assert [(k, n, {f: v for f, v in data.items() if f != "verification"}) for k, n, data in seen] == [
+        ("set_text", "Amount", {"text": "7"}), ("invoke", "Submit Payment", {})]
+    # the native set_text reports how its read-back went
+    assert seen[0][2]["verification"].status == "verified"
 
 
 # ================================================================ finding: image paths

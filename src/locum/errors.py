@@ -62,6 +62,8 @@ __all__ = [
     "PolicyViolation",
     "WorkflowError",
     "TargetLost",
+    "VerificationUnavailable",
+    "DesktopBusy",
     "STOP_ERRORS",
     "FATAL_ERRORS",
     "TRANSIENT_ERRORS",
@@ -148,6 +150,18 @@ class TargetLost(LocumError):
     was found, or another window covers the point to click. Never retried."""
 
 
+class VerificationUnavailable(ActionTimeout):
+    """A strict read-back (``verify="exact"`` / ``"amount"``) was asked for, but the
+    field's value cannot be read (no value pattern, a password field, text whose
+    Tab/Enter would be key presses). The input may or may not have arrived: it is
+    not proven, so a financial field is never reported as entered. Never retried."""
+
+
+class DesktopBusy(LocumError):
+    """Another thread or process held the desktop input lock (mouse, keyboard,
+    focus) for longer than the input lock timeout. See :mod:`locum._inputlock`."""
+
+
 # ------------------------------------------------------------ classification
 #: Stop requests: fatal even when marked ``transient=True``.
 STOP_ERRORS: Tuple[Type[BaseException], ...] = (FailSafeTriggered, PolicyViolation, TargetLost)
@@ -156,6 +170,7 @@ STOP_ERRORS: Tuple[Type[BaseException], ...] = (FailSafeTriggered, PolicyViolati
 #: their transient base classes: ``PermissionError`` is an ``OSError``,
 #: ``NotSupported`` a ``BackendError``...).
 FATAL_ERRORS: Tuple[Type[BaseException], ...] = STOP_ERRORS + (
+    VerificationUnavailable,
     BackendUnavailable,
     NotSupported,
     PermissionDenied,

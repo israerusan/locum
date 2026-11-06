@@ -198,6 +198,26 @@ raises instead of reporting success; `set_text()` sets the value natively and
 verifies it; `d.type(text, mode="clipboard")` pastes instead of typing. Use one
 of those when the exact text matters.
 
+**Financial fields: say how strict.** `set_text`/`type` take `verify=`:
+`True` (normalised: case, white space and unambiguous number formatting such as
+`1250` → `1,250.00`), `"exact"` (character for character — document numbers,
+vendor ids: `0001234` is not `1234`) or `"amount"` (both sides parsed with *one*
+decimal separator, `decimal="."`/`","` or `Desktop(decimal_separator=...)`,
+compared as `Decimal`; SAP's `1.250,00-` is understood). A read-back that reads
+as a different number per locale — `1,000` is 1000 or 1.000 — never passes as a
+number without a known separator. A field that cannot be read back (no value,
+a password) is never reported as verified: `el.last_verification.status` is
+`"unverified"`, and the strict modes raise `VerificationUnavailable` instead.
+
+**One input owner at a time.** Every mouse/keyboard action — and a whole
+`Element` action such as focus → select all → type → read back — holds the
+desktop input lock, shared by all locum processes of your session. Workers can
+process in parallel (native set-value/invoke need no lock) but never interleave
+their input; `with locum.desktop_input(d):` holds it around a sequence of your
+own, `locum.try_desktop_input(d)` takes it only if free (for an idle "keep
+awake" nudger), and a wait beyond `Desktop(input_lock_timeout=30)` raises
+`DesktopBusy` naming the holder.
+
 `Desktop(humanize=True)` (or `Humanize(speed=..., jitter=..., seed=...)`) makes
 every move human-like; `pause=` mirrors PyAutoGUI's `PAUSE`. Moving the mouse
 into a screen corner raises `FailSafeTriggered`; `locum.install_kill_hotkey()`
@@ -220,8 +240,8 @@ def enter_invoice(item):
         raise BusinessException(f"invalid amount {item['amount']!r}")   # recorded, never retried
     d.click('button "Clear"')                               # known state: status "Cleared"
     d.find("edit#vendor").set_text(item["vendor"])          # errors up to here are retried
-    d.find("edit#invoice_no").set_text(item["invoice_no"])
-    d.find("edit#amount").set_text(item["amount"])
+    d.find("edit#invoice_no").set_text(item["invoice_no"], verify="exact")
+    d.find("edit#amount").set_text(item["amount"], verify="amount", decimal=".")
 
     def answered():                                         # the old status is still on screen
         status = d.find("text#status").text
@@ -246,6 +266,14 @@ def process():
 report = robot.run()          # timings, logs, error screenshots, report.json + report.html
 print(report.summary(), robot.vars["stats"]["success"], robot.vars["stats"]["business_exception"])
 ```
+
+Keep the **live** queue file on a local disk (`locum.rpa.default_queue_dir()`
+is `%LOCALAPPDATA%\locum\queues` on Windows): a `WorkQueue` path inside
+OneDrive, Dropbox, Google Drive, iCloud or a network share is refused
+(`allow_synced=True` overrides), because a sync client replaces and locks files
+behind the queue's file lock and atomic rename. Workers on several machines
+sharing one queue file are not supported. Copy finished state into a synced
+vault with `queue.export(path)` (and `report.save_json/save_html(path)`).
 
 Declarative flows (YAML/JSON) cover the same ground without Python —
 `click, type, set_text, wait, if_exists, for_each (csv/json/items), try/catch,

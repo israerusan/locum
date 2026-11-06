@@ -225,3 +225,48 @@ a browser). This is why the plugin only takes screenshots on failure by default.
 Keep the trace directory out of version control (`.locum-traces/` in
 `.gitignore`), and run UI tests on a dedicated machine or VM, or with
 `--locum-screenshots none` / `--locum-trace off`, when that matters.
+
+## Acceptance scenarios (real applications)
+
+The unit suite runs against the mock desktop, and CI's real-desktop jobs only
+drive windows locum opens itself. Before relying on unattended runs against
+your own applications, run the acceptance scenarios in `tests/acceptance/` on
+the machine that will do the work. They are opt-in and skipped by default:
+
+```powershell
+pip install pytest pywin32 psutil
+$env:LOCUM_ACCEPTANCE = "1"
+python -m pytest tests/acceptance -m "acceptance and not sap" -rs     # Excel dialogs
+$env:LOCUM_ACCEPTANCE_SAP = "1"
+python -m pytest tests/acceptance -m sap -rs                          # SAP GUI export
+```
+
+| Scenario | What it proves |
+|---|---|
+| `test_save_changes_prompt_dont_save` | Excel's *Save changes?* prompt on closing a dirty workbook is found among that Excel's windows and answered *Don't Save* by native invoke; the file on disk is unchanged. |
+| `test_overwrite_prompt_yes` | *A file named ... already exists. Replace it?* on `SaveAs` is answered *Yes*; the new content is on disk. |
+| `test_save_as_dialog_exact_file_name` | The common *Save As* dialog's file name is entered with `set_text(native=True, verify="exact")` (`last_verification.verified`) and *Save* invoked; Excel receives exactly that path. |
+| `test_se16n_export_to_local_file` | An idle SAP GUI session on its home screen runs SE16N on `T001`, exports it as a local unconverted file (ALV `&PC`, so no Excel opens), and locum answers any *SAP GUI Security* prompt with *Allow*; the file has a header and rows; the session is sent back to its home screen. |
+
+Safety rules the scenarios follow:
+
+* **Private Excel only.** A child process starts its own instance with
+  `DispatchEx` and always quits it; dialogs are looked up only among windows
+  of *that* process id. Workbooks open in your own Excel are never touched.
+* **No input.** Buttons are pressed with accessibility-native invoke and text
+  is entered with native set-value. The Excel tests fail if anything would
+  move the mouse or press a key, so they run while you keep working (but
+  Excel windows do appear on screen for a few seconds each).
+* **Local files.** Everything is written to a pytest temp directory, never a
+  synced folder.
+* **SAP is read-only and borrowed.** A session is used only if it is idle and
+  on its home screen, probed with a deadline (a frozen session is skipped, not
+  waited on); no session is opened, closed or killed; the scenario skips when
+  none is free.
+* **No popup watchdog.** Stop any tool that auto-answers Excel/SAP dialogs
+  while the scenarios run, or it will race them.
+
+CI: the `acceptance-self-hosted` job runs them on demand (`workflow_dispatch`)
+on a self-hosted Windows runner labelled `excel` that is logged in to an
+interactive desktop; register the runner yourself. Hosted runners have neither
+Excel nor SAP GUI.

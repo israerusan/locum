@@ -116,15 +116,6 @@ jobs:
         continue-on-error: true
         run: python -m locum.selftest --yes --out selftest-report
 
-      # Another window takes the focus between finding a target and typing, and in the
-      # middle of typing: nothing may reach it (real SendInput on the runner's desktop).
-      - name: Focus-steal tests against the real desktop
-        env:
-          LOCUM_TEST_DESKTOP: "1"
-        run: |
-          python -m pip install pytest
-          python -m pytest -q -p no:cacheprovider tests/test_real_focus_steal.py
-
       - name: Flag a failed self-test (non-blocking)
         if: steps.selftest.outcome == 'failure'
         shell: bash
@@ -137,3 +128,60 @@ jobs:
           name: windows-native-selftest-report
           path: selftest-report
           if-no-files-found: warn
+
+  # BLOCKING: real SendInput on the runner's desktop. Another window takes the focus
+  # between finding a target and typing, and in the middle of typing: nothing may
+  # reach it. This used to run inside the non-blocking self-test job, so a
+  # regression in the input guard could merge green.
+  windows-real-desktop-input:
+    name: windows-real-desktop-input (blocking)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      LOCUM_TEST_DESKTOP: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install locum
+        run: python -m pip install . pytest
+
+      - name: Focus-steal tests against the real desktop
+        run: python -m pytest -q -p no:cacheprovider tests/test_real_focus_steal.py
+
+      - name: Desktop input lock across real processes
+        run: python -m pytest -q -p no:cacheprovider tests/test_desktop_lock.py
+
+  # Real-application acceptance: Excel dialogs (+ SAP GUI when the runner has it).
+  # Hosted runners have neither, so this runs only on demand on a self-hosted
+  # Windows runner labelled `excel` (and `sap` for the SAP scenario), logged in to
+  # an interactive desktop. See docs/TESTING.md "Acceptance scenarios".
+  acceptance-self-hosted:
+    name: acceptance (self-hosted, on demand)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, windows, excel]
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+      LOCUM_ACCEPTANCE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install locum
+        shell: pwsh
+        run: python -m pip install . pytest pywin32 psutil
+
+      - name: Acceptance scenarios
+        shell: pwsh
+        run: python -m pytest -q -p no:cacheprovider tests/acceptance -m acceptance -rs

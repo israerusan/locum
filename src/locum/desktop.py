@@ -141,9 +141,19 @@ class Desktop:
             on the ``locum.heal`` logger. ``False`` (the default: acting on the
             wrong element is dangerous), ``True``, or a :class:`~locum.heal.HealOptions`.
             Per call, ``find(..., heal=True/False)`` overrides it.
+        input_lock_timeout: Seconds an input action waits for the desktop input
+            lock while another thread or process drives the mouse/keyboard,
+            before raising :class:`~locum.errors.DesktopBusy` (see
+            :mod:`locum._inputlock`; ``LOCUM_DESKTOP_LOCK=0`` disables the lock).
+        decimal_separator: ``"."`` or ``","``: how the target application writes
+            amounts. Used by :meth:`Element.set_text` read-back verification
+            (``verify="amount"`` requires it, per call or here); ``None`` means
+            unknown, so a locale-ambiguous read-back like ``1,000`` never passes
+            as a number.
 
     Attributes:
-        backend, mouse, keyboard, screen, failsafe, default_timeout, humanize, typing_mode, heal_selectors.
+        backend, mouse, keyboard, screen, failsafe, default_timeout, humanize, typing_mode, heal_selectors,
+        input_lock_timeout, decimal_separator.
     """
 
     def __init__(
@@ -161,6 +171,8 @@ class Desktop:
         clipboard_settle: float = DEFAULT_CLIPBOARD_SETTLE,
         clipboard_timeout: float = DEFAULT_CLIPBOARD_TIMEOUT,
         heal_selectors: Any = False,
+        input_lock_timeout: float = 30.0,
+        decimal_separator: Optional[str] = None,
     ):
         from .backends import create_backend, get_backend
 
@@ -182,6 +194,11 @@ class Desktop:
                 raise ValueError(f"typing_mode must be one of {', '.join(TYPING_MODES)}, got {typing_mode!r}")
             if poll_interval is None or not math.isfinite(float(poll_interval)) or float(poll_interval) < 0:
                 raise ValueError(f"poll_interval must be a finite number >= 0, got {poll_interval!r}")
+            if input_lock_timeout is None or not math.isfinite(float(input_lock_timeout)) or float(input_lock_timeout) < 0:
+                raise ValueError(f"input_lock_timeout must be a finite number >= 0, got {input_lock_timeout!r}")
+            if decimal_separator not in (None, ".", ","):
+                raise ValueError(f"decimal_separator must be '.', ',' or None, got {decimal_separator!r}")
+            self.decimal_separator: Optional[str] = decimal_separator
 
             from .heal import HealOptions
 
@@ -215,6 +232,7 @@ class Desktop:
             self.keyboard = Keyboard(self.backend, self.failsafe, self._pause, sleep=sleep,
                                      clipboard_settle=clipboard_settle, clipboard_timeout=clipboard_timeout)
             self.screen = Screen(self.backend, sleep=sleep, clock=clock)
+            self.input_lock_timeout = float(input_lock_timeout)
         except BaseException:
             # A bad option must not leak the backend this constructor created (and owns).
             if self._owns_backend:
@@ -225,6 +243,20 @@ class Desktop:
             raise
 
     # ================================================================ plumbing
+    @property
+    def input_lock_timeout(self) -> float:
+        """Seconds an input action waits for the desktop input lock (see :mod:`locum._inputlock`)."""
+        return self._input_lock_timeout
+
+    @input_lock_timeout.setter
+    def input_lock_timeout(self, value: float) -> None:
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"input_lock_timeout must be a finite number >= 0, got {value!r}")
+        self._input_lock_timeout = value
+        self.mouse.input_lock_timeout = value  # their own calls take the lock too
+        self.keyboard.input_lock_timeout = value
+
     @property
     def pause(self) -> float:
         """Seconds slept after every mouse/keyboard action."""

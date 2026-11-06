@@ -138,6 +138,8 @@ __all__ = [
     "BUSINESS_EXCEPTION",
     "ITEM_STATUSES",
     "ABANDONED_POLICIES",
+    "synced_location",
+    "default_queue_dir",
 ]
 
 #: Attribute :class:`~locum.rpa.robot.Robot` sets on the ``ActionTimeout`` of a task's own deadline.
@@ -346,6 +348,72 @@ def _same_file(a: pathlib.Path, b: pathlib.Path) -> bool:
     return norm(a) == norm(b)
 
 
+#: Environment variables the OneDrive client sets to its folders.
+_SYNC_ENV_VARS = ("OneDrive", "OneDriveCommercial", "OneDriveConsumer")
+#: Folder names of common sync clients (compared case-insensitively, per path component).
+_SYNC_FOLDERS = frozenset({"onedrive", "dropbox", "google drive", "my drive", "icloud drive", "iclouddrive",
+                           "mobile documents", "box", "box sync"})
+
+
+def _is_under(path: str, root: str) -> bool:
+    try:
+        p, r = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(root))
+        return os.path.commonpath([p, r]) == r
+    except ValueError:  # different drives
+        return False
+
+
+def _is_remote_drive(path: str) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        drive = os.path.splitdrive(os.path.abspath(path))[0]
+        if not drive:
+            return False
+        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4  # DRIVE_REMOTE
+    except Exception:
+        return False
+
+
+def synced_location(path: PathLike) -> str:
+    """Why ``path`` is not a safe place for a live queue file ("" if it is).
+
+    Flags cloud-synced folders (the OneDrive folders named by ``%OneDrive%`` /
+    ``%OneDriveCommercial%`` / ``%OneDriveConsumer%``, any ``OneDrive`` /
+    ``OneDrive - <org>`` / Dropbox / Google Drive / iCloud / Box folder) and
+    network locations (UNC paths, mapped network drives).
+    """
+    p = os.path.abspath(os.path.expanduser(str(path)))
+    if p.startswith("\\\\") or p.startswith("//"):
+        return "a network share (UNC path)"
+    for var in _SYNC_ENV_VARS:
+        root = os.environ.get(var)
+        if root and _is_under(p, root):
+            return f"a OneDrive folder ({root})"
+    for part in pathlib.PurePath(p).parts:
+        low = part.lower().strip("\\/")
+        if low in _SYNC_FOLDERS or low.startswith("onedrive - "):
+            return f"a cloud-synced folder ({part!r})"
+    if _is_remote_drive(p):
+        return "a network drive"
+    return ""
+
+
+def default_queue_dir() -> pathlib.Path:
+    """A local, unsynced folder for live queue files.
+
+    ``%LOCALAPPDATA%\\locum\\queues`` on Windows (never roamed or synced),
+    ``$XDG_STATE_HOME/locum/queues`` (default ``~/.local/state/locum/queues``)
+    elsewhere. Not created until used.
+    """
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return pathlib.Path(os.environ["LOCALAPPDATA"]) / "locum" / "queues"
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return pathlib.Path(base) / "locum" / "queues"
+
+
 def _atomic_write(target: pathlib.Path, text: str) -> None:
     """Write ``text`` to a temp file, fsync it, rename it over ``target``, fsync the directory."""
     tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp")
@@ -532,6 +600,13 @@ class WorkQueue:
             its lease expires when the worker that claimed it was a process on
             this machine that no longer exists (default ``True``; disable when
             workers with the same host name run in separate PID namespaces).
+        allow_synced: Accept a ``path`` inside a cloud-synced folder (OneDrive,
+            Dropbox, Google Drive, iCloud) or on a network drive. Refused by
+            default (``ValueError``): a sync client replaces, locks and
+            "conflict-copies" files behind the queue's back, which defeats the
+            file lock and the atomic rename. Keep the live queue in a local
+            folder (:func:`default_queue_dir`) and :meth:`export` finished
+            state into the synced folder instead.
     """
 
     def __init__(
@@ -546,7 +621,17 @@ class WorkQueue:
         lease_duration: float = DEFAULT_LEASE_DURATION,
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
         reclaim_dead_workers: bool = True,
+        allow_synced: bool = False,
     ):
+        if path is not None and not allow_synced:
+            why = synced_location(path)
+            if why:
+                raise ValueError(
+                    f"WorkQueue path {str(path)!r} is in {why}: the queue's file lock and atomic rename are "
+                    "only reliable on a local, unsynced disk. Keep the live queue local "
+                    f"(e.g. {str(default_queue_dir())!r}) and copy finished state with WorkQueue.export(); "
+                    "pass allow_synced=True to override"
+                )
         if on_abandoned not in ABANDONED_POLICIES:
             raise ValueError(f"on_abandoned must be one of {', '.join(ABANDONED_POLICIES)}, got {on_abandoned!r}")
         if not float(lease_duration) > 0:
@@ -1485,6 +1570,25 @@ class WorkQueue:
                 snapshot = self.to_dict()
                 snapshot["generation"] = max(self._generation, _peek_generation(target) or 0) + 1
                 _atomic_write(target, json.dumps(snapshot, indent=2, ensure_ascii=False, default=str))
+        return str(target)
+
+    def export(self, path: PathLike) -> str:
+        """Copy this queue's current state to ``path`` as JSON (atomic temp + rename). Returns the path.
+
+        Unlike :meth:`save` to another path, this takes no ``.lock`` sidecar at
+        the destination and never merges with it: the copy is an archive (a
+        report for a synced vault, an audit trail), not a second live queue.
+        The live file is re-read first so the copy includes every worker's
+        changes. Open an exported file with ``WorkQueue.open(..., allow_synced=True)``
+        only to read it.
+        """
+        with self._lock:
+            if self.path is not None and self._persistent():
+                self.refresh()
+            snapshot = self.to_dict()
+        target = pathlib.Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(target, json.dumps(snapshot, indent=2, ensure_ascii=False, default=str))
         return str(target)
 
     def export_csv(self, path: PathLike, *, encoding: str = "utf-8") -> str:

@@ -37,7 +37,7 @@ Step types (shorthand scalar form -> the key in brackets):
   ``drag`` {start, end, duration, button}, ``scroll`` [dy] {dy, dx, at}
 * keyboard: ``type`` [text] {text, into, interval, mode}, ``press`` [keys]
   {keys, presses, interval}, ``hotkey`` [keys] (``"ctrl+s"`` or a list)
-* elements: ``set_text`` {target, text, native, clear} (an ``"x,y"`` target clicks
+* elements: ``set_text`` {target, text, native, clear, verify, decimal} (an ``"x,y"`` target clicks
   there, selects all and types), ``invoke``/``toggle``/
   ``select``/``expand``/``collapse``/``check``/``uncheck`` [target] (native
   accessibility action with click/keyboard fallback), ``wait`` [target]
@@ -163,7 +163,7 @@ _SPEC: Dict[str, Tuple[Optional[str], frozenset]] = {
     "type": ("text", frozenset({"text", "into", "target", "interval", "mode", "timeout"})),
     "press": ("keys", frozenset({"keys", "presses", "interval"})),
     "hotkey": ("keys", frozenset({"keys"})),
-    "set_text": (None, frozenset({"target", "text", "native", "clear", "timeout"})),
+    "set_text": (None, frozenset({"target", "text", "native", "clear", "verify", "decimal", "timeout"})),
     **{k: ("target", frozenset({"target", "timeout"})) for k in _ELEMENT_ACTIONS},
     "wait": ("target", frozenset({"target", "state", "timeout"})),
     "wait_gone": ("target", frozenset({"target", "timeout"})),
@@ -989,7 +989,11 @@ class FlowRunner:
                 return None
             el = self._element(args["target"], self._timeout(args, step, scope))
             native = args.get("native", "auto")
-            el.set_text(_to_text(args.get("text")), native=native, clear=_bool_arg(args.get("clear", True), "set_text.clear"))
+            verify = args.get("verify", True)
+            if not isinstance(verify, (bool, str)):
+                raise ValueError(f"set_text.verify must be a bool or a mode name, got {verify!r}")
+            el.set_text(_to_text(args.get("text")), native=native, clear=_bool_arg(args.get("clear", True), "set_text.clear"),
+                        verify=verify, decimal=args.get("decimal"))
             return None
         if kind in _ELEMENT_ACTIONS:
             el = self._element(args["target"], self._timeout(args, step, scope))

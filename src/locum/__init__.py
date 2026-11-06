@@ -39,6 +39,8 @@ from .errors import (
     WindowNotFound,
     WorkflowError,
     TargetLost,
+    VerificationUnavailable,
+    DesktopBusy,
 )
 from .types import Match, Monitor, MouseButton, Point, Rect, WindowInfo, coerce_point
 
@@ -66,6 +68,9 @@ except ImportError:  # pragma: no cover - a source tree that was never built/ins
 _LAZY = {
     "Desktop": ("locum.desktop", "Desktop"),
     "Element": ("locum.element", "Element"),
+    "VerifyResult": ("locum.element", "VerifyResult"),
+    "desktop_input": ("locum._inputlock", "desktop_input"),
+    "try_desktop_input": ("locum._inputlock", "try_desktop_input"),
     "Window": ("locum.window", "Window"),
     "Humanize": ("locum.motion", "Humanize"),
     "FailSafe": ("locum.failsafe", "FailSafe"),
@@ -363,7 +368,12 @@ __all__ = [
     "PolicyViolation",
     "WorkflowError",
     "TargetLost",
+    "VerificationUnavailable",
+    "DesktopBusy",
+    "VerifyResult",
     # safety / helpers
+    "desktop_input",
+    "try_desktop_input",
     "abort",
     "reset_abort",
     "is_aborted",
