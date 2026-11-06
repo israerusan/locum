@@ -923,6 +923,11 @@ class DesktopToolkit:
                 raise
             finally:
                 self._local.redact = None
+                # The shared selector trees of this call hold accessibility (COM) nodes; on a
+                # long-lived worker thread they would stay referenced until the next selector.
+                from ..selectors import release_trees
+
+                release_trees()
                 event: Dict[str, Any] = {
                     "event": "tool_call",
                     "tool": name,
@@ -2148,10 +2153,16 @@ class DesktopToolkit:
             # own handler: the policy judges that control, as for a click on it (cf. _with_default_button).
             ctx["enter"] = True
             hit = page.enter_target(target)
-            if not hit:
-                ctx["target_unknown"] = True  # nothing focused / readable: Enter goes who knows where
-            else:
-                label = str(hit.get("label") or "")
+            kind = hit.get("kind") if isinstance(hit, dict) else None
+            label = str(hit.get("label") or "") if isinstance(hit, dict) else ""
+            if kind not in ("self", "form", "nearby") or (not label and not (kind == "form" and hit.get("action"))):
+                # Nothing focused, nothing found, the focus inside an embedded (cross-origin)
+                # frame -- a Stripe-style card field --, a form without a submit button or a
+                # control without a usable name: what Enter activates is unknown.
+                ctx["target_unknown"] = True
+                if kind == "frame":
+                    desc += " (the focus is inside an embedded frame: what Enter activates cannot be seen)"
+            if isinstance(hit, dict):
                 extra = [x for x in (label, str(hit.get("form") or ""), str(hit.get("action") or "")) if x]
                 if extra:
                     ctx["enter_target"] = extra

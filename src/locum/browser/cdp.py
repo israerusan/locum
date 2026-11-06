@@ -98,8 +98,14 @@ def find_executable(browser: str) -> Optional[str]:
     return None
 
 
+def _url_host(host: str) -> str:
+    """``host`` as it goes into a URL: an IPv6 address in brackets (``::1`` -> ``[::1]``)."""
+    host = str(host)
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 def _http_json(host: str, port: int, path: str, method: str = "GET", timeout: float = 2.0) -> Any:
-    req = urllib.request.Request(f"http://{host}:{port}{path}", method=method)
+    req = urllib.request.Request(f"http://{_url_host(host)}:{port}{path}", method=method)
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - localhost DevTools only
         return json.loads(resp.read().decode("utf-8"))
 
@@ -316,13 +322,26 @@ _RESOLVE_JS = r"""
 #: link: Enter presses it), ``form`` (implicit submission: ``label`` is the form's default
 #: button -- its first submit button --, ``action`` / ``form`` describe the form),
 #: ``nearby`` (no form: the closest button of the field's container, which page scripts
-#: usually wire to Enter -- chat "Send", search "Go"), ``none`` (nothing found), or
-#: ``null`` (no such element / nothing focused). Labels never come from field values.
+#: usually wire to Enter -- chat "Send", search "Go"), ``frame`` (the focus is inside an
+#: embedded frame -- a Stripe-style card field --, whose content this page cannot see),
+#: ``none`` (nothing found), or ``null`` (no such element / nothing focused). Labels never
+#: come from field values. The focus is followed into open shadow roots and same-origin
+#: frames.
 _ENTER_TARGET_JS = r"""
 (css) => {
 """ + _NAME_FN + r"""
-  const e = css ? document.querySelector(css) : document.activeElement;
+  let e = css ? document.querySelector(css) : document.activeElement;
   if (!e || e === document.body || e === document.documentElement) return null;
+  for (let i = 0; i < 16; i++) {
+    if (e.shadowRoot && e.shadowRoot.activeElement) { e = e.shadowRoot.activeElement; continue; }
+    if (['IFRAME', 'FRAME', 'OBJECT', 'EMBED', 'PORTAL', 'FENCEDFRAME'].includes(e.tagName)) {
+      let inner = null;
+      try { inner = e.contentDocument && e.contentDocument.activeElement; } catch (err) { inner = null; }
+      if (inner && inner !== e.contentDocument.body && inner !== e.contentDocument.documentElement) { e = inner; continue; }
+      return {kind: 'frame', label: '', form: '', action: ''};
+    }
+    break;
+  }
   const tag = e.tagName.toLowerCase();
   const type = (e.getAttribute('type') || '').toLowerCase();
   const short = (t) => String(t || '').slice(0, 80);
@@ -612,8 +631,12 @@ class Browser:
         page = Page(info, self)
         self._pages[info.id] = page
         if url and url != "about:blank":
-            page.session.call("Page.navigate", {"url": url})
+            res = page.session.call("Page.navigate", {"url": url}) or {}
+            if res.get("errorText"):
+                raise CDPError(f"could not open {url!r} in the new tab: {res['errorText']}")
             info.url = url
+            if not res.get("loaderId"):
+                return page  # no new document (a download, a same-document navigation): nothing to wait for
             end = time.monotonic() + 5.0  # until the new document replaced about:blank
             while time.monotonic() < end:
                 try:

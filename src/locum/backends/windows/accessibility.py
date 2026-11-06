@@ -7,7 +7,7 @@ from __future__ import annotations
 import ctypes
 import sys
 from ctypes import wintypes
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Set
 
 from ...errors import NotSupported
 from ..base import AccessibleNode
@@ -53,6 +53,11 @@ class _AccessibilityMixin:
             self._change_tracker_failed = True
             return None
         self._change_tracker = tracker
+        # Shared selector trees (locum.selectors) drop the windows these events touch.
+        from ...selectors import register_change_source
+
+        self._selector_change_source = _SelectorChangeSource(self, tracker)
+        register_change_source(self._selector_change_source)
         return tracker
 
     def window_content_pids(self, handle: Any) -> Optional[FrozenSet[int]]:
@@ -226,3 +231,40 @@ def _user32() -> Any:
         u.EnumChildWindows.restype = wintypes.BOOL
         _U32 = u
     return _U32
+
+
+class _SelectorChangeSource:
+    """Adapter for :func:`locum.selectors.register_change_source`: which windows changed."""
+
+    def __init__(self, backend: Any, tracker: Any) -> None:
+        import weakref
+
+        self._backend = weakref.ref(backend)
+        self.tracker = tracker
+
+    @property
+    def alive(self) -> bool:
+        return bool(self.tracker.alive) and self._backend() is not None
+
+    def stamp(self) -> int:
+        return int(self.tracker.identity_generation)
+
+    def dirty_since(self, stamp: int) -> Optional[Set[int]]:
+        return self.tracker.identity_dirty_since(stamp)
+
+    def pids_of(self, node: Any) -> Optional[FrozenSet[int]]:
+        """Processes whose events can change ``node``'s subtree (``None``: unknown)."""
+        try:
+            own = node.pid
+        except Exception:
+            own = None
+        be = self._backend()
+        content = None
+        if be is not None:
+            try:
+                content = be.window_content_pids(node.handle)
+            except Exception:
+                content = None
+        if content is None:
+            return frozenset({own}) if own else None
+        return frozenset(content) | (frozenset({own}) if own else frozenset())

@@ -34,6 +34,7 @@ from typing import Any, Deque, Optional, Set, Tuple
 #: UIA property ids watched (Name, Value, IsEnabled, IsOffscreen, ToggleState,
 #: SelectionItem.IsSelected, ExpandCollapseState, Scroll H/V percent).
 WATCHED_PROPERTIES = (30005, 30045, 30010, 30022, 30086, 30079, 30070, 30053, 30057)
+NAME_PROPERTY = 30005
 #: Events remembered for :meth:`ChangeTracker.dirty_since`; older history is "unknown".
 LOG_SIZE = 8192
 
@@ -59,6 +60,12 @@ class ChangeTracker:
         self.generation = 0
         self._log: Deque[Tuple[int, Optional[int]]] = collections.deque(maxlen=LOG_SIZE)
         self._forgotten = 0  # generations <= this are no longer in the log
+        #: Like ``generation``, for the events that can change which element a selector
+        #: matches: elements added/removed/reordered and Name changes (not focus, values,
+        #: scrolling...). See :meth:`identity_dirty_since`.
+        self.identity_generation = 0
+        self._identity_log: Deque[Tuple[int, Optional[int]]] = collections.deque(maxlen=LOG_SIZE)
+        self._identity_forgotten = 0
         self._focus_pid: Optional[int] = None
         self.alive = False
         self.error: Optional[BaseException] = None
@@ -78,6 +85,13 @@ class ChangeTracker:
                 self._log.append((self.generation, pid))
             self._cond.notify_all()
 
+    def _bump_identity(self, pid: Optional[int]) -> None:
+        with self._cond:
+            self.identity_generation += 1
+            if len(self._identity_log) == self._identity_log.maxlen:
+                self._identity_forgotten = self._identity_log[0][0]
+            self._identity_log.append((self.identity_generation, pid))
+
     # ------------------------------------------------------------- queries
     def wait(self, since: int, timeout: float) -> int:
         """Block until an event newer than generation ``since`` (or ``timeout``); the generation."""
@@ -93,6 +107,21 @@ class ChangeTracker:
                 return None
             out: Set[int] = set()
             for gen, pid in reversed(self._log):
+                if gen <= since:
+                    break
+                if pid is None:
+                    return None
+                out.add(pid)
+            return out
+
+    def identity_dirty_since(self, since: int) -> Optional[Set[int]]:
+        """:meth:`dirty_since` for the identity events (structure and Name changes) after
+        ``identity_generation`` ``since``."""
+        with self._cond:
+            if not self.alive or since < self._identity_forgotten:
+                return None
+            out: Set[int] = set()
+            for gen, pid in reversed(self._identity_log):
                 if gen <= since:
                     break
                 if pid is None:
@@ -204,11 +233,15 @@ def _make_handler(UIA: Any, tracker: ChangeTracker) -> Any:
             pid = _pid(sender)
             if pid is None:
                 pid = _pid_from_runtime_id(runtime_id)
+            tracker._bump_identity(pid)
             tracker._bump(pid)
             return 0
 
         def HandlePropertyChangedEvent(self, sender: Any, property_id: Any, new_value: Any) -> int:
-            tracker._bump(_pid(sender))
+            pid = _pid(sender)
+            if property_id == NAME_PROPERTY:
+                tracker._bump_identity(pid)
+            tracker._bump(pid)
             return 0
 
     return _Handler()

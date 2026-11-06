@@ -55,7 +55,9 @@ pip install "locum[yaml]"         # + PyYAML for YAML flows (JSON flows need not
 pip install "locum[all]"          # everything above
 ```
 
-From a checkout: `pip install -e ".[dev]"` and `python -m pytest -q`.
+From a checkout: `pip install -e ".[dev]"` and `python -m pytest -q`. Tests that start a
+real headless Edge/Chrome run on CI and with `LOCUM_TEST_BROWSER=1`; locally they are
+skipped by default.
 
 Platform notes: on **Linux** the clipboard works out of the box (native X11
 selection handling; `xclip`/`xsel` are used if present) and, for

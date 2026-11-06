@@ -140,7 +140,10 @@ password -- is never used as its name). `browser_type(..., submit=True)` is
 judged by what Enter activates: the field's form's default button (its first
 submit button, e.g. "Pay now") and the form's action URL, or, outside a form,
 the field's nearby button (a chat's "Send") -- so typing a card number and
-pressing Enter needs the same confirmation as clicking "Pay now". A cancelled
+pressing Enter needs the same confirmation as clicking "Pay now". When what Enter
+activates cannot be seen -- the focus is inside an embedded cross-origin frame
+(Stripe-style card fields), the form has no submit button, or the button has no
+name -- the submit is treated like a click on an unidentified control (asks). A cancelled
 or timed-out tool call sends no further input to the page. DevTools gives full
 control of that browser, so only connect to browsers you started for automation.
 

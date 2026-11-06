@@ -248,6 +248,9 @@ def test_observe_skips_document_subtree_of_connected_browser():
 
 # ------------------------------------------------------------- real headless browser
 def _browser_or_skip():
+    from conftest import skip_unless_real_browser_allowed
+
+    skip_unless_real_browser_allowed()
     for name in ("edge", "chrome", "chromium"):
         if find_executable(name):
             return name

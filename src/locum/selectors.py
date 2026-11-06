@@ -64,7 +64,8 @@ from __future__ import annotations
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+import weakref
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .backends.base import AccessibleNode
 from ._cancel import check as _cancel_check
@@ -1819,7 +1820,7 @@ class _TreeCache:
     the same as a fresh search's.
     """
 
-    __slots__ = ("owner", "born", "building", "nodes", "entries", "_alias")
+    __slots__ = ("owner", "born", "building", "nodes", "entries", "_alias", "_stamps", "_pids")
 
     def __init__(self, owner: List[Any], born: float):
         self.owner = owner
@@ -1829,6 +1830,33 @@ class _TreeCache:
         self.entries: List[_Entry] = []
         # Other objects for the same roots (a chain's top, a re-read root): id -> (object, index).
         self._alias: Dict[int, Tuple[AccessibleNode, int]] = {}
+        # Change sources (UI Automation events) and their stamp when this tree was read.
+        self._stamps: List[Tuple[Any, int]] = [(src, src.stamp()) for src in _change_sources()]
+        self._pids: Dict[int, Optional[FrozenSet[int]]] = {}  # root index -> processes drawing it
+
+    def revalidate(self) -> bool:
+        """Forget the subtrees of the roots that changed since the tree was read (an element
+        added, removed or renamed there: a selector proven unique against the old subtree
+        could match two elements now). ``False`` when that cannot be told (the event history
+        is gone or names no process): the whole tree must be read again."""
+        stamps = []
+        for src, stamp in self._stamps:
+            if not src.alive:
+                return False
+            now = src.stamp()
+            if now != stamp:
+                dirty = src.dirty_since(stamp)
+                if dirty is None:
+                    return False
+                for j, node in enumerate(self.nodes):
+                    if j not in self._pids:
+                        self._pids[j] = src.pids_of(node)
+                    pids = self._pids[j]
+                    if pids is None or pids & dirty:
+                        self.entries[j] = _Entry(node, None, 0, (j,))
+            stamps.append((src, now))
+        self._stamps = stamps
+        return True
 
     def seed(self, roots: Sequence[AccessibleNode]) -> None:
         if not self.nodes:
@@ -1859,6 +1887,31 @@ class _TreeCache:
 
 
 _TREES = threading.local()  # per thread: COM nodes are used and released by the thread that read them
+_SOURCES: "weakref.WeakSet[Any]" = weakref.WeakSet()
+_SOURCES_LOCK = threading.Lock()
+
+
+def register_change_source(source: Any) -> None:
+    """Tell the shared selector trees which windows changed (backends with change events).
+
+    ``source`` has ``alive``, ``stamp() -> int``, ``dirty_since(stamp) -> set of pids or
+    None`` and ``pids_of(node) -> frozenset of pids or None``. Held weakly: keep a
+    reference for as long as it should be used.
+    """
+    with _SOURCES_LOCK:
+        _SOURCES.add(source)
+
+
+def _change_sources() -> List[Any]:
+    with _SOURCES_LOCK:
+        return [s for s in _SOURCES if getattr(s, "alive", False)]
+
+
+def release_trees() -> None:
+    """Free this thread's shared selector trees (they hold accessibility nodes -- COM
+    objects on Windows). Long-lived threads (an MCP worker) call it after each request;
+    the trees would otherwise stay referenced until the thread builds the next selector."""
+    _TREES.trees = []
 
 
 def _tree_cache(prefix_cache: List[Any], fresh: bool = False) -> _TreeCache:
@@ -1867,6 +1920,8 @@ def _tree_cache(prefix_cache: List[Any], fresh: bool = False) -> _TreeCache:
     now = time.monotonic()
     trees = [t for t in trees if now - t.born <= _TREE_TTL]  # expired trees are dropped
     tree = None if fresh else next((t for t in trees if t.owner is prefix_cache), None)
+    if tree is not None and not tree.revalidate():
+        tree = None
     if tree is None:
         trees = [t for t in trees if t.owner is not prefix_cache]
         tree = _TreeCache(prefix_cache, now)

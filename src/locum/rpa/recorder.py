@@ -291,6 +291,11 @@ def _escape_flow_strings(value: Any) -> Any:
 
 #: Environment variable that recorded flows/scripts read passwords from (typed text in
 #: password fields is never recorded).
+#: Marks a queued live-capture event that moves the focus (see ``Recorder._focus_events_queued``).
+_FOCUS_EVENT = object()
+#: pynput key names that move the focus to another field.
+_FOCUS_KEY_NAMES = frozenset({"tab", "enter"})
+
 PASSWORD_ENV = "LOCUM_PASSWORD"
 _PASSWORD_REF = "${env." + PASSWORD_ENV + "}"
 _PASSWORD_PY = f"os.environ[{PASSWORD_ENV!r}]"
@@ -654,8 +659,8 @@ class RecordedAction:
             return f"{var}.type({text}{mode}){note}"
         if k == "set_text":
             if self.selector:
-                return f"{var}.find({self.selector!r}).set_text({text})"
-            return f"{var}.click(({self.x}, {self.y})); {var}.hotkey('mod+a'); {var}.type({text})"
+                return f"{var}.find({self.selector!r}).set_text({text}){note}"
+            return f"{var}.click(({self.x}, {self.y})); {var}.hotkey('mod+a'); {var}.type({text}){note}"
         if k in ("invoke", "toggle", "select", "expand", "collapse"):
             if self.selector:
                 return f"{var}.find({self.selector!r}).{k}()"
@@ -720,6 +725,9 @@ class Recorder:
         self._pos: Optional[Tuple[int, int]] = None
         self._paste: Optional[str] = None  # text locum just put on the clipboard to paste
         self._pre_focus: Optional[Tuple[Any, str]] = None  # focus probe taken before a hooked type_text
+        # Live capture: focus-moving events (Tab, Enter, mouse down) queued but not yet processed.
+        self._focus_events_queued = 0
+        self._focus_events_lock = threading.Lock()
 
     # ----------------------------------------------------------------- plumbing
     @property
@@ -1019,6 +1027,12 @@ class Recorder:
     def _focus_probe(self) -> Tuple[Any, str]:
         """``(focused node, status)``; status is ``"plain"``, ``"password"`` or ``"unknown"``
         (no focus support, the query failed, nothing reported, or the field's state is unreadable)."""
+        if self._focus_events_queued > 0:
+            # Live capture lags: a Tab/Enter/click typed *after* the key being processed is
+            # still queued, so the focus now may already be the next field (a plain one,
+            # with the password still being processed). What was focused when this key was
+            # typed is unknown: fail closed.
+            return None, "unknown"
         try:
             node = self.backend.focused_element()
         except Exception as exc:
@@ -1242,6 +1256,14 @@ class Recorder:
         if probe is None:
             probe = self._focus_probe()
         if self._buffer and self._focus_moved(probe):
+            if self._buffer_target.get("secret"):
+                # A secret burst is never downgraded by a focus probe: with live capture the
+                # probe runs when the worker gets to this key, which can be after the user
+                # already moved on (typed the password fast, then Tab). Keys that move the
+                # focus (Tab, Enter, a click) end the burst from the event stream itself;
+                # a focus change without one (an auto-advancing field) keeps the rest secret.
+                self._buffer += text
+                return
             self._flush_typing()
         if not self._buffer:
             self._buffer_time = t
@@ -1297,9 +1319,13 @@ class Recorder:
             if sel is None and x is None:
                 _log.warning("cannot record %s on %r: no selector and no position", kind, element)
                 return None
+            status = _password_status(node) if kind == "set_text" else "plain"
+            # A field whose state cannot be read is secret like text typed with an unknown
+            # focus (``${env.LOCUM_SECRET}``, not the password variable): it may be anything.
+            unknown = status == "unknown" and not self.trust_unknown_focus
             action = RecordedAction(kind, time=self._clock(), x=x, y=y, selector=sel, element=self._describe(node),
-                                    text=text or "",
-                                    secret=kind == "set_text" and _password_status(node) != "plain")
+                                    text=text or "", secret=status == "password" or unknown,
+                                    secret_reason=UNKNOWN_FOCUS if unknown else "")
             return self._emit(action)
 
     def _install_action_listener(self) -> None:
@@ -1387,6 +1413,10 @@ class Recorder:
                 item = events.get()
                 if item is None:
                     return
+                if item[-1] is _FOCUS_EVENT:
+                    with rec._focus_events_lock:
+                        rec._focus_events_queued = max(0, rec._focus_events_queued - 1)
+                    item = item[:-1]
                 try:
                     if item[0] == "key":
                         ev = rec._pynput_event(item[1], item[2], item[3])
@@ -1401,15 +1431,29 @@ class Recorder:
         def on_move(x: Any, y: Any) -> None:
             events.put(("ev", {"event": "move", "x": x, "y": y, "time": rec._clock()}))
 
+        def queued_focus_event() -> None:
+            # Counted when it happens, on the hook thread, so that keys typed before it and
+            # processed later know the focus may already have moved on (see _focus_probe).
+            with rec._focus_events_lock:
+                rec._focus_events_queued += 1
+
         def on_click(x: Any, y: Any, button: Any, pressed: bool) -> None:
-            events.put(("ev", {"event": "down" if pressed else "up", "button": getattr(button, "name", str(button)),
-                               "x": x, "y": y, "time": rec._clock()}))
+            item: Tuple[Any, ...] = ("ev", {"event": "down" if pressed else "up", "button": getattr(button, "name", str(button)),
+                                            "x": x, "y": y, "time": rec._clock()})
+            if pressed:
+                queued_focus_event()
+                item += (_FOCUS_EVENT,)
+            events.put(item)
 
         def on_scroll(x: Any, y: Any, dx: Any, dy: Any) -> None:
             events.put(("ev", {"event": "scroll", "dx": dx, "dy": dy, "x": x, "y": y, "time": rec._clock()}))
 
         def on_press(key: Any) -> None:
-            events.put(("key", "key_down", key, rec._clock()))
+            item: Tuple[Any, ...] = ("key", "key_down", key, rec._clock())
+            if getattr(key, "name", None) in _FOCUS_KEY_NAMES:
+                queued_focus_event()
+                item += (_FOCUS_EVENT,)
+            events.put(item)
 
         def on_release(key: Any) -> None:
             events.put(("key", "key_up", key, rec._clock()))

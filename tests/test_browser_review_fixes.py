@@ -269,6 +269,9 @@ def _browser_name():
 
 @pytest.fixture(scope="module")
 def real_browser(tmp_path_factory):
+    from conftest import skip_unless_real_browser_allowed
+
+    skip_unless_real_browser_allowed()
     name = _browser_name()
     if name is None:
         pytest.skip("no Chromium-based browser installed")
