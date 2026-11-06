@@ -838,12 +838,18 @@ def observe(
     annotated_img = None
     scale = 1.0
     blanked = False
+    window_captured = False
     if screenshot:
         tw, th = fit_image_size(region.width, region.height, max_long_edge, max_visual_tokens)
         scale = tw / float(region.width) if region.width else 1.0
-        raw = desktop.screenshot(region)
+        raw = None
         if target_window is not None:
-            raw, blanked = _blank_other_windows(raw, backend, target_window, region)
+            raw = _capture_covered_window(target_window, region)
+            window_captured = raw is not None
+        if raw is None:
+            raw = desktop.screenshot(region)
+            if target_window is not None:
+                raw, blanked = _blank_other_windows(raw, backend, target_window, region)
         if raw.size != (tw, th):
             from PIL import Image as _PILImage
 
@@ -854,7 +860,8 @@ def observe(
         if annotate:
             from ..vision import annotate as _annotate
 
-            boxes = [(el.bounds, str(el.id)) for el in elements if not el.occluded]
+            # A window captured off-screen shows its covered elements too, so they get boxes.
+            boxes = [(el.bounds, str(el.id)) for el in elements if window_captured or not el.occluded]
             annotated_img = _annotate(shot, boxes, color=None, offset=(region.left, region.top), scale=scale) if boxes else shot.copy()
     shown_windows, shown_active = all_windows, active
     if target_window is not None:
@@ -899,8 +906,32 @@ def observe(
                          "keyboard input goes to that other window until this one is focused.")
     if blanked:
         obs.notes.append("Parts of this window covered by other windows are blanked out in the screenshot.")
+    if window_captured:
+        obs.notes.append("Other windows cover part of this window: the screenshot shows the window's own content "
+                         "(captured off-screen). A click at screenshot coordinates in a covered part would reach "
+                         "the window in front; act on element ids (they use the elements' own actions).")
     obs._ctx = ctx
     return obs
+
+
+def _capture_covered_window(window: Any, region: Rect) -> Any:
+    """The part ``region`` of ``window`` captured off-screen (its own content, not what covers it),
+    or ``None`` when the window is in plain view, the backend cannot capture windows, or the
+    capture fails / comes back blank / no longer matches ``region`` (the caller then grabs
+    the screen and blanks the covering windows out)."""
+    try:
+        if window.is_minimized or not window.is_covered():
+            return None
+        img, how = window._capture("auto")
+    except Exception:
+        return None
+    if how != "window":
+        return None
+    r = window.rect
+    if img.size != (r.width, r.height) or r.intersect(region) != region:
+        return None
+    x0, y0 = region.left - r.left, region.top - r.top
+    return img.crop((x0, y0, x0 + region.width, y0 + region.height))
 
 
 def _blank_other_windows(img: Any, backend: Any, window: Any, region: Rect) -> Tuple[Any, bool]:

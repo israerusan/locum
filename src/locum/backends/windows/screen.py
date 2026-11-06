@@ -96,6 +96,26 @@ def enable_dpi_awareness(api: Any = None) -> str:
         return mode
 
 
+def _bitmap_info(width: int, height: int) -> BITMAPINFO:
+    """A 32-bpp top-down ``BITMAPINFO`` (rows top to bottom, pixels as BGRX)."""
+    bmi = BITMAPINFO()
+    hdr = bmi.bmiHeader
+    hdr.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    hdr.biWidth = int(width)
+    hdr.biHeight = -int(height)  # negative = top-down rows
+    hdr.biPlanes = 1
+    hdr.biBitCount = 32
+    hdr.biCompression = BI_RGB
+    return bmi
+
+
+def _bgrx_image(width: int, height: int, raw: bytes) -> Any:
+    """RGB PIL image from 32-bpp top-down BGRX pixel data (a GDI DIB)."""
+    from PIL import Image
+
+    return Image.frombuffer("RGB", (int(width), int(height)), raw, "raw", "BGRX", 0, 1)
+
+
 class _MssHolder:
     """Thread-local owner of one mss grabber; its finalizer closes the grabber."""
 
@@ -194,8 +214,6 @@ class _ScreenMixin:
         return Image.frombuffer("RGB", (shot.width, shot.height), bytes(shot.bgra), "raw", "BGRX", 0, 1)
 
     def _grab_gdi(self, r: Rect) -> Any:
-        from PIL import Image
-
         a = self._api
         hdc_screen = a.GetDC(None)
         if not hdc_screen:
@@ -214,19 +232,12 @@ class _ScreenMixin:
                     raise self._error("BitBlt")
             finally:
                 a.SelectObject(hdc_mem, old)  # GetDIBits needs the bitmap deselected
-            bmi = BITMAPINFO()
-            hdr = bmi.bmiHeader
-            hdr.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            hdr.biWidth = r.width
-            hdr.biHeight = -r.height  # negative = top-down rows
-            hdr.biPlanes = 1
-            hdr.biBitCount = 32
-            hdr.biCompression = BI_RGB
+            bmi = _bitmap_info(r.width, r.height)
             buf = ctypes.create_string_buffer(r.width * r.height * 4)
             lines = a.GetDIBits(hdc_mem, hbm, 0, r.height, buf, ctypes.byref(bmi), DIB_RGB_COLORS)
             if int(lines) != r.height:
                 raise self._error("GetDIBits")
-            return Image.frombuffer("RGB", (r.width, r.height), buf.raw, "raw", "BGRX", 0, 1)
+            return _bgrx_image(r.width, r.height, buf.raw)
         finally:
             if hbm:
                 a.DeleteObject(hbm)

@@ -17,7 +17,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 
 from ._cancel import check as _cancel_check
-from .errors import ActionTimeout, ElementNotFound, NotSupported, WindowNotFound
+from .errors import ActionTimeout, BackendError, ElementNotFound, NotSupported, WindowNotFound
 from .types import Rect, RectLike, WindowInfo
 from .wait import wait_until
 
@@ -28,6 +28,9 @@ if TYPE_CHECKING:  # pragma: no cover
     from .element import Element
 
 __all__ = ["Window", "match_window"]
+
+#: :data:`locum.backends.base.CAP_WINDOW_CAPTURE` (not imported: importing locum.window loads no backend).
+_CAP_WINDOW_CAPTURE = "window_capture"
 
 TitleQuery = Union[str, "re.Pattern[str]", None]
 
@@ -280,15 +283,86 @@ class Window:
         r = self._after().rect  # current position, not the (possibly stale) snapshot's
         return self.set_rect(Rect(r.left, r.top, int(width), int(height)))
 
-    def screenshot(self) -> "Image":
-        """Capture the window's rectangle (clipped to the virtual screen).
+    #: Accepted values of :meth:`screenshot`'s ``mode``.
+    SCREENSHOT_MODES = ("auto", "screen", "window")
 
-        Raises :class:`WindowNotFound` if the window no longer exists (rather
-        than capturing whatever is now under its old rectangle).
+    def screenshot(self, mode: str = "auto", *, restore_minimized: bool = False) -> "Image":
+        """Capture the window.
+
+        Args:
+            mode: How to capture it:
+
+                * ``"screen"``: grab the window's rectangle from the screen
+                  (clipped to the virtual screen). Whatever covers the window
+                  shows; a minimized or entirely off-screen window raises
+                  :class:`NotSupported`. This was the only behaviour before 0.3.
+                * ``"window"``: render the window's own content off-screen
+                  (``PrintWindow`` on Windows, ``CGWindowListCreateImage`` on
+                  macOS, the composited pixmap on X11): covered and partly
+                  off-screen windows come out whole. Raises :class:`NotSupported`
+                  when the backend cannot, or the capture comes back blank (some
+                  GPU / UWP surfaces, a minimized window).
+                * ``"auto"`` (default): ``"screen"`` when the window is in plain
+                  view (nothing in front of it, entirely on the monitors), which
+                  is exact and cheap; otherwise ``"window"`` when the backend
+                  supports it (:data:`~locum.backends.base.CAP_WINDOW_CAPTURE`).
+                  A covered / partly off-screen window whose window capture fails
+                  falls back to the screen grab; a minimized one raises
+                  :class:`NotSupported`.
+            restore_minimized: For a minimized window whose capture comes back
+                blank: show it *without activating it* (no focus change; on
+                Windows ``SW_SHOWNOACTIVATE``), capture it and minimize it again.
+                The window flashes on screen for a moment, so this is opt-in.
+                Backends that cannot restore without activation raise
+                :class:`NotSupported` instead.
+
+        The image covers the window's whole rectangle in window mode, and the
+        on-screen part of it in screen mode.
+
+        Raises:
+            WindowNotFound: the window no longer exists (rather than capturing
+                whatever is now under its old rectangle).
+            NotSupported: see ``mode``.
+            ValueError: unknown ``mode``.
         """
+        return self._capture(mode, restore_minimized=restore_minimized)[0]
+
+    def _capture(self, mode: str = "auto", *, restore_minimized: bool = False) -> "tuple":
+        """:meth:`screenshot`, returning ``(image, how)`` with ``how`` in {"screen", "window"}."""
+        m = str(mode).strip().lower()
+        if m not in self.SCREENSHOT_MODES:
+            raise ValueError(f"Unknown screenshot mode {mode!r}; use one of {', '.join(self.SCREENSHOT_MODES)}")
         self.refresh()
+        if m == "screen":
+            return self._screen_grab(), "screen"
+        if m == "window":
+            return self._window_grab(restore_minimized), "window"
+        # auto
         if self.is_minimized:
-            raise NotSupported(f"Window {self.title!r} is minimized; restore it before taking a screenshot")
+            if not self._can_capture_window():
+                raise NotSupported(f"Window {self.title!r} is minimized; restore it before taking a screenshot "
+                                   f"(the {getattr(self.backend, 'name', '?')} backend cannot capture windows off-screen)")
+            return self._window_grab(restore_minimized), "window"
+        if self._in_plain_view() or not self._can_capture_window():
+            return self._screen_grab(), "screen"
+        try:
+            return self._window_grab(False), "window"
+        except NotSupported:
+            pass
+        except BackendError:
+            pass
+        return self._screen_grab(), "screen"
+
+    def _can_capture_window(self) -> bool:
+        try:
+            return bool(self.backend.has(_CAP_WINDOW_CAPTURE))
+        except Exception:
+            return False
+
+    def _screen_grab(self) -> "Image":
+        if self.is_minimized:
+            raise NotSupported(f"Window {self.title!r} is minimized; restore it before taking a screenshot "
+                               "(or use mode='window' / restore_minimized=True)")
         r = self.rect
         try:
             vs = self.backend.virtual_screen()
@@ -298,6 +372,53 @@ class Window:
         if clipped is None:
             raise NotSupported(f"Window {self.title!r} is entirely off-screen")
         return self.backend.screenshot(clipped)
+
+    def _window_grab(self, restore_minimized: bool) -> "Image":
+        if restore_minimized and self.is_minimized:
+            self._guard()  # the capture may show the window for a moment
+        img = self.backend.capture_window(self.handle, restore_minimized=bool(restore_minimized))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return img
+
+    def is_covered(self) -> bool:
+        """Whether another window (not one of this window's own dialogs / pop-ups) is in front of part of it."""
+        r = self.rect
+        try:
+            covers = list(self.backend.windows_above(self.handle))
+        except Exception:
+            return False
+        for c in covers:
+            hit = c.intersect(r)
+            if hit is not None and hit.width > 0 and hit.height > 0:
+                return True
+        return False
+
+    def is_on_screen(self) -> bool:
+        """Whether the window's whole rectangle lies on the monitors (not minimized, nothing off-screen)."""
+        if self.is_minimized:
+            return False
+        r = self.rect
+        if r.width <= 0 or r.height <= 0:
+            return False
+        try:
+            mons = [m.rect for m in self.backend.monitors()]
+        except Exception:
+            mons = []
+        if not mons:
+            try:
+                mons = [self.backend.virtual_screen()]
+            except Exception:
+                return True
+        seen = 0
+        for m in mons:
+            hit = m.intersect(r)
+            if hit is not None:
+                seen += hit.width * hit.height
+        return seen >= r.width * r.height
+
+    def _in_plain_view(self) -> bool:
+        return self.is_on_screen() and not self.is_covered()
 
     def wait_closed(self, timeout: Optional[float] = 10) -> bool:
         """Wait until the window disappears. Returns True; raises :class:`ActionTimeout` otherwise."""

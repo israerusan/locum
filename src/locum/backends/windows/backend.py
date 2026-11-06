@@ -20,11 +20,13 @@ from ..base import (
     CAP_MOUSE,
     CAP_SCREENSHOT,
     CAP_UNICODE_TYPING,
+    CAP_WINDOW_CAPTURE,
     CAP_WINDOWS,
     Backend,
 )
 from ._win32api import INPUT, _win32
 from .accessibility import _AccessibilityMixin
+from .capture import _CaptureMixin
 from .clipboard import _ClipboardMixin
 from .input import _Held, _InputMixin
 from .process import _ProcessMixin
@@ -36,6 +38,7 @@ from .windowing import _WindowsMixin
 class WindowsBackend(
     _InputMixin,
     _ScreenMixin,
+    _CaptureMixin,
     _WindowsMixin,
     _ProcessMixin,
     _ClipboardMixin,
@@ -141,6 +144,8 @@ class WindowsBackend(
         caps = {CAP_MOUSE, CAP_KEYBOARD, CAP_UNICODE_TYPING, CAP_SCREENSHOT, CAP_WINDOWS, CAP_CLIPBOARD, CAP_HSCROLL}
         if self._accessibility and self._uia_available():
             caps.add(CAP_ACCESSIBILITY)
+        if self._can_print_window():
+            caps.add(CAP_WINDOW_CAPTURE)
         return frozenset(caps)
 
     @property

@@ -171,8 +171,13 @@ def test_screenshot_clipped():
     be = MockBackend(width=400, height=300)
     d = StubDesktop(be)
     be.add_window("Edge", (300, 200, 200, 200))
-    assert d.window("Edge").screenshot().size == (100, 100)
+    assert d.window("Edge").screenshot(mode="screen").size == (100, 100)
+    assert d.window("Edge").screenshot().size == (200, 200)  # auto: partly off-screen -> window capture
     be.add_window("Gone", (500, 500, 50, 50))
+    with pytest.raises(NotSupported):
+        d.window("Gone").screenshot(mode="screen")
+    be.window_capture = False  # without window capture, auto behaves like the screen grab
+    assert d.window("Edge").screenshot().size == (100, 100)
     with pytest.raises(NotSupported):
         d.window("Gone").screenshot()
 

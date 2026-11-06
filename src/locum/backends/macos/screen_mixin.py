@@ -7,15 +7,20 @@ import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...errors import BackendError
+from ...errors import BackendError, NotSupported
 from ...types import Monitor, Point, Rect
 from .constants import (
     SCREEN_RECORDING_HELP,
     kCGNullWindowID,
+    kCGWindowImageBestResolution,
+    kCGWindowImageBoundsIgnoreFraming,
     kCGWindowImageDefault,
+    kCGWindowListOptionIncludingWindow,
     kCGWindowListOptionOnScreenOnly,
 )
+from ..base import is_blank_image
 from .displays import DisplayInfo, DisplayLayout, capture_plan
+from .windowing import _record_bounds
 
 
 class _ScreenMixin:
@@ -128,10 +133,52 @@ class _ScreenMixin:
                                         kCGNullWindowID, kCGWindowImageDefault)
         if img is None:
             raise BackendError("CGWindowListCreateImage returned no image. " + SCREEN_RECORDING_HELP)
+        return self._cgimage_to_pil(img)
+
+    def _cgimage_to_pil(self, img: Any) -> Any:
+        """RGB PIL image of a 32-bit BGRA/BGRX ``CGImage`` (alpha dropped)."""
+        from PIL import Image
+
+        q = self._q
         width, height = int(q.CGImageGetWidth(img)), int(q.CGImageGetHeight(img))
         bpr = int(q.CGImageGetBytesPerRow(img))
         data = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(img)))
         return Image.frombuffer("RGB", (width, height), data, "raw", "BGRX", bpr, 1)
+
+    def capture_window(self, handle: Any, *, restore_minimized: bool = False) -> Any:
+        """The window's own content (covered and off-screen parts included) via
+        ``CGWindowListCreateImage(kCGWindowListOptionIncludingWindow, id,
+        kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution)``,
+        scaled to the window's pixel rect.
+
+        A minimized window (or one on another Space) has no current image, and
+        macOS cannot show a window without activating its application, so
+        ``restore_minimized`` is not honoured: :class:`NotSupported` is raised.
+        """
+        from PIL import Image
+
+        rec = self._window_record(handle)  # WindowNotFound for an unknown id
+        num = int(rec.get("kCGWindowNumber", -1))
+        q = self._q
+        bounds = _record_bounds(rec)
+        area = getattr(q, "CGRectNull", None)
+        if area is None:
+            area = q.CGRectMake(*bounds)
+        img = q.CGWindowListCreateImage(area, kCGWindowListOptionIncludingWindow, num,
+                                        kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution)
+        on_screen = bool(rec.get("kCGWindowIsOnscreen", False))  # the key is left out for off-screen windows
+        why = ("it is minimized or on another Space (macOS keeps no current image of it and cannot show it "
+               "without activating its app" + ("; restore_minimized is not supported on macOS)" if restore_minimized else ")")
+               if not on_screen else "its image came back blank (Screen Recording permission missing?)")
+        if img is None:
+            raise NotSupported(f"Cannot capture window {handle!r} off-screen: {why}")
+        pil = self._cgimage_to_pil(img)
+        expected = self._get_layout().points_rect_to_pixels(*bounds)
+        if expected.width > 0 and expected.height > 0 and pil.size != (expected.width, expected.height):
+            pil = pil.resize((expected.width, expected.height), Image.BILINEAR)
+        if is_blank_image(pil):
+            raise NotSupported(f"Cannot capture window {handle!r} off-screen: {why}")
+        return pil
 
     def _warn_screen_recording(self) -> None:
         if self._warned_capture:

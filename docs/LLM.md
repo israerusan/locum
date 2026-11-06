@@ -38,7 +38,10 @@ png_b64 = obs.image_base64(annotated=True)     # numbered boxes drawn on every e
   and ≤ 4784 visual tokens of 28×28 px); every coordinate the model sends back
   is mapped to physical pixels with `Observation.to_screen`.
 * `observe(d, window="Invoice Entry*")` restricts the view (and the screenshot)
-  to one window; `interactive_only=False` adds labels and static text.
+  to one window; `interactive_only=False` adds labels and static text. When
+  other windows cover it, the screenshot shows the window's own content
+  (captured off-screen) where the backend can; otherwise the covering windows
+  are blanked out.
 
 From the shell: `locum observe --screenshot marks.png` prints exactly what
 the model will read and saves the annotated image.

@@ -201,8 +201,10 @@ SW_HIDE = 0
 SW_SHOWNORMAL = 1
 SW_SHOWMINIMIZED = 2
 SW_MAXIMIZE = 3
+SW_SHOWNOACTIVATE = 4
 SW_SHOW = 5
 SW_MINIMIZE = 6
+SW_SHOWMINNOACTIVE = 7
 SW_RESTORE = 9
 
 WM_CLOSE = 0x0010
@@ -223,6 +225,10 @@ SRCCOPY = 0x00CC0020
 CAPTUREBLT = 0x40000000
 BI_RGB = 0
 DIB_RGB_COLORS = 0
+PW_CLIENTONLY = 0x1
+PW_RENDERFULLCONTENT = 0x2  # Windows 8.1+: render through DWM (DirectX / Chromium / UWP content too)
+MONITOR_DEFAULTTONEAREST = 0x2
+DPI_AWARENESS_UNAWARE = 0
 
 DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE = -3
@@ -372,6 +378,13 @@ class _Win32:
             (u, "WindowFromPoint", HWND, [POINT]),
             (u, "GetAncestor", HWND, [HWND, UINT]),
             (u, "GetWindow", HWND, [HWND, UINT]),
+            # off-screen window capture
+            (u, "PrintWindow", BOOL, [HWND, HDC, UINT]),
+            (gdi32, "CreateDIBSection", HBITMAP, [HDC, P(BITMAPINFO), UINT, P(LPVOID), HANDLE, DWORD]),
+            (gdi32, "GdiFlush", BOOL, []),
+            (u, "MonitorFromWindow", HMONITOR, [HWND, DWORD]),
+            (u, "GetWindowDpiAwarenessContext", HANDLE, [HWND]),
+            (u, "GetAwarenessFromDpiAwarenessContext", INT, [HANDLE]),
         ]
         for dll, name, res, args in optional:
             setattr(self, name, _proto(dll, name, res, args, required=False))

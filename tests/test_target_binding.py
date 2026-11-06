@@ -249,6 +249,7 @@ def test_window_observe_shows_no_other_window(scene):
 
 def test_window_observe_blanks_windows_in_front(scene):
     be, d, chat, box, note, editor, _ = scene
+    be.window_capture = False  # the screen-grab path (a backend without off-screen window capture)
     pop = be.add_window("Secret", (100, 100, 200, 150), app="vault")  # in front of Notepad
     pop.add_button("Reveal", (110, 110, 80, 30))
     obs = observe(d, window="Notepad", screenshot=True)

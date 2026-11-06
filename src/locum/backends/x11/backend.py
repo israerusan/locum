@@ -23,6 +23,7 @@ from ..base import (
     CAP_MOUSE,
     CAP_SCREENSHOT,
     CAP_UNICODE_TYPING,
+    CAP_WINDOW_CAPTURE,
     CAP_WINDOWS,
 )
 from ._xcore import _ErrorSink, _abandon_display, _make_error_handler, _xlib
@@ -137,6 +138,8 @@ class X11Backend(_InputMixin, _ScreenMixin, _WindowsMixin, _ClipboardMixin, _Acc
             caps.add(CAP_CLIPBOARD)
         if self._atspi() is not None:
             caps.add(CAP_ACCESSIBILITY)
+        if self._has_composite():
+            caps.add(CAP_WINDOW_CAPTURE)
         return frozenset(caps)
 
     @property
