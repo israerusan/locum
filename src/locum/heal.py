@@ -352,6 +352,9 @@ def _targets(sel: Any) -> List[_Target]:
             elif isinstance(c, _HasTextCond) and not t.name:
                 t.name, t.name_partial = c.text, True
         if len(branch.steps) > 1 and branch.relative is None:
+            # Step 0 is an ancestor of the target or, after ``+``/``~``, a sibling of
+            # one of its ancestors (or of the target): either way it lies in the same
+            # top-level root, which is all the scope is used for.
             t.scope = branch.steps[0][1]
         out.append(t)
     return out
