@@ -187,6 +187,36 @@ def launch_program(command: Any) -> str:
     return tokens[0]
 
 
+def _unquoted_path_programs(command: Any) -> Tuple[List[str], Optional[str]]:
+    """Programs an unquoted path command with spaces may run, as Windows resolves it.
+
+    ``CreateProcess`` (and :func:`~locum.backends.windows.process.shell_launch_target`)
+    try each whitespace-delimited prefix of ``C:\\Program Files\\x\\app.exe -a`` in
+    turn (``C:\\Program``, ``C:\\Program Files\\x\\app.exe`` ...) and run the first
+    that exists (also with ``.exe`` appended). Returns ``(candidates, resolved)``:
+    the prefixes up to and including the first existing one, and that one (None
+    when none exists). Empty for quoted commands, lists, single tokens and
+    commands whose first token is not a path.
+    """
+    if not isinstance(command, str):
+        return [], None
+    cmd = command.strip()
+    if not cmd or cmd[0] in "\"'":
+        return [], None
+    parts = cmd.split(None, 1)
+    if len(parts) < 2 or not any(c in parts[0] for c in "\\/"):
+        return [], None
+    out: List[str] = []
+    for m in re.finditer(r"\s+|$", cmd):
+        prefix = cmd[:m.start()]
+        if not prefix or (out and out[-1] == prefix):
+            continue
+        out.append(prefix)
+        if os.path.isfile(prefix) or os.path.isfile(prefix + ".exe"):
+            return out, prefix
+    return out, None
+
+
 #: ``launch`` options that never change *which* program runs: guarded launches accept them.
 SAFE_LAUNCH_OPTIONS = frozenset({
     "wait_window", "timeout",                                   # Desktop.launch's own arguments
@@ -265,9 +295,22 @@ class _CardNumber:
 
     def search(self, text: str) -> Optional["re.Match[str]"]:
         text = str(text)
-        for m in self._IBAN.finditer(text):
-            if self._iban_ok(m.group(0)):
-                text = text[: m.start()] + "#" * (m.end() - m.start()) + text[m.end():]
+        pos = 0
+        while True:
+            m = self._IBAN.search(text, pos)
+            if m is None:
+                break
+            # The regex is greedy and also takes a following word ("... 31 EUR"): mask the
+            # longest prefix ending at a group boundary that is a valid IBAN.
+            s = m.group(0)
+            ends = [len(s)] + [i for i in range(len(s) - 1, 0, -1) if s[i] == " "]
+            for end in ends:
+                if self._iban_ok(s[:end]):
+                    text = text[: m.start()] + "#" * end + text[m.start() + end:]
+                    pos = m.start() + end
+                    break
+            else:
+                pos = m.start() + 1
         for m in self._RUN.finditer(text):
             # The whole run, or a card number next to other digit groups ("4111 1111 1111 1111 2027").
             groups = re.split(r"[ -]", m.group(0))
@@ -650,7 +693,10 @@ class AllowRule:
             command = ctx.get("command") or args.get("command") or ""
             text = " ".join(command) if isinstance(command, (list, tuple)) else str(command)
             program = launch_program(command)
-            if not (_glob_ci(" ".join(text.split()), self.command) or (program and _app_matches(program, [self.command]))):
+            candidates, resolved = _unquoted_path_programs(command)
+            programs = [resolved] if resolved is not None else [program] + candidates
+            if not (_glob_ci(" ".join(text.split()), self.command)
+                    or any(p and _app_matches(p, [self.command]) for p in programs)):
                 return False
         pressed = _pressed_combos(ctx)
         if self.keys:
@@ -1030,10 +1076,16 @@ class Policy:
                 whole = " ".join(command.split())
                 if " " in whole and not any(c in whole for c in "/\\\"'") and whole != program:
                     names.append(whole)
+            # An unquoted Windows path with spaces runs the first existing prefix, not the first
+            # token: every prefix it may run is checked against blocked_apps, and allowed_apps
+            # judges the one that exists (any candidate when none does yet).
+            candidates, resolved = _unquoted_path_programs(command)
+            names += [c for c in candidates if c not in names]
             for name in names:
                 if name and self.blocked_apps and _app_matches(name, self.blocked_apps):
                     raise PolicyViolation(f"Application {name!r} is blocked by the policy")
-            if self.allowed_apps is not None and not any(_app_matches(n, self.allowed_apps) for n in names):
+            judged = [resolved] if resolved is not None else names
+            if self.allowed_apps is not None and not any(_app_matches(n, self.allowed_apps) for n in judged):
                 raise PolicyViolation(
                     f"Launching {program or 'an unknown program'!r} is not allowed; allowed apps: {', '.join(self.allowed_apps)}"
                 )
@@ -1112,6 +1164,18 @@ class Policy:
                         except ValueError:
                             pass
             raise
+        if stamp is not None:
+            # The window starts when the action really runs, not when it was reserved: the
+            # time a human spent confirming must not count toward the sliding minute.
+            with self._lock:
+                ran = self._clock()
+                if ran != stamp:
+                    try:
+                        self._recent.remove(stamp)
+                    except ValueError:
+                        pass
+                    else:
+                        self._recent.append(ran)
 
     def _confirm_step(self, tool_name: str, args: Dict[str, Any], ctx: Dict[str, Any], confirm: Any) -> None:
         """The human-confirmation part of :meth:`check` (raises if declined)."""
@@ -1504,11 +1568,15 @@ class GuardedDesktop(_GuardedProxy):
             pass
 
     def _gate(self, tool: str, args: Dict[str, Any], ctx: Dict[str, Any], description: str, *,
-              count: bool = True, secret: bool = False) -> bool:
-        """Check the policy; ``True`` when the action may run (``False``: dry-run). Raises PolicyViolation."""
+              count: bool = True, secret: bool = False, log_args: Optional[Dict[str, Any]] = None) -> bool:
+        """Check the policy; ``True`` when the action may run (``False``: dry-run). Raises PolicyViolation.
+
+        ``log_args`` replaces ``args`` in the audit log (the policy still judges ``args``).
+        """
         ctx.setdefault("description", description)
         clean = {k: v for k, v in args.items() if v is not None}
-        logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in clean.items()}
+        shown = clean if log_args is None else {k: v for k, v in log_args.items() if v is not None}
+        logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in shown.items()}
         policy = self.policy
         try:
             policy.check(tool, clean, context=ctx, count=count, confirm=self.confirm)
@@ -1799,13 +1867,18 @@ class GuardedDesktop(_GuardedProxy):
         pieces = split_typed_text(text) or [""]
         first = pieces[0]
         ctx, secret = self._focus_ctx(activating=typed_text_activates(first), enter="\n" in first or "\r" in first)
-        shown = "***" if secret else (text if len(text) <= 60 else text[:57] + "...")
-        if not self._gate("type_text", {"text": text}, ctx, f"type {shown!r}", secret=secret):
+        # Only the first piece lands in the focused control; later pieces (after a Tab/newline)
+        # may land in a password field, so the log shows each piece in its own event.
+        logged = first if len(pieces) > 1 else text
+        shown = "***" if secret else (logged if len(logged) <= 60 else logged[:57] + "...")
+        part = f" (part 1 of {len(pieces)})" if len(pieces) > 1 else ""
+        if not self._gate("type_text", {"text": text}, ctx, f"type {shown!r}{part}", secret=secret,
+                          log_args={"text": logged}):
             return None
-        self._type_pieces(pieces, shown, interval=interval, mode=mode, first_done=False)
+        self._type_pieces(pieces, interval=interval, mode=mode, first_done=False)
         return None
 
-    def _type_pieces(self, pieces: List[str], shown: str, *, interval: float, mode: Optional[str],
+    def _type_pieces(self, pieces: List[str], *, interval: float, mode: Optional[str],
                      first_done: bool) -> None:
         raw = self._raw
         for i, piece in enumerate(pieces):
@@ -1813,7 +1886,8 @@ class GuardedDesktop(_GuardedProxy):
                 continue
             if i:  # a Tab/newline was typed: the rest may land in another control
                 ctx, secret = self._focus_ctx(activating=typed_text_activates(piece), enter="\n" in piece or "\r" in piece)
-                self._gate("type_text", {"text": piece}, ctx, f"type {'***' if secret else piece!r} (part of {shown!r})",
+                self._gate("type_text", {"text": piece}, ctx,
+                           f"type {'***' if secret else piece!r} (part {i + 1} of {len(pieces)})",
                            count=False, secret=secret)
             raw.type(piece, interval=interval, mode=mode)
 
@@ -1997,7 +2071,8 @@ class GuardedElement(_GuardedProxy):
     """An :class:`~locum.element.Element` whose actions are checked by its :class:`GuardedDesktop`'s policy."""
 
     def _act(self, tool: str, args: Dict[str, Any], description: str, *, activates: bool,
-             extra: Optional[Dict[str, Any]] = None, offset: Any = (0, 0)) -> bool:
+             extra: Optional[Dict[str, Any]] = None, offset: Any = (0, 0),
+             log_args: Optional[Dict[str, Any]] = None) -> bool:
         guard: GuardedDesktop = object.__getattribute__(self, "_g_guard")
         el = self.unwrapped
         ctx = guard._element_ctx(el, activates=activates, offset=_unwrap(offset) or (0, 0))
@@ -2006,7 +2081,7 @@ class GuardedElement(_GuardedProxy):
         from .._nodeinfo import is_password  # noqa: PLC0415
 
         what = ctx.get("target") or getattr(el, "selector", None) or el.role or "element"
-        return guard._gate(tool, args, ctx, f"{description} {what!r}", secret=is_password(el.node))
+        return guard._gate(tool, args, ctx, f"{description} {what!r}", secret=is_password(el.node), log_args=log_args)
 
     def click(self, button: str = "left", clicks: int = 1, **kw: Any) -> "GuardedElement":
         btn = str(getattr(button, "value", button)).lower()
@@ -2082,6 +2157,9 @@ class GuardedElement(_GuardedProxy):
     def type(self, text: str, **kw: Any) -> "GuardedElement":
         text = str(text)
         pieces = split_typed_text(text) or [""]
+        # Later pieces (after a Tab/newline) are logged in their own events: they may land in a
+        # password field.
+        logged = {"text": pieces[0] if len(pieces) > 1 else text}
         enter = "\n" in pieces[0] or "\r" in pieces[0]
         extra = None
         if enter:
@@ -2102,16 +2180,15 @@ class GuardedElement(_GuardedProxy):
             from .._nodeinfo import is_password  # noqa: PLC0415
 
             ok = guard._gate("type_text", {"text": text}, ctx, f"type into {ctx['target']!r}",
-                             secret=is_password(self.unwrapped.node))
+                             secret=is_password(self.unwrapped.node), log_args=logged)
         else:
-            ok = self._act("type_text", {"text": text}, "type into", activates=True)
+            ok = self._act("type_text", {"text": text}, "type into", activates=True, log_args=logged)
         if not ok:
             return self
         self.unwrapped.type(pieces[0], **kw)
         if len(pieces) > 1:
             guard = object.__getattribute__(self, "_g_guard")
-            guard._type_pieces(pieces, text if len(text) <= 60 else text[:57] + "...",
-                               interval=float(kw.get("interval", 0.0) or 0.0), mode=kw.get("mode"), first_done=True)
+            guard._type_pieces(pieces, interval=float(kw.get("interval", 0.0) or 0.0), mode=kw.get("mode"), first_done=True)
         return self
 
     def press(self, *keys: Any, **kw: Any) -> "GuardedElement":

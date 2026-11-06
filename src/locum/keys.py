@@ -137,6 +137,10 @@ def parse_hotkey(combo: Union[str, Sequence[str]]) -> List[str]:
         elif "+" in s:
             raw = combo.lstrip().split("+")
             parts = []
+
+            def _blank(j: int) -> bool:
+                return 0 <= j < len(raw) and raw[j].strip() == "" and raw[j] not in ("\n", "\r", "\t")
+
             for i, p in enumerate(raw):
                 if p in ("\n", "\r", "\t"):
                     # "ctrl+\n" -> ctrl+enter, "alt+\t" -> alt+tab
@@ -145,7 +149,11 @@ def parse_hotkey(combo: Union[str, Sequence[str]]) -> List[str]:
                     # "ctrl+ " -> ctrl+space (the trailing space *is* the key)
                     parts.append(" ")
                 elif p.strip() == "":
-                    # "ctrl++" -> ['ctrl', '', ''] ; collapse to a single '+'
+                    # "ctrl++" -> ['ctrl', '', ''] ; collapse to a single '+'.
+                    # A lone empty piece ("ctrl+", "+ctrl") is a missing key, not
+                    # '+': reject it like "ctrl-" instead of pressing Ctrl+'+'.
+                    if not (_blank(i - 1) or _blank(i + 1)):
+                        raise ValueError(f"Empty key in hotkey: {combo!r}")
                     if not parts or parts[-1] != "+":
                         parts.append("+")
                 else:
@@ -158,6 +166,14 @@ def parse_hotkey(combo: Union[str, Sequence[str]]) -> List[str]:
             # "caps-lock" are single multi-word key names: split first and fall
             # back to the whole string when a piece is not a key on its own.
             parts = s.split() if " " in s else s.split("-")
+            if " " in s and parts[0].lower() not in MODIFIERS and _ALIASES.get(parts[0].lower()) not in MODIFIERS:
+                # A whole spaced name ("Left Shift", "Play Pause") wins over
+                # splitting its words into a chord, matching normalize_key.
+                # A leading modifier ("shift left") stays a chord.
+                ku = re.sub(r"\s+", "_", s.lower()).replace("-", "_")
+                kj = ku.replace("_", "")
+                if ku in KEYS or ku in _ALIASES or kj in KEYS or kj in _ALIASES:
+                    return [normalize_key(s)]
             try:
                 for p in parts:
                     if p.strip().lower() not in ("primary", "mod", "cmdorctrl", "commandorcontrol", "plus", "minus"):

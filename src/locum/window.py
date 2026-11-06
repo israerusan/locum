@@ -297,13 +297,14 @@ class Window:
 
     def wait_closed(self, timeout: Optional[float] = 10) -> bool:
         """Wait until the window disappears. Returns True; raises :class:`ActionTimeout` otherwise."""
+        t = _default_timeout(self.desktop, timeout)
         wait_until(
             # _lookup (not the error-swallowing ``exists``) so transient backend
             # errors are retried and fatal ones propagate instead of reading as "closed".
             lambda: self._lookup() is None,
-            _default_timeout(self.desktop, timeout),
+            t,
             _desktop_interval(self.desktop),
-            message=f"Window {self.title!r} still open after {timeout}s",
+            message=f"Window {self.title!r} still open after {t:g}s",
             ignore_exceptions="transient",
             sleep=_desktop_sleep(self.desktop),
             clock=_desktop_clock(self.desktop),
@@ -319,10 +320,22 @@ class Window:
                     return r
             except Exception:
                 continue
+        # Title fallback, for roots whose handle the backend cannot relate to a window.
+        # A root that carries the handle of *another* listed window is that window,
+        # never this one: a closed "Untitled - Notepad" must not resolve to the other
+        # open "Untitled - Notepad" (finds and clicks would land in the wrong app).
+        try:
+            live = {w.handle for w in self.backend.list_windows() if w.handle is not None}
+        except Exception:
+            live = set()
         for r in roots:
             try:
-                if r.name == self.title:
-                    return r
+                if r.name != self.title:
+                    continue
+                h = r.handle
+                if h is not None and h != self.handle and h in live:
+                    continue
+                return r
             except Exception:
                 continue
         return None

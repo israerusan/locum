@@ -18,6 +18,7 @@ screen pixels before acting.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -37,6 +38,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from PIL.Image import Image
 
     from ..desktop import Desktop
+
+_log = logging.getLogger(__name__)
 
 TOOLSET_TYPE = "computer_toolset_20260801"
 TOOLSET_NAME = "computer"
@@ -311,7 +314,17 @@ class ComputerUseAdapter:
             event["image"] = bool(result.image_base64)
         if error:
             event["error"] = error
-        self.audit.record(event)
+        try:
+            self.audit.record(event)
+        except Exception as exc:  # noqa: BLE001 - never turn a performed action into an error
+            # The action already happened (or was refused): reporting the audit failure
+            # as an error would invite a retry -- a second payment.
+            _log.error("Audit log write failed for computer action %r: %s", action, exc)
+            if result is not None:
+                result.text = (result.text or "OK") + (
+                    f"\n[AUDIT LOG WRITE FAILED: {type(exc).__name__}: {exc}. The action above was "
+                    "performed (or refused) as reported; do not repeat it.]"
+                )
 
     # -------------------------------------------------------------- dispatch
     def _context(self, points: Sequence[Point] = (), *, activates: bool = False, **extra: Any) -> Dict[str, Any]:

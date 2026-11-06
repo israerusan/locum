@@ -294,6 +294,8 @@ class RecordedAction:
         secret: ``type``/``set_text`` into a password field: the text is not kept;
             the flow reads it from ``${env.LOCUM_PASSWORD}`` and the script from
             ``os.environ["LOCUM_PASSWORD"]`` (:data:`PASSWORD_ENV`).
+        mode: ``type`` only: ``"clipboard"`` for text locum pasted that holds a
+            Tab/newline, so the replay pastes it too instead of pressing those keys.
     """
 
     kind: str
@@ -313,6 +315,7 @@ class RecordedAction:
     keys: List[str] = field(default_factory=list)
     presses: int = 1
     secret: bool = False
+    mode: str = ""
     _last_time: float = field(default=0.0, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -333,6 +336,8 @@ class RecordedAction:
             d["text"] = self.text
             if self.secret:
                 d["secret"] = True
+            if self.mode and self.kind == "type":
+                d["mode"] = self.mode
         elif self.kind == "press":
             d.update(keys=list(self.keys), presses=self.presses)
         elif self.kind == "hotkey":
@@ -404,8 +409,14 @@ class RecordedAction:
             return {"scroll": args}
         if k == "type":
             if self.selector:
-                return {"type": {"text": self.text, "into": self.selector}}
-            return {"type": self.text}
+                args = {"text": self.text, "into": self.selector}
+            elif self.mode:
+                args = {"text": self.text}
+            else:
+                return {"type": self.text}
+            if self.mode:
+                args["mode"] = self.mode
+            return {"type": args}
         if k == "set_text":
             return {"set_text": {"target": self._flow_target(), "text": self.text}}
         if k in ("invoke", "toggle", "select", "expand", "collapse"):
@@ -444,9 +455,10 @@ class RecordedAction:
             return f"{var}.scroll({self.dy}{dx}, at={at})"
         text = _PASSWORD_PY if self.secret else repr(self.text)
         if k == "type":
+            mode = f", mode={self.mode!r}" if self.mode else ""
             if self.selector:
-                return f"{var}.find({self.selector!r}).type({text})"
-            return f"{var}.type({text})"
+                return f"{var}.find({self.selector!r}).type({text}{mode})"
+            return f"{var}.type({text}{mode})"
         if k == "set_text":
             if self.selector:
                 return f"{var}.find({self.selector!r}).set_text({text})"
@@ -893,6 +905,15 @@ class Recorder:
                 # clipboard holds at replay time.
                 for m in self._mods:
                     self._mods[m] = True
+                if any(c in text for c in ("\t", "\n", "\r")):
+                    # Typed as keys on replay, a pasted Tab/newline would move the focus
+                    # or press Enter: record it as its own pasted ``type`` step.
+                    self._flush_typing()
+                    target = self._capture_focus()
+                    self._emit(RecordedAction("type", time=t, text=text, selector=target.get("selector"),
+                                              element=target.get("element"), secret=bool(target.get("secret")),
+                                              mode="clipboard"))
+                    return
                 self._append_text(text, t)
                 return
         held = set(self._mods)

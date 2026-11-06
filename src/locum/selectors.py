@@ -1381,7 +1381,10 @@ def _dict_compound(d: Dict[str, Any]) -> _Compound:
         if key in ("within", "child_of", "parent", "ancestor"):
             continue
         if key in ("nth", "index"):
-            nth = int(val)
+            try:
+                nth = int(val)
+            except (TypeError, ValueError):
+                raise SelectorSyntaxError(f"Dict selector key {key!r} needs an integer, got {val!r}") from None
             continue
         if key in ("has_text", "contains_text"):
             comp.conds.append(_HasTextCond(str(val)))
@@ -1426,7 +1429,9 @@ def _dict_compound(d: Dict[str, Any]) -> _Compound:
         if isinstance(val, re.Pattern):
             op = "~="
             ci = ci or bool(val.flags & re.I)
-            val = val.pattern
+            # Keep the other flags as inline flags (re.U is the default for str patterns).
+            inline = "".join(c for f, c in ((re.A, "a"), (re.M, "m"), (re.S, "s"), (re.X, "x")) if val.flags & f)
+            val = (f"(?{inline})" if inline else "") + val.pattern
         if ckey == "role" and op == "=" and comp.role is None and not ci and val is not None:
             comp.role = _norm_role(str(val))
             continue
@@ -1530,9 +1535,25 @@ def parse(selector: Union[str, Dict[str, Any], Selector]) -> Selector:
 _LONG_NAME = 80
 
 
+def _role_head(role: str) -> str:
+    """Selector head matching the (lower-cased) ``role`` exactly.
+
+    ``parse`` rewrites role aliases (``label`` -> ``text``, ``input`` -> ``edit``),
+    also in ``[role=...]``; a node whose role *is* such a spelling gets a test
+    that is not normalised (a glob without wildcards, or an anchored regex).
+    """
+    if not role:
+        return "*"
+    if _norm_role(role) != role:
+        if "*" in role or "?" in role:
+            return f"*[role~={quote('^' + re.escape(role) + '$')}]"
+        return f"*[role%={quote(role)}]"
+    return role if _IDENT_RE.match(role) else f"*[role={quote(role)}]"
+
+
 def _compound_for(node: AccessibleNode, *, use_id: bool = True, use_class: bool = False) -> str:
     role = (_safe(lambda: node.role, "") or "").lower()
-    head = role if _IDENT_RE.match(role) else ("*" if not role else f"*[role={quote(role)}]")
+    head = _role_head(role)
     aid = _safe(lambda: node.automation_id, "") or ""
     name = _safe(lambda: node.name, "") or ""
     out = head
@@ -1738,7 +1759,7 @@ def _selector_below(node: AccessibleNode, chain: Sequence[AccessibleNode], top_s
         role = (_safe(lambda: child.role, "") or "").lower() or "*"
         same_role = [k for k in kids if (_safe(lambda: k.role, "") or "").lower() == role]
         pos = next((j for j, k in enumerate(same_role) if _same(k, child)), 0)
-        parts.append(f"> {role if _IDENT_RE.match(role) else '*'}:nth({pos})")
+        parts.append(f"> {_role_head('' if role == '*' else role)}:nth({pos})")
     return " ".join(parts)
 
 

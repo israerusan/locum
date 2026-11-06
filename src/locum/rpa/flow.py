@@ -713,7 +713,9 @@ class FlowRunner:
         self.logger.log(lvl, "[%s] %s", path or self.report.name, message, extra={"locum": record})
 
     def _timeout(self, args: Mapping[str, Any], step: Mapping[str, Any], scope: _Scope, default: Optional[float] = None) -> Optional[float]:
-        for source in (args.get("timeout"), step.get("timeout"), scope.settings.get("timeout")):
+        # ``args`` is already interpolated; the step-level and settings timeouts are not.
+        for source in (args.get("timeout"), interpolate(step.get("timeout"), self.vars),
+                       interpolate(scope.settings.get("timeout"), self.vars)):
             if source is not None and source != "":
                 try:
                     return float(source)
@@ -1360,7 +1362,11 @@ class FlowRunner:
                     self.log(f"attempt {attempt}/{attempts} failed ({type(exc).__name__}: {exc}); retrying in {delay:g}s",
                              level="warning", path=path)
                     if delay > 0:
-                        self.desktop.sleep(delay)
+                        try:
+                            self.desktop.sleep(delay)
+                        except BaseException as stop:  # abort / Ctrl+C during the retry wait: the step failed
+                            self._finalize_failure(result, stop, t0, screenshot=False)
+                            raise
                     continue
                 break
         assert last is not None

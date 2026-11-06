@@ -88,9 +88,16 @@ class Mouse:
         except Exception:
             return None
 
-    def _travel(self, target: Point, duration: Optional[float], tween: Any, humanize: HumanizeArg) -> Point:
-        """Move to ``target`` without the trailing pause (shared by move/click/drag)."""
-        self._check()
+    def _travel(
+        self, target: Point, duration: Optional[float], tween: Any, humanize: HumanizeArg,
+        ignore: Optional[Point] = None,
+    ) -> Point:
+        """Move to ``target`` without the trailing pause (shared by move/click/drag).
+
+        ``ignore`` is a point the cursor was just moved to by this same action
+        (drag's start), so a corner there does not self-trigger the fail-safe.
+        """
+        self._check(ignore=ignore)
         h = self._resolve_humanize(humanize)
         start = self.backend.mouse_position()
         if duration is None:
@@ -287,8 +294,9 @@ class Mouse:
         """
         btn = MouseButton.coerce(button)
         h = self._resolve_humanize(humanize)
+        at: Optional[Point] = None
         if start is not None:
-            self._travel(self._point(start), None if h is not None else 0.0, tween, h if h is not None else False)
+            at = self._travel(self._point(start), None if h is not None else 0.0, tween, h if h is not None else False)
         else:
             self._check()
         target = self._point(end)
@@ -298,7 +306,8 @@ class Mouse:
             down = True
             if hold > 0:
                 self._sleep(hold)
-            self._travel(target, duration, tween, h if h is not None else False)
+            # The cursor sits where *we* put it (a corner start must not self-trigger).
+            self._travel(target, duration, tween, h if h is not None else False, ignore=at)
             if hold > 0:
                 self._sleep(hold)
         except BaseException as exc:

@@ -183,9 +183,19 @@ def test_element_root_by_handle_then_title(env):
     root = w.element
     assert isinstance(root, Element)
     assert root.role == "window" and root.name == "Editor - doc.txt"
-    # a WindowInfo whose handle is unknown falls back to title matching
+    # a WindowInfo whose handle is unknown never borrows another live window's root by
+    # title (a closed window would otherwise act on a same-titled other window) ...
     ghost = Window(WindowInfo(handle=-1, title="Back", rect=Rect(0, 0, 1, 1)), d)
-    assert ghost.element.name == "Back"
+    with pytest.raises(ElementNotFound):
+        _ = ghost.element
+    # ... but a root the backend cannot relate to any window (no handle) still matches by title
+    back_root = next(r for r in be.accessibility_roots() if r.name == "Back")
+    real_handle = type(back_root).handle
+    try:
+        type(back_root).handle = property(lambda self: None)
+        assert ghost.element.name == "Back"
+    finally:
+        type(back_root).handle = real_handle
     nowhere = Window(WindowInfo(handle=-2, title="Nope", rect=Rect(0, 0, 1, 1)), d)
     with pytest.raises(ElementNotFound):
         _ = nowhere.element

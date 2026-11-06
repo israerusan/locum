@@ -432,7 +432,10 @@ class _WindowsMixin:
             if ax.attr(win, "AXFullScreen"):
                 ax.set_attr(win, "AXFullScreen", False)
             saved = self._restore_rects.pop(handle, None)
-            if saved is not None:
+            frame = self._ax_frame(win)
+            if saved is not None and (frame is None or self._is_maximized(frame)):
+                # only while it is still at our maximized frame: a window the user
+                # (or the app) has since moved/resized is already normal
                 ax.set_point(win, "AXPosition", saved[0], saved[1])
                 ax.set_size(win, "AXSize", saved[2], saved[3])
                 return

@@ -46,12 +46,17 @@ def shell_launch_target(command: str) -> Optional[Tuple[str, str]]:
     else:
         # Like CreateProcess with an unquoted path: try each whitespace-delimited
         # prefix ("C:\Program", "C:\Program Files\app.exe", ...) as the program.
-        for m in re.finditer(r"\s+", cmd):
-            prefix = cmd[:m.start()]
+        # With spaces, the whole command (no arguments) is the last candidate:
+        # "C:\Program Files\App\app" -> app.exe, as CreateProcess does.
+        splits = [(m.start(), m.end()) for m in re.finditer(r"\s+", cmd)]
+        if splits:
+            splits.append((len(cmd), len(cmd)))
+        for start, end in splits:
+            prefix = cmd[:start]
             if os.path.isfile(prefix) or os.path.isfile(prefix + ".exe"):
                 if not os.path.isfile(prefix) or prefix.lower().endswith(_PROGRAM_EXTS):
                     return None
-                return prefix, cmd[m.end():]
+                return prefix, cmd[end:]
         parts = cmd.split(None, 1)
         file, params = parts[0], (parts[1] if len(parts) > 1 else "")
     if not file:

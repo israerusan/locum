@@ -52,17 +52,18 @@ class _AccessibilityMixin:
             pid, title, bounds = node.pid, node.name, node.bounds
             wins = windows()
             same_pid = [w for w in wins if pid and w.pid == pid]
+            # a known pid never matches another process's window (as in owning_window)
+            candidates = same_pid or ([w for w in wins if not w.pid] if pid else wins)
             for w in same_pid:
                 if title and w.title == title:
                     return w.handle
             if bounds is not None:
-                pool = same_pid or wins
-                best = max(pool, key=lambda w: w.rect.iou(bounds), default=None)
+                best = max(candidates, key=lambda w: w.rect.iou(bounds), default=None)
                 if best is not None and best.rect.iou(bounds) > 0.5:
                     return best.handle
             if len(same_pid) == 1:
                 return same_pid[0].handle
-            for w in wins:
+            for w in candidates:
                 if title and w.title == title:
                     return w.handle
             return None

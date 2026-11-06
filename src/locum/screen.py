@@ -174,7 +174,11 @@ class Screen:
         if p.parent and not p.parent.exists():
             p.parent.mkdir(parents=True, exist_ok=True)
         img = self.capture(region, monitor=monitor)
-        if p.suffix:
+        from PIL import Image
+
+        # "shot_10.30.45" / "invoice.v2": a dot suffix that is not an image
+        # extension means "no format given", so it is PNG too.
+        if p.suffix and p.suffix.lower() in Image.registered_extensions():
             img.save(str(p))
         else:
             img.save(str(p), format="PNG")

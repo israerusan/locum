@@ -214,10 +214,28 @@ class Observation:
     scale: float
     annotated: Optional["Image"]
     region: Rect = field(default_factory=lambda: Rect(0, 0, 0, 0))
-    # Desktop roots and prefix cache from observe(): selectors built later (add_element,
-    # refresh) are proven unique among all windows, not only inside their own.
-    _roots: Optional[List[AccessibleNode]] = field(default=None, init=False, repr=False, compare=False)
-    _prefix_cache: Optional[List[Any]] = field(default=None, init=False, repr=False, compare=False)
+    # Live desktop roots + prefix cache from observe(): selectors built later (lazily,
+    # add_element, refresh) are proven unique among all windows, not only inside their own.
+    _ctx: Optional["_SelectorContext"] = field(default=None, init=False, repr=False, compare=False)
+
+    # Older spelling (an Observation built by hand, e.g. by the toolkit before any observe):
+    # setting the roots gives a context that cannot re-read them from a backend.
+    @property
+    def _roots(self) -> Optional[List[AccessibleNode]]:
+        return self._ctx.roots if self._ctx is not None else None
+
+    @_roots.setter
+    def _roots(self, roots: Optional[List[AccessibleNode]]) -> None:
+        self._ctx = _SelectorContext(None, list(roots) if roots else None)
+
+    @property
+    def _prefix_cache(self) -> Optional[List[Any]]:
+        return self._ctx.cache if self._ctx is not None else None
+
+    @_prefix_cache.setter
+    def _prefix_cache(self, cache: Optional[List[Any]]) -> None:
+        if self._ctx is not None and cache is not None:
+            self._ctx.cache = cache
 
     # ----------------------------------------------------------------- mapping
     @property
@@ -279,7 +297,7 @@ class Observation:
         (a calculator display still reading "0" after the result came in)."""
         for el in self.elements:
             if _same(el.node, node):
-                _refresh(el, node, self._roots, self._prefix_cache)
+                _refresh(el, node, self._ctx)
                 return el
         b = _safe(lambda: node.bounds)
         next_id = max((e.id for e in self.elements), default=0) + 1
@@ -293,7 +311,7 @@ class Observation:
             selector=selector or LAZY_SELECTOR,
             node=node,
             _selector_source=None if selector else (
-                lambda n=node, r=self._roots, c=self._prefix_cache: _selector(n, r, c)),
+                lambda n=node, c=self._ctx: _selector_in(n, c)),
         )
         self.elements.append(entry)
         return entry
@@ -396,9 +414,7 @@ def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
         return False
 
 
-def _refresh(el: ObservedElement, node: AccessibleNode,
-             roots: Optional[Sequence[AccessibleNode]] = None,
-             prefix_cache: Optional[List[Any]] = None) -> None:
+def _refresh(el: ObservedElement, node: AccessibleNode, ctx: Optional["_SelectorContext"] = None) -> None:
     """Update ``el``'s description fields from the live ``node`` (id unchanged).
 
     A field that can no longer be read keeps its old value. When the name changes, a
@@ -414,7 +430,7 @@ def _refresh(el: ObservedElement, node: AccessibleNode,
         if name != el.name and el.selector_ready and (el.selector or el._selector_source is not None):
             del el.__dict__["selector"]
             if el._selector_source is None:
-                el._selector_source = lambda n=node, r=roots, c=prefix_cache: _selector(n, r, c)
+                el._selector_source = lambda n=node, c=ctx: _selector_in(n, c)
         el.name = name
     raw = _safe(lambda: node.value, missing)
     if raw is not missing:
@@ -437,6 +453,56 @@ def _selector(node: AccessibleNode, roots: Optional[Sequence[AccessibleNode]] = 
         return selector_for(node, roots=roots, prefix_cache=prefix_cache)
     except Exception:
         return _safe(lambda: describe_node(node, include_bounds=False), "") or ""
+
+
+def _root_key(root: AccessibleNode) -> Tuple[Any, ...]:
+    return (_safe(lambda: root.handle), _safe(lambda: root.role), _safe(lambda: root.name),
+            _safe(lambda: root.automation_id))
+
+
+class _SelectorContext:
+    """Search roots and prefix cache for an observation's (lazily built) selectors.
+
+    Selectors are built after ``observe`` returns (on first ``.selector`` access, or by
+    ``add_element`` from ``find_elements`` / ``wait_for``), when windows may have opened,
+    closed or been retitled. Each build therefore proves uniqueness against the *live*
+    roots, and the shared prefix cache (valid only while the windows have not changed)
+    is dropped whenever the roots differ from the ones it was filled for.
+    """
+
+    def __init__(self, backend: Any, roots: Optional[List[AccessibleNode]]) -> None:
+        self.backend = backend
+        self.roots = roots
+        self.sig = self._sig(roots)
+        self.cache: List[Any] = []
+
+    @staticmethod
+    def _sig(roots: Optional[Sequence[AccessibleNode]]) -> Optional[List[Tuple[Any, ...]]]:
+        return None if roots is None else [_root_key(r) for r in roots]
+
+    def current(self) -> Tuple[Optional[List[AccessibleNode]], List[Any]]:
+        if self.backend is None:
+            return self.roots, self.cache
+        try:
+            live: Optional[List[AccessibleNode]] = list(self.backend.accessibility_roots()) or None
+        except Exception:
+            live = self.roots  # cannot re-read: keep the observe-time roots
+        else:
+            sig = self._sig(live)
+            changed = (sig != self.sig or live is None or self.roots is None or len(live) != len(self.roots)
+                       or not all(_same(a, b) for a, b in zip(live, self.roots)))
+            if changed:
+                self.roots, self.sig, self.cache = live, sig, []
+            else:
+                self.roots = live
+        return self.roots, self.cache
+
+
+def _selector_in(node: AccessibleNode, ctx: Optional[_SelectorContext]) -> str:
+    if ctx is None:
+        return _selector(node)
+    roots, cache = ctx.current()
+    return _selector(node, roots, cache)
 
 
 def _is_interactive(node: AccessibleNode) -> bool:
@@ -531,11 +597,21 @@ def observe(
     front: List[Tuple[Any, Rect]] = [(w.handle, w.rect) for w in all_windows if w.is_visible and not w.is_minimized]
     z_index = {h: i for i, (h, _) in enumerate(front)}
     titles = {w.handle: w for w in all_windows}
+    # Walk in window Z-order (front-most first) whatever order the backend lists roots in
+    # (AT-SPI: application order). Roots of unlisted windows (e.g. pop-up menus) keep their slots.
+    zs = [_safe(lambda: z_index.get(_safe(lambda: r.handle))) for r in roots]
+    slots = [i for i, z in enumerate(zs) if z is not None]
+    if slots:
+        ordered = sorted(slots, key=lambda k: zs[k])
+        picked = [roots[k] for k in ordered]
+        roots = list(roots)
+        for i, r in zip(slots, picked):
+            roots[i] = r
 
     elements: List[ObservedElement] = []
     # One per observation: elements of the same window share the (expensive) proof that
-    # the window's selector prefix is unique on the desktop.
-    prefix_cache: List[Any] = []
+    # the window's selector prefix is unique on the desktop (while the windows are unchanged).
+    ctx = _SelectorContext(backend, all_roots)
     limit = max(0, int(max_elements))
     for root in roots:
         if len(elements) >= limit:
@@ -578,7 +654,7 @@ def observe(
                     node=node,
                     window_title=win_title,
                     app=app,
-                    _selector_source=(lambda n=node, r=all_roots: _selector(n, r, prefix_cache))
+                    _selector_source=(lambda n=node: _selector_in(n, ctx))
                     if selectors else None,
                 )
             )
@@ -614,8 +690,7 @@ def observe(
         annotated=annotated_img,
         region=region,
     )
-    obs._roots = all_roots
-    obs._prefix_cache = prefix_cache
+    obs._ctx = ctx
     return obs
 
 

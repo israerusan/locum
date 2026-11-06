@@ -220,13 +220,20 @@ def _clamp_point(x: float, y: float, bounds: Optional[Rect]) -> Tuple[float, flo
     )
 
 
-def _finalize(raw: Sequence[Tuple[float, float, float]], end: Point, duration: float, bounds: Optional[Rect]) -> List[Tuple[Point, float]]:
-    """Round to pixels, drop consecutive duplicates and pin the last waypoint to ``end`` at ``duration``."""
+def _finalize(
+    raw: Sequence[Tuple[float, float, float]], end: Point, duration: float, bounds: Optional[Rect],
+    start: Optional[Point] = None,
+) -> List[Tuple[Point, float]]:
+    """Round to pixels, drop consecutive duplicates and pin the last waypoint to ``end`` at ``duration``.
+
+    Leading samples that round back onto the ``start`` pixel are dropped too, so
+    the path never begins with a no-op step to where the cursor already is.
+    """
     out: List[Tuple[Point, float]] = []
     for x, y, t in raw:
         x, y = _clamp_point(x, y, bounds)
         p = Point(int(round(x)), int(round(y)))
-        if out and out[-1][0] == p:
+        if (out[-1][0] if out else start) == p:
             continue
         out.append((p, max(0.0, min(duration, t))))
     if out and out[-1][0] == end:
@@ -269,6 +276,7 @@ def plan_path(
     sx, sy = _as_xy(start)
     ex, ey = _as_xy(end)
     end_pt = Point(int(round(ex)), int(round(ey)))
+    start_pt = Point(int(round(sx)), int(round(sy)))
     clamp = Rect.coerce(bounds) if bounds is not None else None
     duration = max(0.0, float(duration))
     rate = max(1, int(rate))
@@ -286,9 +294,9 @@ def plan_path(
             f = i / steps
             p = ease(f)
             raw.append((sx + dx * p, sy + dy * p, f * duration))
-        return _finalize(raw, end_pt, duration, clamp)
+        return _finalize(raw, end_pt, duration, clamp, start_pt)
 
-    return _finalize(_humanized(sx, sy, ex, ey, dist, duration, steps, ease, humanize), end_pt, duration, clamp)
+    return _finalize(_humanized(sx, sy, ex, ey, dist, duration, steps, ease, humanize), end_pt, duration, clamp, start_pt)
 
 
 def _humanized(

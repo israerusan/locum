@@ -47,6 +47,12 @@ _handles = itertools.count(0x1000)
 #: Caret-navigation keys: in an edit field they cancel a ``ctrl+a`` selection.
 _NAV_KEYS = frozenset({"home", "end", "left", "right", "up", "down", "pageup", "pagedown"})
 
+#: Named keys that type a character into an edit field (like any real backend).
+_NAMED_CHAR_KEYS = {
+    "space": " ", **{f"num{i}": str(i) for i in range(10)},
+    "num_add": "+", "num_subtract": "-", "num_multiply": "*", "num_divide": "/", "num_decimal": ".",
+}
+
 _SHIFT_MAP = {
     "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(",
     "0": ")", "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|", ";": ":", "'": '"', ",": "<", ".": ">", "/": "?",
@@ -563,9 +569,9 @@ class MockBackend(Backend):
         elif key == "enter":
             if w.attrs.get("multiline"):
                 self._insert(w, "\n")
-        elif len(key) == 1:
-            ch = key
-            if "shift" in mods:
+        elif len(key) == 1 or key in _NAMED_CHAR_KEYS:
+            ch = _NAMED_CHAR_KEYS.get(key, key)
+            if "shift" in mods and len(key) == 1:
                 ch = _SHIFT_MAP.get(ch, ch.upper())
             self._insert(w, ch)
 

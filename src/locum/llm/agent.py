@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+import logging
 import platform
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ from ..errors import FailSafeTriggered, PolicyViolation
 from .computer_use import ACTIONS, LEGACY_TOOL_NAME, ComputerUseAdapter
 from .safety import AuditLog, Policy, _strings
 from .tools import DesktopToolkit, ToolRegistry, ToolResult, ToolSpec
+from .tools import _param_hints
 from .tools import _to_result as _to_tool_result
 
 try:  # Python 3.8+: typing.Protocol
@@ -47,6 +49,8 @@ except ImportError:  # pragma: no cover
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..desktop import Desktop
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_MAX_TOKENS = 16000
@@ -356,8 +360,13 @@ class Agent:
         # so e.g. ``policy=Policy(dry_run=True)`` is really enforced (and the prompt tells the truth).
         if self.toolkit.policy is not self.policy:
             self.toolkit.policy = self.policy
-            self.toolkit.registry = ToolRegistry()
-            self.toolkit._build()  # read-only flags depend on the policy
+            # Read-only flags depend on the policy. Update the built-in specs in place:
+            # rebuilding the registry would bring back tools the caller removed and
+            # drop tools the caller registered on it.
+            builtin = {n for n, _ in DesktopToolkit._TOOLS}
+            for spec in self.toolkit.registry.specs():
+                if spec.name in builtin:
+                    spec.read_only = self.policy.is_read_only(spec.name)
         self.toolkit.audit = self.audit
         self.computer.policy = self.policy
         self.computer.audit = self.audit
@@ -440,13 +449,29 @@ class Agent:
                     event["image"] = bool(result.image_base64)
                 if error is not None:
                     event["error"] = error
-                self.audit.record(event)
+                try:
+                    self.audit.record(event)
+                except Exception as exc:  # noqa: BLE001 - never turn a performed action into an error
+                    # The tool already ran (or was refused): reporting the audit failure as
+                    # the tool's error would invite a retry -- a second invoice.
+                    _log.error("Audit log write failed for tool %r: %s", name, exc)
+                    if result is not None:
+                        result.text = (result.text or "OK") + (
+                            f"\n[AUDIT LOG WRITE FAILED: {type(exc).__name__}: {exc}. The action above was "
+                            "performed (or refused) as reported; do not repeat it.]"
+                        )
 
         wrapped.__name__ = name
         wrapped.__doc__ = getattr(fn, "__doc__", None)
         try:
             wrapped.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]  # keep argument validation
         except (TypeError, ValueError):
+            pass
+        try:
+            # Resolved hints of the real function, so ToolRegistry.call still converts
+            # Enum arguments to members (the function gets Priority.HIGH, not "high").
+            wrapped.__annotations__ = dict(_param_hints(fn))
+        except Exception:  # noqa: BLE001
             pass
         return ToolSpec(spec.name, spec.description, spec.parameters, wrapped, spec.read_only, spec.confirm)
 

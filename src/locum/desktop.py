@@ -171,8 +171,8 @@ class Desktop:
             mode = (typing_mode or "auto").lower()
             if mode not in TYPING_MODES:
                 raise ValueError(f"typing_mode must be one of {', '.join(TYPING_MODES)}, got {typing_mode!r}")
-            if float(poll_interval) < 0:
-                raise ValueError("poll_interval must be >= 0")
+            if poll_interval is None or not math.isfinite(float(poll_interval)) or float(poll_interval) < 0:
+                raise ValueError(f"poll_interval must be a finite number >= 0, got {poll_interval!r}")
 
             self.default_timeout = float(default_timeout)
             self.typing_mode = mode
@@ -265,7 +265,8 @@ class Desktop:
         kw.setdefault("ignore_exceptions", "transient")
         kw.setdefault("sleep", self.sleep)
         kw.setdefault("clock", self._clock)
-        return _wait_until(predicate, self._timeout(timeout), interval, **kw)
+        # interval=0 would busy-spin (and never advance an injected clock), as for poll_interval=0.
+        return _wait_until(predicate, self._timeout(timeout), interval or 0.05, **kw)
 
     def _poll(
         self,
@@ -360,7 +361,10 @@ class Desktop:
             return target.center
         if isinstance(target, AccessibleNode):
             return Element(target, self).center
-        if isinstance(target, (Point, Rect, Match, Window, dict)):
+        if isinstance(target, Window):
+            # Current rect, not the snapshot (raises WindowNotFound if it closed).
+            return target.refresh().center
+        if isinstance(target, (Point, Rect, Match, dict)):
             return coerce_point(target)
         if isinstance(target, str):
             m = _XY_RE.match(target)
@@ -448,7 +452,9 @@ class Desktop:
                 raise ElementNotFound(f"{region!r} has no screen bounds to use as a region")
             return b
         if isinstance(region, Window):
-            return region.rect
+            # Current rect, not the snapshot (raises WindowNotFound if it closed),
+            # matching Window.screenshot().
+            return region.refresh().rect
         if isinstance(region, Match):
             return region.rect
         if isinstance(region, WindowInfo):

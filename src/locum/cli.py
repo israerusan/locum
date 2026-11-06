@@ -227,7 +227,8 @@ class DemoBackend(MockBackend):
                         "right": (col + 1, row),
                     }
                     if key in moves:
-                        self._goto_cell(*moves[key])
+                        # Tab keeps the row anchor; every other move (arrows, Enter) re-anchors
+                        self._goto_cell(*moves[key], anchor=(key != "tab"))
                         return
         super()._apply_key(key)
 
@@ -738,6 +739,11 @@ def cmd_locate(ctx: _Ctx) -> int:
     region = _parse_region(a.region)
     if a.all:
         matches = d.locate_all(a.image, region=region, confidence=a.confidence, grayscale=a.grayscale)
+        if not matches and a.timeout:
+            # --all with a timeout: wait for the first match, then list them all (like find --all)
+            if d.locate(a.image, region=region, confidence=a.confidence, grayscale=a.grayscale,
+                        timeout=a.timeout) is not None:
+                matches = d.locate_all(a.image, region=region, confidence=a.confidence, grayscale=a.grayscale)
     else:
         m = d.locate(a.image, region=region, confidence=a.confidence, grayscale=a.grayscale, timeout=a.timeout or 0.0)
         matches = [m] if m is not None else []
@@ -885,6 +891,8 @@ def cmd_agent(ctx: _Ctx) -> int:
         usage = result.usage
         ctx.info(f"{'success' if result.success else 'FAILED'} after {len(result.steps)} step(s), "
                  f"stop={result.stop_reason}, tokens in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}")
+    if result.stop_reason == "aborted":
+        return EXIT_ABORTED
     return EXIT_OK if result.success else EXIT_FAILURE
 
 

@@ -856,6 +856,11 @@ class DesktopToolkit:
         ("wait", "tool_wait"),
     )
 
+    #: Built-in tools that do not go through ``_act`` (so ``_wrap`` runs their policy check).
+    _QUERY_TOOLS: frozenset = frozenset(
+        {"observe", "screenshot", "find_elements", "wait_for", "list_windows", "read_clipboard", "read_text", "wait"}
+    )
+
     def _build(self) -> None:
         for name, attr in self._TOOLS:
             method = getattr(self, attr)
@@ -879,6 +884,10 @@ class DesktopToolkit:
             try:
                 if self.policy.is_read_only(name):
                     self.policy.check(name, kwargs, context={})
+                elif name in self._QUERY_TOOLS:
+                    # A query tool the policy does not treat as read-only never reaches
+                    # ``_act``: check (and count) it here, or it would run unchecked.
+                    self.policy.check(name, kwargs, context=self._context(description=f"run {name}"))
                 result = _to_result(method(**kwargs))
                 if result.is_error:
                     status = "error"
@@ -1957,13 +1966,23 @@ class DesktopToolkit:
             oe = self._mapping().element(element_id)
             parts = []
             name = oe.node.name if oe.node is not None else oe.name
-            value = oe.node.value if oe.node is not None else oe.value
+            if oe.node is not None:
+                secret = is_password(oe.node)
+                value = oe.node.value
+                if secret and value not in (None, ""):
+                    value = "***"  # the model and the audit log never see passwords
+            else:
+                secret = oe.value == "***"
+                value = oe.value
             if name:
                 parts.append(f"name: {name}")
             if value not in (None, "") and value != name:
                 parts.append(f"value: {value}")
             if parts:
                 return ToolResult("\n".join(parts), data={"name": name, "value": value})
+            if secret:
+                # Never OCR a password field: the screen may show the plaintext (a reveal toggle).
+                return ToolResult("(no text: password field)", data={"name": name, "value": value})
             region: Optional[Rect] = oe.bounds
         elif any(v is not None for v in region_args):
             if any(v is None for v in region_args):

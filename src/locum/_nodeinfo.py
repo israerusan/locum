@@ -113,9 +113,23 @@ def owning_window(
     # unknown stay candidates (a backend may not report window pids).
     candidates = pool or [w for w in wins if not (pid and w.pid and w.pid != pid)]
     if title:
-        for w in candidates:
-            if w.title == title:
-                return w
+        same_title = [w for w in candidates if w.title == title]
+        if len(same_title) == 1:
+            return same_title[0]
+        if same_title:
+            # Several windows share the title (two SAP sessions, two "Book1"s):
+            # the top ancestor's bounds, else the node's center, tell them apart.
+            if bounds is not None:
+                ranked = sorted(same_title, key=lambda w: _iou(w.rect, bounds), reverse=True)
+                best = _iou(ranked[0].rect, bounds)
+                if best > 0.5 and _iou(ranked[1].rect, bounds) < best:
+                    return ranked[0]
+            nb = _safe(lambda: node.bounds)
+            if nb is not None:
+                inside = [w for w in same_title if w.rect.contains(nb.center)]
+                if len(inside) == 1:
+                    return inside[0]
+            return same_title[0] if guess else None
     if bounds is not None:
         best = max(candidates, key=lambda w: _iou(w.rect, bounds), default=None)
         if best is not None and _iou(best.rect, bounds) > 0.5:

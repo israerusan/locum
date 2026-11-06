@@ -752,9 +752,10 @@ class Robot:
             if self._sleep is not None:
                 self._sleep(delay)
             elif self._desktop is not None:
-                self._desktop.sleep(delay)
+                self._desktop.sleep(delay)  # ends at once on abort() (kill hotkey)
             else:
-                time.sleep(delay)
+                _failsafe.abortable_sleep(delay)
+        _failsafe._raise_if_aborted()  # abort() / the kill hotkey during the wait: never retry
 
     def _run_callable(self, name: str, kind: str, fn: Callable[[], Any], *, retries: int = 0, retry_delay: float = 0.0,
                       backoff: float = 2.0, timeout: Optional[float] = None) -> StepResult:
@@ -780,6 +781,15 @@ class Robot:
                         frame.result.data["result"] = value
                     raise _deadline_error(f"{kind} {name!r} exceeded its timeout of {timeout:g}s (took {elapsed:.2f}s)")
             except Exception as exc:
+                elapsed = self._clock() - frame.extra["t_attempt"]
+                if timeout is not None and elapsed > timeout and self._retryable(exc) and n < attempts:
+                    # It failed after overrunning its timeout: its actions may have happened. Never run it again.
+                    frame.result.data.setdefault("note", "the body failed after the timeout; not retried")
+                    overrun = _deadline_error(f"{kind} {name!r} exceeded its timeout of {timeout:g}s (took {elapsed:.2f}s), "
+                                              f"then failed: {type(exc).__name__}: {_exc_text(exc)}")
+                    overrun.__cause__ = exc
+                    self._close(frame, overrun)
+                    return frame.result
                 if self._retryable(exc) and n < attempts:
                     # Drop frames leaked above ours, then retry.
                     if frame in self._stack:
@@ -939,7 +949,7 @@ class Robot:
             hook_name = f"teardown:{getattr(hook, '__name__', 'teardown')}"
             try:
                 self._run_callable(hook_name, "teardown", self._caller(hook))
-            except (FailSafeTriggered, KeyboardInterrupt) as exc:  # still run the other hooks...
+            except BaseException as exc:  # fail-safe, Ctrl+C, SystemExit: still run the other hooks...
                 if pending is None:
                     pending = exc
         if pending is not None:  # ...then let the interrupt / fail-safe abort the run

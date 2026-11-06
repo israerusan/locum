@@ -1335,6 +1335,8 @@ class Element:
         a ``TypeError``/``AttributeError`` in a ``callable`` state raises at once."""
         if interval is None:
             interval = _desktop_interval(self.desktop)
+        elif interval == 0:
+            interval = 0.05  # a zero interval busy-spins (and never advances an injected clock)
         pred = self._state_predicate(state)
         if timeout is None:
             timeout = float(getattr(self.desktop, "default_timeout", 10.0))
