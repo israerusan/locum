@@ -20,6 +20,12 @@ Options::
     python -m locum.selftest            # asks before starting
     python -m locum.selftest --yes      # no prompt
     python -m locum.selftest --backend mock --yes   # dry run on the simulated desktop
+    python -m locum.selftest --yes --retries 2 --strict  # CI: retry flaky checks, SKIP fails
+
+``--strict`` turns every SKIP into a failure of the run, so a CI job cannot go
+green because a capability (accessibility, clipboard, an editor) was missing.
+``--retries N`` re-runs a failed check up to N more times; a check that passes
+on a retry is reported as PASS with the failed attempts in its detail.
 """
 
 from __future__ import annotations
@@ -52,8 +58,12 @@ class Check:
 
 
 class SelfTest:
-    def __init__(self, desktop: Any, out_dir: str, log: Callable[[str], None] = print):
+    #: checks with side effects that must not be repeated (a second editor, a second close)
+    NO_RETRY = frozenset({"launch editor", "close editor without saving"})
+
+    def __init__(self, desktop: Any, out_dir: str, log: Callable[[str], None] = print, *, retries: int = 0):
         self.d = desktop
+        self.retries = max(0, int(retries))
         self.out = out_dir
         self.log = log
         self.checks: List[Check] = []
@@ -71,6 +81,24 @@ class SelfTest:
 
     # ----------------------------------------------------------------- runner
     def run_check(self, name: str, fn: Callable[[], Any], *, needs: Optional[str] = None) -> bool:
+        attempts = 1 if name in self.NO_RETRY else 1 + self.retries
+        failures: List[str] = []
+        for attempt in range(attempts):
+            ok = self._run_check_once(name, fn, needs=needs)
+            last = self.checks[-1]
+            if last.status != "FAIL" or attempt == attempts - 1:
+                if failures and last.status == "PASS":
+                    last.detail = (last.detail + "\n" if last.detail else "") + (
+                        f"passed on attempt {attempt + 1}; earlier failures:\n" + "\n".join(failures))
+                elif failures:
+                    last.detail = last.detail + f"\n(failed all {attempts} attempts)"
+                return ok
+            failures.append(f"  attempt {attempt + 1}: " + (last.detail.strip().splitlines() or [""])[0])
+            self.checks.pop()
+            self.log(f"  RETRY {name} ({attempt + 2}/{attempts})")
+        return False  # pragma: no cover - the loop always returns
+
+    def _run_check_once(self, name: str, fn: Callable[[], Any], *, needs: Optional[str] = None) -> bool:
         if needs and not self.d.backend.has(needs):
             self.checks.append(Check(name, "SKIP", f"backend has no {needs!r} capability"))
             self.log(f"  SKIP  {name}: backend has no {needs!r} capability")
@@ -572,6 +600,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--backend", help="backend name (default: this platform's); 'mock' = simulated dry run")
     ap.add_argument("--yes", "-y", action="store_true", help="start without asking")
     ap.add_argument("--out", help="output folder (default: ./locum_selftest_<timestamp>)")
+    ap.add_argument("--retries", type=int, default=0, metavar="N",
+                    help="re-run a failed check up to N more times (default 0)")
+    ap.add_argument("--strict", action="store_true",
+                    help="a skipped check fails the run (CI: a missing capability must not pass)")
     args = ap.parse_args(argv)
 
     from . import Desktop
@@ -590,7 +622,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     d = _mock_desktop() if (args.backend or "").lower() in ("mock", "demo") else Desktop(args.backend)
     with d:
         print(f"backend: {d.backend.name}")
-        st = SelfTest(d, out)
+        st = SelfTest(d, out, retries=args.retries)
         aborted: Optional[BaseException] = None
         try:
             st.run()
@@ -599,6 +631,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"stopped: {type(exc).__name__}: {exc}")
     fails = sum(1 for c in st.checks if c.status == "FAIL")
     warns = sum(1 for c in st.checks if c.status == "WARN")
+    skips = [c.name for c in st.checks if c.status == "SKIP"]
+    if args.strict and skips:
+        print("strict: skipped checks count as failures: " + ", ".join(skips))
+        fails += len(skips)
     print(f"\nreport: {os.path.join(out, 'report.txt')}")
     if aborted is not None:  # the remaining checks never ran: never report success
         result = f"ABORTED ({type(aborted).__name__}; remaining checks did not run)"

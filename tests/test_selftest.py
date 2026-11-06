@@ -131,3 +131,43 @@ def test_selftest_does_not_overwrite_a_clipboard_it_could_not_save(tmp_path):
     status = {c.name: c.status for c in st.checks}
     assert status["hotkeys + clipboard"] == "SKIP"
     assert d.clipboard_get() == "precious"
+
+
+def test_selftest_retries_a_flaky_check_and_reports_the_earlier_failure(tmp_path):
+    d = selftest._mock_desktop()
+    st = selftest.SelfTest(d, str(tmp_path / "st"), log=lambda m: None, retries=2)
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 2:
+            raise RuntimeError("clipboard busy")
+        return "ok"
+
+    assert st.run_check("hotkeys + clipboard", flaky) is True
+    assert len(calls) == 2
+    assert [c.status for c in st.checks] == ["PASS"]
+    assert "passed on attempt 2" in st.checks[0].detail and "clipboard busy" in st.checks[0].detail
+
+
+def test_selftest_never_retries_side_effect_checks(tmp_path):
+    d = selftest._mock_desktop()
+    st = selftest.SelfTest(d, str(tmp_path / "st"), log=lambda m: None, retries=3)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("no")
+
+    assert st.run_check("launch editor", boom) is False
+    assert len(calls) == 1 and st.checks[-1].status == "FAIL"
+
+
+def test_selftest_strict_turns_a_skip_into_a_failed_run(tmp_path, monkeypatch):
+    def skip_vision(self):
+        raise selftest._Skip("no screen capture permission")
+
+    monkeypatch.setattr(selftest.SelfTest, "c_vision", skip_vision)
+    out = tmp_path / "a"
+    assert selftest.main(["--backend", "mock", "--yes", "--out", str(out)]) == 0
+    assert selftest.main(["--backend", "mock", "--yes", "--strict", "--out", str(tmp_path / "b")]) == 2

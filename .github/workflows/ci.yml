@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, ci-probe]
   pull_request:
   workflow_dispatch:
 
@@ -80,15 +80,16 @@ jobs:
           python examples/llm_agent.py < /dev/null
           python examples/pyautogui_migration.py
 
-  # Non-blocking: drives the runner's REAL desktop (not the mock backend) with the
-  # built-in self-test. It only types into a Notepad window it opens itself and
-  # refuses to type into an editor that already contains text. Hosted runners'
-  # interactive sessions vary, so a failure here is a signal to read the uploaded
-  # report, not a reason to block the PR.
+  # BLOCKING real-desktop self-tests: the path `pip install locum` takes on a user's
+  # machine, against each OS's real input, capture and accessibility stack (not the
+  # mock backend). They only type into an editor they open themselves and refuse to
+  # type into one that already contains text. `--strict` makes a SKIP fail the job
+  # (a missing capability must not pass as green); `--retries 2` re-runs a check
+  # that a busy hosted runner occasionally fails, and the report keeps the failed
+  # attempts. The report is uploaded either way.
   windows-native-selftest:
-    name: windows-native-selftest (real desktop, non-blocking)
+    name: windows-native-selftest (real desktop, blocking)
     runs-on: windows-latest
-    continue-on-error: true
     timeout-minutes: 15
     env:
       PYTHONUTF8: "1"
@@ -107,25 +108,100 @@ jobs:
       - name: Install locum
         run: python -m pip install .
 
-      # Step-level continue-on-error as well as job-level: job-level alone keeps
-      # the workflow run green but still records this job's check run as failed,
-      # which would leave the PR showing a red X. With it on the step, a
-      # self-test failure becomes a warning annotation plus the uploaded report.
       - name: Self-test against the runner's real desktop
-        id: selftest
-        continue-on-error: true
-        run: python -m locum.selftest --yes --out selftest-report
-
-      - name: Flag a failed self-test (non-blocking)
-        if: steps.selftest.outcome == 'failure'
-        shell: bash
-        run: echo "::warning title=windows-native-selftest::The real-desktop self-test reported failures; see the windows-native-selftest-report artifact."
+        run: python -m locum.selftest --yes --strict --retries 2 --out selftest-report
 
       - name: Upload self-test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-native-selftest-report
+          path: selftest-report
+          if-no-files-found: warn
+
+  # Linux: a real X server (Xvfb) with a window manager, a real D-Bus session and the
+  # real AT-SPI registry, driving a real GTK editor (mousepad). This is the stack a
+  # Linux desktop user has; the unit-test job above only exercises XTEST/Xlib.
+  linux-native-selftest:
+    name: linux-native-selftest (X11 + AT-SPI, blocking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install X server, window manager, AT-SPI and a GTK editor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb xauth openbox dbus-x11 at-spi2-core libatk-adaptor \
+            python3-venv python3-gi gir1.2-atspi-2.0 mousepad xclip x11-utils
+
+      # PyGObject (gi) comes from the distro: a venv that sees the system site-packages.
+      - name: Install locum
+        run: |
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/python -m pip install .
+          .venv/bin/python -c "import gi; gi.require_version('Atspi', '2.0'); from gi.repository import Atspi; print('Atspi', Atspi.get_version())"
+
+      - name: Self-test against a real X11 + AT-SPI desktop
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
+            export DISPLAY=:99
+            for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+            openbox &
+            /usr/libexec/at-spi-bus-launcher --launch-immediately &
+            export GTK_MODULES=gail:atk-bridge NO_AT_BRIDGE=0
+            gsettings set org.gnome.desktop.interface toolkit-accessibility true || true
+            sleep 2
+            .venv/bin/python -m locum.selftest --yes --strict --retries 2 --out selftest-report
+          '
+
+      - name: Upload self-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-selftest-report
+          path: selftest-report
+          if-no-files-found: warn
+
+  # macOS: the real Quartz event, capture and AX stack on a hosted Mac, driving
+  # TextEdit. Hosted macOS images pre-grant Accessibility and Screen Recording to
+  # the runner's shell (TCC); the strict self-test fails if they ever stop doing so.
+  macos-native-selftest:
+    name: macos-native-selftest (real desktop, blocking)
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install locum
+        run: python -m pip install .
+
+      - name: Self-test against the runner's real desktop
+        run: python -m locum.selftest --yes --strict --retries 2 --out selftest-report
+
+      - name: Upload self-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-native-selftest-report
           path: selftest-report
           if-no-files-found: warn
 
