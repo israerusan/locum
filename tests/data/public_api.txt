@@ -259,6 +259,7 @@ locum.errors.BackendError exception(LocumError)
 locum.errors.BackendUnavailable exception(BackendError)
 locum.errors.DesktopBusy exception(LocumError)
 locum.errors.ElementNotFound exception(LocumError, LookupError)
+locum.errors.ExperimentalWarning exception(UserWarning)
 locum.errors.FATAL_ERRORS tuple
 locum.errors.FailSafeTriggered exception(LocumError)
 locum.errors.ImageNotFound exception(LocumError, LookupError)
@@ -757,7 +758,7 @@ locum.compat.pyautogui.useImageNotFoundException def(value: 'Optional[bool]' = N
 locum.compat.pyautogui.vscroll def(clicks: 'float', x: 'Any' = None, y: 'Any' = None, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
 locum.compat.pyautogui.write def(message: 'Union[str, Sequence[str]]', interval: 'float' = 0.0, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
 
-# locum.bridges.sap
+# locum.bridges.sap (experimental: no compatibility promise)
 locum.bridges.sap.SCRIPTING_HINT str
 locum.bridges.sap.SapButton class(com: 'Any', session: 'SapSession') -> 'None'
     .press(self) -> "'SapButton'"
@@ -876,7 +877,7 @@ locum.bridges.sap.engine def() -> 'Any'
 locum.bridges.sap.sessions def() -> 'List[SapSessionInfo]'
 locum.bridges.sap.vkey_combo def(vkey: 'int') -> 'str'
 
-# locum.bridges.java
+# locum.bridges.java (experimental: no compatibility promise)
 locum.bridges.java.AccessibleActionInfo class(...)
 locum.bridges.java.AccessibleActions class(...)
 locum.bridges.java.AccessibleActionsToDo class(...)

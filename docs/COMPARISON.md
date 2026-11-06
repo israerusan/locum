@@ -99,12 +99,15 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
   is the requirement, UiPath is the right tool.
 * Native Wayland: an experimental portal-based backend (input and capture via
   xdg-desktop-portal, AT-SPI for elements, no window control). It has not yet
-  been validated on a real compositor. XWayland apps and X11 sessions are the
+  been validated on a real compositor, so it is never selected automatically
+  (`LOCUM_BACKEND=wayland` opts in). XWayland apps and X11 sessions are the
   tested path.
 * SAP GUI Scripting, Java Access Bridge and an image-only remote-session
-  helper (`locum.bridges`, since 0.3) have been tested only against fakes of
-  the COM and DLL APIs, not yet against real SAP GUI, JVMs or Citrix
-  sessions. Inside remote sessions everything is pixels: vision and OCR,
+  helper (`locum.bridges`, since 0.3). The SAP bridge is experimental and has
+  been tested only against a fake COM API, never against a real SAP GUI. The
+  Java bridge is experimental too, but CI drives a real Swing window through
+  the JDK's Access Bridge. The remote helper has not been run in a real
+  Citrix session. Inside remote sessions everything is pixels: vision and OCR,
   confined to the session window.
 * Browser DOM automation (`locum.browser`, since 0.1.5) speaks the DevTools
   protocol to Edge/Chrome: launch with a separate profile or attach, navigate,

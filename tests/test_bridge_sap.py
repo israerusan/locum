@@ -587,3 +587,14 @@ def test_failsafe_abort_stops_actions(engine):
     finally:
         failsafe.reset_abort()
     assert raw(engine).post.calls == []
+
+
+def test_the_bridge_warns_that_it_is_experimental(engine):
+    import warnings
+
+    from locum.errors import ExperimentalWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sap.attach(system="PRD")
+    assert any(issubclass(w.category, ExperimentalWarning) and "real SAP GUI" in str(w.message) for w in caught)

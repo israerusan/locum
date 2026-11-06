@@ -13,7 +13,9 @@ and not yet validated on a real compositor**. Changes are in
 | Windows 10/11 | SendInput + **UI Automation** | unit tests; **blocking** real-desktop self-test and focus-steal tests on the GitHub Windows runner on every push; validated on a real Windows 11 machine |
 | macOS 12+ | Quartz events + **AX API** | unit tests; **blocking** real-desktop self-test on the GitHub macOS runner (Quartz, AX, TextEdit); passed on a real Apple Silicon Mac (0.1.1) |
 | Linux (X11 / XWayland) | XTEST + **AT-SPI** | unit tests plus X11 tests under Xvfb; **blocking** self-test on Xvfb + openbox with a real D-Bus/AT-SPI registry and a GTK editor (not a full desktop session) |
-| Linux (Wayland) | xdg-desktop-portal + **AT-SPI** | unit tests against a fake D-Bus portal only: **experimental, not yet validated on a real compositor** |
+| Linux (Wayland) | xdg-desktop-portal + **AT-SPI** | unit tests against a fake D-Bus portal only: **experimental, not yet validated on a real compositor**; opt-in only (`LOCUM_BACKEND=wayland`) |
+| Java Swing/AWT (`locum.bridges.java`) | Java Access Bridge | **blocking** CI job driving a real Swing window through a Temurin JDK; **experimental** (one test window, no business application) |
+| SAP GUI (`locum.bridges.sap`) | SAP GUI Scripting (COM) | unit tests against a fake COM object graph only: **experimental, never run against a real SAP GUI** |
 
 * **Selectors, not coordinates.** `d.click('button "Save"')` finds the element
   through UI Automation / AX / AT-SPI, survives window moves, DPI and theme
@@ -522,9 +524,10 @@ RemoteDesktop + ScreenCast for keyboard and pointer (the compositor asks for
 approval once; the restore token is kept in
 `$XDG_STATE_HOME/locum/wayland-portal.json`), the Screenshot portal for capture
 (it may ask for permission and is much slower than X11), and AT-SPI for
-windows and elements. It is picked automatically only in a Wayland session
-with no X server. With XWayland present, the tested `x11` backend stays the
-default.
+windows and elements. It has never been run on a real GNOME or KDE session,
+so it is never picked automatically: only `LOCUM_BACKEND=wayland` selects it,
+and it emits an `ExperimentalWarning`. Every Linux session, Wayland included,
+gets the tested `x11` backend, which reaches XWayland clients.
 
 What Wayland does not allow is refused, not faked:
 

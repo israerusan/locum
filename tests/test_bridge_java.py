@@ -453,3 +453,57 @@ def test_policy_dry_run_and_password_masking(fake):
     events = audit.read()
     assert [e["status"] for e in events] == ["dry_run", "dry_run"]
     assert events[0]["args"]["text"] == "***"
+
+
+# ---------------------------------------------------------------------- live reads
+# Found by the real-JVM CI job: nodes cached their context info forever, so a
+# checkbox that a click had checked still read as unchecked through the same
+# window element. These pin the fix on the fake DLL.
+def test_reads_follow_the_ui_after_it_changes(fake):
+    panel = fake.roots[HWND].kids[0]
+    rush, status = panel.kids[2], panel.kids[7]
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        box = win.find('checkbox "Rush order"')
+        assert "checked" in box.states
+        rush.states = "enabled,visible,showing"  # the user (or a click) unchecked it
+        assert "checked" not in box.states  # an element already held
+        assert "checked" not in win.find('checkbox "Rush order"').states  # a fresh lookup
+        status.name = "Saved: ACME"  # a label's visible text is its accessible name
+        assert win.find('text "Saved: ACME"').name == "Saved: ACME"
+        assert not win.exists('text "Status"')
+        panel.kids[4].states = "focusable,visible,showing"  # Save got disabled
+        with pytest.raises(ElementNotFound, match="disabled"):
+            win.find('button "Save"').click()
+
+
+def test_lookups_see_added_and_removed_children_and_keep_held_elements(fake):
+    panel = fake.roots[HWND].kids[0]
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        box = win.find('checkbox "Rush order"')
+        assert not win.exists('button "Approve"')
+        panel.kids.append(Obj("Approve", "push button", "enabled,visible,showing", (0, 0, 10, 10),
+                              actions=["click"]))
+        assert win.exists('button "Approve"')
+        del panel.kids[0]  # the "Customer:" label goes away
+        assert not win.exists('text "Customer:"')
+        assert "checked" in box.states  # an element held across the change is still usable
+        assert box.node is win.find('checkbox "Rush order"').node
+
+
+def test_repeated_lookups_do_not_pile_up_references(fake):
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        win.find_all("*")
+        held = jab.live_references
+        for _ in range(5):
+            win.find('button "Save"')
+            win.find_all("*")
+            win.tree()
+            assert win.exists('checkbox "Rush order"')
+        assert jab.live_references == held
+        # find(timeout=) re-reads the tree while it polls, without leaking either.
+        with pytest.raises(ElementNotFound):
+            win.find('button "Nope"', timeout=1.0)
+        assert jab.live_references == held

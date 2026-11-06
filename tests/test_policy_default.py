@@ -299,3 +299,27 @@ def test_keyword_tables_and_accent_folding():
 
 def test_allow_rule_coerce_used_by_exempt():
     assert Policy(exempt='button "X"').exempt == (AllowRule(selector='button "X"'),)
+
+
+def test_cli_run_allow_list_authorizes_only_the_named_actions(app, tmp_path):
+    be, d, w = app
+    flow = write_flow(tmp_path, {"steps": [{"click": 'button "Post"'}]})
+    code, out, _ = cli(["--json", "run", flow, "--allow", 'button "Post"'], d)
+    data = json.loads(out)
+    assert code == EXIT_OK and w["post"].clicks == 1
+    assert data["metadata"]["policy"] == "strict" and data["metadata"]["policy_mode"] == "allow-list"
+    # A rule for something else does not authorize the Post click.
+    code, out, _ = cli(["--json", "run", flow, "--allow", 'button "OK"'], d)
+    assert code == EXIT_FAILURE and w["post"].clicks == 1
+    assert cli(["run", flow, "--allow", 'button "Post"', "--policy", "default"], d)[0] == EXIT_USAGE
+    assert cli(["run", flow, "--allow", 'button "Post"', "--no-policy"], d)[0] == EXIT_USAGE
+    assert cli(["run", flow, "--allow", "window="], d)[0] == EXIT_USAGE
+
+
+def test_cli_run_says_the_default_policy_is_only_a_tripwire(app, tmp_path):
+    be, d, w = app
+    flow = write_flow(tmp_path, {"steps": [{"click": 'button "OK"'}]})
+    _, _, err = cli(["run", flow], d)
+    assert "tripwire" in err and "--allow" in err
+    _, _, err = cli(["run", flow, "--policy", "default"], d)
+    assert "tripwire" not in err

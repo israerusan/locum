@@ -42,3 +42,9 @@ def test_typing_reliability_is_not_overstated():
     assert "regardless of keyboard layout" not in README
     assert "Element.type" in README and 'mode="clipboard"' in README
     assert "Windows 11 Notepad" in README
+
+
+def test_bridges_say_what_has_and_has_not_run_against_the_real_system():
+    assert re.search(r"SAP GUI.*experimental, never run against a real SAP GUI", HEAD)
+    assert re.search(r"Java Swing/AWT.*\*\*blocking\*\* CI job driving a real Swing window", HEAD)
+    assert re.search(r"Wayland.*opt-in only", HEAD)

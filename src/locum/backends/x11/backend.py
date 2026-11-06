@@ -80,7 +80,12 @@ class X11Backend(_InputMixin, _ScreenMixin, _WindowsMixin, _ClipboardMixin, _Acc
             raise ValueError("screenshot_method must be 'auto', 'mss' or 'xlib'")
         display_name = display or os.environ.get("DISPLAY")
         if not display_name:
-            raise BackendUnavailable("No X display: $DISPLAY is not set and no display name was given")
+            hint = ""
+            if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+                hint = ("; this is a Wayland session without XWayland. Start XWayland, or opt in to the "
+                        "experimental Wayland backend (not yet validated on a real compositor) with "
+                        "LOCUM_BACKEND=wayland")
+            raise BackendUnavailable(f"No X display: $DISPLAY is not set and no display name was given{hint}")
         try:
             self._d = xl.display.Display(display_name)
         except Exception as exc:

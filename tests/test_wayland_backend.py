@@ -827,16 +827,27 @@ def test_unknown_foreground_refuses_keys():
     ("darwin", {}, True, "macos"),
     ("linux", {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}, True, "x11"),
     ("linux", {"DISPLAY": ":0"}, True, "x11"),
-    # experimental: never chosen over a working X server (XWayland); LOCUM_BACKEND=wayland opts in
+    # experimental: never chosen automatically, only with LOCUM_BACKEND=wayland
     ("linux", {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"}, True, "x11"),
-    ("linux", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"}, False, "wayland"),
+    ("linux", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"}, True, "x11"),
     ("linux", {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}, False, "x11"),
-    ("linux", {"WAYLAND_DISPLAY": "wayland-0"}, True, "wayland"),
+    ("linux", {"WAYLAND_DISPLAY": "wayland-0"}, True, "x11"),
     ("linux", {"XDG_SESSION_TYPE": "tty", "WAYLAND_DISPLAY": "wayland-0"}, True, "x11"),
-    ("freebsd13", {"XDG_SESSION_TYPE": "wayland"}, True, "wayland"),
+    ("freebsd13", {"XDG_SESSION_TYPE": "wayland"}, True, "x11"),
 ])
 def test_select_platform_backend(platform, env, jeepney, expected):
     assert select_platform_backend(platform, env, jeepney) == expected
+
+
+def test_x11_without_display_in_a_wayland_session_names_the_opt_in(monkeypatch):
+    pytest.importorskip("Xlib")
+    from locum.backends.x11.backend import X11Backend
+    from locum.errors import BackendUnavailable
+
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    with pytest.raises(BackendUnavailable, match="LOCUM_BACKEND=wayland"):
+        X11Backend()
 
 
 def test_is_wayland_session():
@@ -957,3 +968,14 @@ def test_real_portal_session():  # pragma: no cover - needs a real session
         assert be.mouse_position() == c
     finally:
         be.close()
+
+
+def test_the_backend_warns_that_it_is_experimental():
+    import warnings
+
+    from locum.errors import ExperimentalWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        make()
+    assert any(issubclass(w.category, ExperimentalWarning) and "GNOME or KDE" in str(w.message) for w in caught)

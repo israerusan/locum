@@ -5,10 +5,74 @@ versions follow [Semantic Versioning](https://semver.org/) as described in
 [docs/API.md](docs/API.md) (what is public, what a breaking change is, and how
 deprecations work). Every release also has a GitHub release with the same notes.
 
-Entries for 0.1.0 to 0.2.0 were reconstructed from those GitHub releases, which
-were the only record at the time.
+Entries for 0.1.0 to 0.2.0 were reconstructed afterwards from those GitHub
+releases, which were the only record at the time. Those releases did not follow
+the versioning rules in docs/API.md (0.1.7 broke the CLI in a patch release).
+The rules apply from 0.3.0 on.
 
 ## [Unreleased]
+
+### Breaking
+
+- **The Wayland backend is no longer chosen automatically.** In 0.3.0 a
+  Wayland session with no X server got the experimental `wayland` backend. Now
+  every Linux session gets `x11`. Without XWayland, `x11` fails with a
+  `BackendUnavailable` that names the opt-in. **Migration:** set
+  `LOCUM_BACKEND=wayland`.
+
+### Experimental
+
+These components have never been run against the real system they drive. They
+are now marked as such in code, not only in docs (docs/API.md, "Experimental").
+
+- `locum.bridges.sap` is experimental. It was written against SAP's
+  documented scripting API and tested against a fake COM object graph only.
+  No SAP GUI has run it: the acceptance job needs a self-hosted runner with SAP
+  GUI, and it has not run. `SapGui()`/`attach()` emit an
+  `ExperimentalWarning`.
+- The Wayland backend is experimental. It has been tested against a fake D-Bus
+  portal only, never on GNOME or KDE. `WaylandBackend()` emits an
+  `ExperimentalWarning`.
+- `locum.bridges.java` is experimental (no compatibility promise) but is no
+  longer fakes-only: see **Fixed** and **Tests**.
+- `tests/data/public_api.txt` lists experimental modules under a marked header.
+  The snapshot shows changes to them in review, but does not freeze them.
+
+### Added
+
+- `locum run --allow RULE` (repeatable) runs the flow under
+  `Policy.strict(allow=[...])`. Only actions a rule matches run without
+  `--confirm`. Before, `--policy strict` had no way to authorize anything from
+  the command line.
+- `locum run` without `--policy` prints a one-line note to stderr. It says the
+  default policy is a keyword tripwire that authorizes nothing, and points to
+  `--allow` for flows that post, pay or delete. `--policy default`, `--json` and
+  `--dry-run` do not print it.
+- `locum.errors.ExperimentalWarning`.
+
+### Fixed
+
+- **Java bridge: stale reads.** Found by the first run against a real JVM.
+  `JavaNode` cached its context info and child list forever. So after the UI
+  changed, `win.find(...)` and properties of elements already held reported
+  the state from the first read: a checkbox a click had just checked read as
+  unchecked, a label kept its old text, and a disabled button still looked
+  enabled to `click()`. Lookups (`find`, `find_all`, `exists`, `tree`,
+  `walk`, `children`) and every property read and action now re-read from the
+  JVM. Unchanged children keep their node, so held elements stay valid. The
+  fake-DLL unit tests passed with the bug because nothing changed under a
+  cached node; three regression tests now do that.
+- **Java bridge: reference leak in `find(timeout=...)`.** Each poll dropped
+  the cached child lists without releasing them, so a wait pinned new Java
+  objects in the target JVM on every iteration until `close()`.
+
+### Tests
+
+- New blocking CI job `windows-java-bridge`. It enables the Java Access Bridge
+  of a Temurin JDK, compiles a Swing window (`tests/helpers/JabProbe.java`) and
+  drives it through `locum.bridges.java`: tree and selectors, `set_text` with
+  read-back, AccessibleAction clicks, a window-bound mouse click, checkbox
+  state, and reference release (`tests/test_real_java_bridge.py`).
 
 ## [0.3.0] - 2026-11-06
 

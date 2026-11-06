@@ -64,6 +64,7 @@ __all__ = [
     "TargetLost",
     "VerificationUnavailable",
     "DesktopBusy",
+    "ExperimentalWarning",
     "STOP_ERRORS",
     "FATAL_ERRORS",
     "TRANSIENT_ERRORS",
@@ -160,6 +161,23 @@ class VerificationUnavailable(ActionTimeout):
 class DesktopBusy(LocumError):
     """Another thread or process held the desktop input lock (mouse, keyboard,
     focus) for longer than the input lock timeout. See :mod:`locum._inputlock`."""
+
+
+class ExperimentalWarning(UserWarning):
+    """Emitted when an experimental component is first used: one that has only
+    been tested against fakes, never against the real system it drives (the SAP
+    GUI Scripting bridge, the Wayland backend). Its API may change in any
+    release; see docs/API.md, "Experimental". Silence it with
+    ``warnings.filterwarnings("ignore", category=ExperimentalWarning)``."""
+
+
+def warn_experimental(component: str, untested: str, stacklevel: int = 3) -> None:
+    """Warn that ``component`` is experimental; ``untested`` names what it was never run against."""
+    import warnings
+
+    warnings.warn(f"{component} is experimental: it has only been tested against fakes, not against "
+                  f"{untested}. Verify it on a test system before relying on it; its API may change "
+                  "in any release (docs/API.md, 'Experimental').", ExperimentalWarning, stacklevel=stacklevel)
 
 
 # ------------------------------------------------------------ classification

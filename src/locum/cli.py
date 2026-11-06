@@ -1099,7 +1099,11 @@ def cmd_agent(ctx: _Ctx) -> int:
 def _flow_policy(ctx: _Ctx) -> Tuple[Any, Any, Any]:
     """``(policy, confirm, audit)`` for ``locum run`` from ``--policy``/``--no-policy``/``--exempt``/``--confirm``."""
     a = ctx.args
-    name = "off" if a.no_policy else a.policy
+    allow_given = bool(getattr(a, "allow", None))
+    name = "off" if a.no_policy else (a.policy or ("strict" if allow_given else "default"))
+    if allow_given and name != "strict":
+        raise _UsageError(f"--allow is an allow-list for the strict policy; it cannot be combined with "
+                          f"{'--no-policy' if a.no_policy else '--policy ' + name}")
     if name == "off":
         if a.exempt:
             raise _UsageError("--exempt needs a policy; it cannot be combined with --no-policy / --policy off")
@@ -1115,12 +1119,25 @@ def _flow_policy(ctx: _Ctx) -> Tuple[Any, Any, Any]:
     except (TypeError, ValueError) as exc:
         raise _UsageError(f"--exempt: {exc}") from None
     kw: Dict[str, Any] = {"exempt": exempt, "dry_run": a.dry_run}
+    if allow_given:
+        try:
+            kw["allow"] = [AllowRule.coerce(rule) for rule in a.allow]
+        except (TypeError, ValueError) as exc:
+            raise _UsageError(f"--allow: {exc}") from None
+        # A rule named on the command line is the authorization: the tripwire does not
+        # second-guess it. Everything no rule matches still needs --confirm.
+        kw["exempt"] = list(exempt) + list(kw["allow"])
     if name == "strict":
         policy = Policy.strict(**kw)
     elif name == "permissive":
         policy = Policy.permissive(**kw)
     else:
         policy = Policy.default(**kw)
+        if a.policy is None and not a.dry_run and not ctx.json:
+            # The tripwire is what runs when nobody chose a policy. Say what it is not.
+            ctx.info("[locum] policy: default (a keyword/shortcut tripwire; it catches common mistakes but "
+                     "authorizes nothing). For flows that post, pay or delete, authorize the intended "
+                     "actions with --allow RULE (strict policy); --policy default silences this note.")
     confirm = None
     if a.confirm:
         if not bool(getattr(ctx.inp, "isatty", lambda: False)()):
@@ -1548,9 +1565,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--var", action="append", default=[], metavar="KEY=VALUE", help="override a flow variable (repeatable)")
     p.add_argument("--report-dir", metavar="DIR", help="write report.json/report.html and error screenshots under DIR/<run-id>/")
     p.add_argument("--validate", action="store_true", help="only validate the flow")
-    p.add_argument("--policy", choices=("default", "strict", "permissive", "off"), default="default",
+    p.add_argument("--policy", choices=("default", "strict", "permissive", "off"), default=None,
                    help="safety policy for the flow's actions (default: 'default', the keyword/shortcut tripwire; "
-                        "a flagged action is blocked unless --confirm or --exempt lets it run)")
+                        "a flagged action is blocked unless --confirm or --exempt lets it run; 'strict' "
+                        "when --allow is given)")
+    p.add_argument("--allow", action="append", default=[], metavar="RULE",
+                   help="allow-list authorization (repeatable; implies --policy strict): only actions matching a "
+                        "rule run without --confirm (the keyword tripwire does not re-check them). A selector ('window \"Invoice*\" button \"Post\"') or "
+                        "window=/app=/keys=/launch=/tool= shorthand. Use this for flows that move money or data")
     p.add_argument("--no-policy", action="store_true",
                    help="do not gate the flow's actions at all (same as --policy off)")
     p.add_argument("--exempt", action="append", default=[], metavar="RULE",

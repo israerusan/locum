@@ -288,7 +288,15 @@ Scripting COM object graph, `tests/test_bridge_java.py` checks the header
 layouts and uses a fake `WindowsAccessBridge` DLL object, and
 `tests/test_bridge_remote.py` runs on the mock desktop. They cover attach and
 selection errors, the typed wrappers, busy waits, the policy, dry runs, audit,
-the fail-safe, reference release and the bound mouse fallback. Real SAP GUI and
-real Java applications are covered only by the on-demand acceptance scenario
-for SAP (`tests/acceptance`, see `docs/TESTING.md`). That scenario does not
-use this module yet.
+the fail-safe, reference release and the bound mouse fallback.
+
+Against the real thing:
+
+| Bridge | Real-system test | Status |
+| --- | --- | --- |
+| `locum.bridges.java` | CI job `windows-java-bridge` on every push: a Temurin JDK with the Access Bridge enabled, a Swing window (`tests/helpers/JabProbe.java`), and `tests/test_real_java_bridge.py` (tree, selectors, `set_text` read-back, AccessibleAction and mouse clicks, checkbox state, reference release) | **experimental**: verified on one small Swing window, not on a business application |
+| `locum.bridges.sap` | none. The on-demand acceptance job needs a self-hosted runner with SAP GUI and has never run; its SAP scenario does not use this module yet | **experimental, unverified**: emits `ExperimentalWarning` |
+| `locum.bridges.remote` | none against Citrix/RDP; it is template matching and OCR over a window, the same code paths as the rest of locum's vision | tested on the mock desktop |
+
+Do not use `locum.bridges.sap` in production until you have run it against
+your own SAP GUI test system.

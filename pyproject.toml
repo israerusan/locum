@@ -82,3 +82,5 @@ markers = [
   "x11: requires a real X11 display (run under Xvfb)",
   "wayland: requires a real Wayland session with xdg-desktop-portal (RemoteDesktop/ScreenCast/Screenshot)",
 ]
+# The experimental bridges warn on every use; their own tests check that once.
+filterwarnings = ["ignore::locum.errors.ExperimentalWarning"]

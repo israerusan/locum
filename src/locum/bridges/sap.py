@@ -60,6 +60,7 @@ from ..errors import (
     ElementNotFound,
     LocumError,
     NotSupported,
+    warn_experimental,
 )
 from ..types import Rect
 from ..wait import wait_until
@@ -243,6 +244,7 @@ class SapGui:
     def __init__(self, engine_obj: Any = None, *, policy: Any = None, confirm: Any = None, audit: Any = None,
                  desktop: Any = None, default_timeout: float = 30.0, poll_interval: float = 0.1,
                  sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic) -> None:
+        warn_experimental("locum.bridges.sap", "a real SAP GUI")
         self.com = engine_obj if engine_obj is not None else engine()
         self.desktop, self.gate = ActionGate.resolve(desktop, policy, confirm, audit, bridge="sap")
         self.default_timeout = float(default_timeout)

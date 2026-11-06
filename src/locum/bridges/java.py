@@ -457,6 +457,8 @@ class JavaNode(AccessibleNode):
         self.hwnd = hwnd
         self._info: Optional[AccessibleContextInfo] = None
         self._kids: Optional[List["JavaNode"]] = None
+        #: ``True`` when the cached children must be checked against the JVM on the next read.
+        self._kids_stale = False
         self._released = False
 
     # ------------------------------------------------------------------ raw data
@@ -474,9 +476,19 @@ class JavaNode(AccessibleNode):
         return self._info
 
     def refresh(self) -> "JavaNode":
-        """Forget cached info and children (children are not released; see :meth:`release`)."""
+        """Re-read this node and everything below it from the JVM on next access.
+
+        Names, states, values and bounds are read again. The child lists are
+        checked against the JVM: unchanged children keep their node (so
+        elements already handed out stay valid), new ones are added, and the
+        ones that went away are dropped from the tree (their references are
+        released on :meth:`JavaBridge.close`). A refresh leaks no reference.
+        """
         self._info = None
-        self._kids = None
+        if self._kids is not None:
+            self._kids_stale = True
+            for kid in self._kids:
+                kid.refresh()
         return self
 
     def _s(self, field: str) -> str:
@@ -565,20 +577,42 @@ class JavaNode(AccessibleNode):
         }
 
     def children(self) -> Sequence["JavaNode"]:
-        if self._kids is None:
+        if self._kids is None or self._kids_stale:
             info = self.info
             count = min(int(info.childrenCount), self.bridge.max_children) if info is not None else 0
+            old = list(self._kids or ())
             kids: List[JavaNode] = []
             for i in range(max(0, count)):
                 try:
                     child = self.bridge.dll.getAccessibleChildFromContext(self.vm, self.ac, i)
                 except Exception:  # noqa: BLE001
                     child = 0
-                if child:
-                    self.bridge._track(self.vm, child)
-                    kids.append(JavaNode(self.bridge, self.vm, child, self))
+                if not child:
+                    continue
+                same = next((k for k in old if not k._released and self._same_ref(k.ac, child)), None)
+                if same is not None:
+                    # A second reference to a child we already hold: keep the node, drop the new reference.
+                    if child != same.ac:
+                        try:
+                            self.bridge.dll.releaseJavaObject(self.vm, child)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    old.remove(same)
+                    kids.append(same)
+                    continue
+                self.bridge._track(self.vm, child)
+                kids.append(JavaNode(self.bridge, self.vm, child, self))
             self._kids = kids
+            self._kids_stale = False
         return self._kids
+
+    def _same_ref(self, a: int, b: int) -> bool:
+        if a == b:
+            return True
+        try:
+            return bool(self.bridge.dll.isSameObject(self.vm, a, b))
+        except Exception:  # noqa: BLE001
+            return False
 
     @property
     def parent(self) -> Optional["JavaNode"]:
@@ -696,43 +730,53 @@ class JavaElement:
     def bridge(self) -> JavaBridge:
         return self.node.bridge
 
+    def _live(self) -> JavaNode:
+        """The node, with its own info re-read from the JVM on next access.
+
+        Every property read and action goes through this: a Java UI changes
+        under an element (a checkbox is checked, a label's text changes, a
+        field is disabled), and a cached read would report the old state.
+        """
+        self.node._info = None
+        return self.node
+
     # ------------------------------------------------------------------ properties
     @property
     def name(self) -> str:
-        return self.node.name
+        return self._live().name
 
     @property
     def role(self) -> str:
-        return self.node.role
+        return self._live().role
 
     @property
     def java_role(self) -> str:
-        return self.node.java_role
+        return self._live().java_role
 
     @property
     def description(self) -> str:
-        return self.node.description
+        return self._live().description
 
     @property
     def states(self) -> frozenset:
-        return self.node.states
+        return self._live().states
 
     @property
     def rect(self) -> Optional[Rect]:
-        return self.node.bounds
+        return self._live().bounds
 
     bounds = rect
 
     @property
     def text(self) -> str:
-        return self.node.text()
+        return self._live().text()
 
     @property
     def is_enabled(self) -> bool:
-        return "disabled" not in self.node.states
+        return "disabled" not in self._live().states
 
     def actions(self) -> List[str]:
-        return self.node.actions()
+        return self._live().actions()
 
     @property
     def parent(self) -> Optional["JavaElement"]:
@@ -740,10 +784,10 @@ class JavaElement:
         return JavaElement(p) if p is not None else None
 
     def children(self) -> List["JavaElement"]:
-        return [JavaElement(n) for n in self.node.children()]
+        return [JavaElement(n) for n in self.node.refresh().children()]
 
     def walk(self, max_depth: int = 64) -> Iterator["JavaElement"]:
-        for n in self.node.walk(max_depth):
+        for n in self.node.refresh().walk(max_depth):
             yield JavaElement(n)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------ lookup
@@ -751,6 +795,7 @@ class JavaElement:
         """Descendants matching a locum selector (``'button "OK"'``, ``'edit[name^="Cust"]'``, ...)."""
         from ..selectors import parse  # noqa: PLC0415
 
+        self.node.refresh()  # match against the UI as it is now, not as it was first read
         return [JavaElement(n) for n in parse(selector).find_all([self.node], max_depth=max_depth)]  # type: ignore[misc]
 
     def find(self, selector: Any, timeout: float = 0.0) -> "JavaElement":
@@ -762,11 +807,11 @@ class JavaElement:
         def probe() -> Optional[JavaNode]:
             return sel.find_first([self.node])  # type: ignore[return-value]
 
+        self.node.refresh()  # match against the UI as it is now, not as it was first read
         node = probe()
         if node is None and timeout and timeout > 0:
             def again() -> Optional[JavaNode]:
-                for n in self.node.walk():
-                    n.refresh()  # type: ignore[attr-defined]
+                self.node.refresh()
                 return probe()
 
             try:
@@ -788,7 +833,7 @@ class JavaElement:
     def tree(self, max_depth: int = 8) -> str:
         from ..selectors import tree_text  # noqa: PLC0415
 
-        return tree_text([self.node], max_depth=max_depth)
+        return tree_text([self.node.refresh()], max_depth=max_depth)
 
     # ------------------------------------------------------------------ policy context
     def _ctx(self, *, activates: bool) -> Dict[str, Any]:
@@ -837,7 +882,7 @@ class JavaElement:
         ``True``: the action only (:class:`NotSupported` without one);
         ``False``: the mouse only.
         """
-        if "disabled" in self.node.states:
+        if "disabled" in self._live().states:
             raise ElementNotFound(f"{self!r} is disabled")
         action = self.node.click_action() if native is not False else None
         if native is True and action is None:
@@ -885,7 +930,7 @@ class JavaElement:
         editable text component), :class:`ElementNotFound` for a disabled or
         read-only field and :class:`ActionTimeout` when the read-back differs.
         """
-        st = self.node.states
+        st = self._live().states
         if "disabled" in st or "readonly" in st:
             raise ElementNotFound(f"{self!r} is disabled or read-only")
         secret = "password" in st

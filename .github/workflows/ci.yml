@@ -245,6 +245,47 @@ jobs:
       - name: Desktop input lock across real processes
         run: python -m pytest -q -p no:cacheprovider tests/test_desktop_lock.py
 
+  # BLOCKING: locum.bridges.java against a real JVM. A Swing window
+  # (tests/helpers/JabProbe.java) is driven through the Java Access Bridge that
+  # ships with the JDK: tree, set_text read-back, AccessibleAction clicks, a
+  # window-bound mouse click and reference release.
+  windows-java-bridge:
+    name: windows-java-bridge (real JVM, blocking)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      LOCUM_TEST_JAVA: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Enable the Java Access Bridge
+        shell: pwsh
+        run: |
+          & "$env:JAVA_HOME\bin\jabswitch.exe" -enable
+          Get-Content "$env:USERPROFILE\.accessibility.properties"
+          Get-ChildItem "$env:JAVA_HOME\bin\WindowsAccessBridge*.dll"
+
+      - name: Install locum
+        run: python -m pip install . pytest
+
+      - name: Java Access Bridge tests against a real Swing window
+        run: python -m pytest -v -p no:cacheprovider tests/test_real_java_bridge.py -rs
+
   # Real-application acceptance: Excel dialogs (+ SAP GUI when the runner has it).
   # Hosted runners have neither, so this runs only on demand on a self-hosted
   # Windows runner labelled `excel` (and `sap` for the SAP scenario), logged in to

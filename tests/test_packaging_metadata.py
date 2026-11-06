@@ -65,3 +65,15 @@ def test_ci_real_desktop_selftests_block_the_build_and_upload_their_report(job_n
     assert "--yes" in run and "--strict" in run and "--out selftest-report" in run and "--backend" not in run
     upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@v4"))
     assert upload["if"] == "always()" and upload["with"]["path"] == "selftest-report"
+
+
+def test_ci_java_bridge_job_runs_a_real_jvm_and_blocks():
+    # README and docs/BRIDGES.md say the Java bridge is driven against a real Swing window in CI.
+    job = _workflow()["jobs"]["windows-java-bridge"]
+    assert job["runs-on"] == "windows-latest" and "continue-on-error" not in job
+    assert job["env"]["LOCUM_TEST_JAVA"] == "1"
+    steps = job["steps"]
+    assert any(s.get("uses", "").startswith("actions/setup-java@") for s in steps)
+    assert any("jabswitch" in s.get("run", "") for s in steps)
+    run = next(s for s in steps if "test_real_java_bridge.py" in s.get("run", ""))
+    assert "continue-on-error" not in run

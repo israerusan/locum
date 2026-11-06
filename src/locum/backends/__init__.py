@@ -3,8 +3,9 @@
 ``get_backend()`` returns a process-wide default backend chosen from, in order:
 
 1. the ``LOCUM_BACKEND`` environment variable (``mock``, ``x11``, ``wayland``, ``windows``, ``macos``)
-2. the current platform (``win32`` -> windows, ``darwin`` -> macos, otherwise x11 --
-   or wayland in a Wayland session, see :func:`select_platform_backend`)
+2. the current platform (``win32`` -> windows, ``darwin`` -> macos, otherwise x11;
+   the experimental ``wayland`` backend is never chosen automatically, see
+   :func:`select_platform_backend`)
 
 Third-party backends can be registered with :func:`register_backend`.
 """
@@ -51,37 +52,24 @@ def is_wayland_session(environ: Optional[Mapping[str, str]] = None) -> bool:
     return bool(env.get("WAYLAND_DISPLAY"))
 
 
-def _jeepney_available() -> bool:
-    import importlib.util
-
-    try:
-        return importlib.util.find_spec("jeepney") is not None
-    except (ImportError, ValueError):
-        return False
-
-
 def select_platform_backend(platform: Optional[str] = None, environ: Optional[Mapping[str, str]] = None,
                             jeepney_available: Optional[bool] = None) -> str:
     """The default backend name for ``platform`` (default: this one) and ``environ``.
 
-    The ``wayland`` backend is experimental, so it is never chosen over a working
-    X server: a Wayland session with ``$DISPLAY`` set (XWayland) keeps the tested
-    ``x11`` backend, which reaches XWayland clients. Opt in with
-    ``LOCUM_BACKEND=wayland``. Only a Wayland session with no X server gets
-    ``wayland`` automatically, because ``x11`` could not work there at all. An X11
-    session always gets ``x11``.
+    The ``wayland`` backend is experimental: it has not been validated on a real
+    GNOME or KDE session, so it is **never chosen automatically** (since 0.3.1).
+    Opt in with ``LOCUM_BACKEND=wayland``. A Wayland session with XWayland
+    (``$DISPLAY`` set) gets the tested ``x11`` backend, which reaches XWayland
+    clients; a Wayland session with no X server also gets ``x11``, which then
+    fails with a :class:`~locum.errors.BackendUnavailable` naming the opt-in.
+    ``environ`` and ``jeepney_available`` are kept for compatibility.
     """
     plat = sys.platform if platform is None else platform
     if plat == "win32":
         return "windows"
     if plat == "darwin":
         return "macos"
-    env = os.environ if environ is None else environ
-    if not is_wayland_session(env):
-        return "x11"
-    if env.get("DISPLAY"):
-        return "x11"
-    return "wayland"
+    return "x11"
 
 
 def platform_backend_name() -> str:

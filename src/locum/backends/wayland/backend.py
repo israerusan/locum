@@ -11,7 +11,7 @@ import urllib.request
 import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...errors import BackendError, NotSupported
+from ...errors import BackendError, NotSupported, warn_experimental
 from ...types import Monitor, MouseButton, Point, Rect, WindowInfo
 from ..base import (
     CAP_ACCESSIBILITY,
@@ -181,6 +181,7 @@ class WaylandBackend(Backend):
         approval_timeout: float = 180.0,
         clipboard_tool: Optional[str] = None,
     ) -> None:
+        warn_experimental("The Wayland backend", "a real GNOME or KDE compositor")
         owns_bus = bus is None
         if bus is None:
             bus = P.JeepneyBus()

@@ -44,6 +44,10 @@ OPTIONAL_MODULES = [
     "locum.rpa.credentials",
 ]
 
+#: Experimental modules (docs/API.md, "Experimental"): snapshotted so a change still shows up
+#: in review, under a marked header, but they carry no compatibility promise.
+EXPERIMENTAL_MODULES = {"locum.bridges.sap", "locum.bridges.java"}
+
 SNAPSHOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "data", "public_api.txt")
 _ADDR = re.compile(r" at 0x[0-9A-Fa-f]+")
 
@@ -120,7 +124,8 @@ def snapshot() -> str:
         names = getattr(mod, "__all__", None)
         if names is None:
             raise SystemExit(f"{modname} has no __all__: every public module must declare one")
-        out.append(f"# {modname}")
+        out.append(f"# {modname} (experimental: no compatibility promise)" if modname in EXPERIMENTAL_MODULES
+                   else f"# {modname}")
         for name in sorted(names):
             out.extend(_describe(modname, name, getattr(mod, name)))
         out.append("")

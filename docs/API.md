@@ -25,6 +25,24 @@ The public API is exactly:
 6. **Documented environment variables** (`LOCUM_BACKEND`, `LOCUM_DESKTOP_LOCK`,
    `LOCUM_UIA_EVENTS`, ...).
 
+## Experimental
+
+Some components have been tested only against fakes, never against the real
+system they drive. They are **experimental**: they may change or be removed in
+any release, including a patch release, and such a change is listed in the
+changelog under **Experimental**, not **Breaking**. Each one emits
+`locum.errors.ExperimentalWarning` when it is first used.
+
+| Component | Why experimental | What would graduate it |
+| --- | --- | --- |
+| `locum.bridges.sap` | never run against a real SAP GUI; the acceptance job needs a self-hosted runner with SAP GUI and has not run | an acceptance run against SAP GUI with scripting enabled |
+| `locum.bridges.java` | its CI job drives one small Swing window; no real business application yet | runs against real Swing/AWT applications |
+| Wayland backend (`LOCUM_BACKEND=wayland`) | never run on a real GNOME or KDE compositor; never chosen automatically | a verified run on GNOME and KDE, written up in docs/TESTING.md |
+
+`tests/data/public_api.txt` still lists the experimental modules, under a
+header marked *experimental*, so a change to them still shows up in review.
+The snapshot does not freeze them.
+
 Everything else is internal and may change in any release: modules and names
 that start with `_`, everything under `locum.backends.*` except
 `register_backend`/`create_backend`, the HTML layout of reports and traces,
@@ -49,8 +67,12 @@ argument in a way that breaks existing scripts. A safety fix may tighten
 behaviour in a patch release when the old behaviour was a vulnerability. It is
 still marked **Breaking** in the changelog.
 
-> 0.1.7 broke the CLI (`--window`/`--focused` became required) in a patch
-> release. Under these rules that would have needed 0.2.0. It is the last time.
+These rules apply from 0.3.0. The releases before that did not follow them:
+0.1.0 to 0.1.7, 0.2.0 and 0.3.0 all shipped on 2026-11-05 and 2026-11-06, and
+0.1.7 broke the CLI (`--window`/`--focused` became required) in a patch
+release. The changelog entries for 0.1.0 to 0.2.0 were reconstructed afterwards
+from the GitHub release notes. Treat anything before 0.3.0 as unversioned
+history, not as a record of compatibility.
 
 ## Deprecations
 
