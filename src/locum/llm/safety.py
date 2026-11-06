@@ -555,7 +555,7 @@ def _compiled_selector(text: str) -> Any:
 
 
 def node_matches_selector(node: Any, selector: str) -> bool:
-    """Whether ``node`` is one of the elements ``selector`` finds (ancestry steps included).
+    """Whether ``node`` is one of the elements ``selector`` finds (ancestry and sibling steps included).
 
     The selector is evaluated from the node's top-most ancestor, so
     ``window[name^="Invoice"] button "Save"`` only matches a Save button inside an

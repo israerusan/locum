@@ -21,7 +21,16 @@ CSS-like (canonical)
     :not(:disabled)                 negation
     :nth(0) :nth(-1) :first :last   position among the matches *so far*
     window "Calc" > pane button     descendant (space) and child (``>``) combinators
+    text "Name:" + edit             adjacent sibling: the edit right after the label
+    group ~ button                  general sibling: any later button under the same parent
     button "OK", button "Yes"       union
+
+Sibling combinators follow CSS: ``A + B`` matches a ``B`` whose immediately
+preceding sibling (same parent, previous position in ``children()``) matches
+``A``; ``A ~ B`` one with *any* earlier sibling matching ``A``. They compose
+with the other combinators (``window "Calc" > pane text "Name:" + edit``).
+Search roots have no siblings (a top-level window is never the sibling of
+another one), and ``:has()`` accepts only ``>`` as a leading combinator.
 
 Window and dialog titles are compared ignoring decorations that change on
 their own (:func:`locum._nodeinfo.stable_title`): ``window "doc.txt - Notepad"``
@@ -302,6 +311,26 @@ class _Entry:
         """True if ``self`` is ``other`` or one of its descendants."""
         n = len(other.path)
         return len(self.path) >= n and self.path[:n] == other.path
+
+
+def _prev_sibling(entry: _Entry) -> Optional[_Entry]:
+    """The sibling right before ``entry`` (``None`` for a first child or a search root)."""
+    p = entry.parent
+    idx = entry.path[-1]
+    if p is None or idx <= 0:
+        return None
+    kids = p.children()
+    return kids[idx - 1] if idx - 1 < len(kids) else None
+
+
+def _next_sibling(entry: _Entry) -> Optional[_Entry]:
+    """The sibling right after ``entry`` (``None`` for a last child or a search root)."""
+    p = entry.parent
+    if p is None:
+        return None
+    kids = p.children()
+    idx = entry.path[-1] + 1
+    return kids[idx] if idx < len(kids) else None
 
 
 def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
@@ -680,7 +709,7 @@ class _Compound:
 
 
 class _Branch:
-    """A complex selector: compounds joined by combinators (``" "`` or ``">"``)."""
+    """A complex selector: compounds joined by combinators (``" "``, ``">"``, ``"+"``, ``"~"``)."""
 
     def __init__(self, steps: List[Tuple[Optional[str], _Compound]], relative: Optional[str] = None):
         self.steps = steps  # first combinator is None
@@ -691,7 +720,7 @@ class _Branch:
         out = "> " if self.relative == ">" else ""
         for i, (comb, comp) in enumerate(self.steps):
             if i:
-                out += " > " if comb == ">" else " "
+                out += f" {comb} " if comb in _COMBINATORS else " "
             out += comp.render()
         return out
 
@@ -711,6 +740,11 @@ class _Branch:
             if p is None or p is boundary:
                 return False
             return self._match_memo(p, snap, boundary, i - 1)
+        if comb == "+":
+            s = _prev_sibling(entry)
+            return s is not None and self._match_memo(s, snap, boundary, i - 1)
+        if comb == "~":
+            return self._any_earlier_sibling(entry, snap, boundary, i - 1)
         p = entry.parent
         while p is not None and p is not boundary:
             if self._match_memo(p, snap, boundary, i - 1):
@@ -725,6 +759,33 @@ class _Branch:
             hit = self.match_rtl(entry, snap, boundary, i)
             snap.memo[key] = hit  # type: ignore[index]
         return hit
+
+    def _any_earlier_sibling(self, entry: _Entry, snap: _Snapshot, boundary: Optional[_Entry], i: int) -> bool:
+        """Whether a sibling before ``entry`` matches steps ``0..i`` (the ``~`` combinator).
+
+        Siblings are the parent's already materialised ``children()`` (same depth as
+        ``entry``, so ``max_depth`` holds). A per-parent running "any match so far"
+        list is memoised and only extended as far as asked, so testing every child
+        of a long list costs one match per sibling, not one per (child, sibling) pair.
+        """
+        p = entry.parent
+        idx = entry.path[-1]
+        if p is None or idx <= 0:
+            return False
+        key = (id(self), id(p), id(boundary), i, "~")
+        acc: Optional[List[bool]] = snap.memo.get(key)  # type: ignore[arg-type,assignment]
+        if acc is None:
+            acc = []
+            snap.memo[key] = acc  # type: ignore[index,assignment]
+        kids = p.children()
+        idx = min(idx, len(kids))
+        while len(acc) < idx:
+            if acc and acc[-1]:
+                acc.append(True)
+                continue
+            _cancel_check()
+            acc.append(self._match_memo(kids[len(acc)], snap, boundary, i))
+        return acc[idx - 1] if idx else False
 
     # -- search ----------------------------------------------------------------
     def search(
@@ -777,6 +838,27 @@ class _Branch:
                         if id(c) not in seen:
                             seen.add(id(c))
                             cands.append(c)
+                cands.sort(key=lambda e: e.path)
+            elif comb == "+":
+                seen = set()
+                cands = []
+                for p in current:
+                    s = _next_sibling(p)
+                    if s is not None and id(s) not in seen:
+                        seen.add(id(s))
+                        cands.append(s)
+                cands.sort(key=lambda e: e.path)
+            elif comb == "~":
+                # Every sibling after the earliest match under each parent.
+                earliest: Dict[int, Tuple[_Entry, int]] = {}
+                for p in current:
+                    par = p.parent
+                    if par is None:
+                        continue
+                    got = earliest.get(id(par))
+                    if got is None or p.path[-1] < got[1]:
+                        earliest[id(par)] = (par, p.path[-1])
+                cands = [k for par, idx in earliest.values() for k in par.children()[idx + 1:]]
                 cands.sort(key=lambda e: e.path)
             else:
                 cands = []
@@ -846,7 +928,7 @@ class Selector:
     def matches(self, node: AccessibleNode) -> bool:
         """Whether ``node`` satisfies the last compound of any branch.
 
-        Ancestry (combinators) and positional pseudo-classes are ignored.
+        Ancestry and siblings (every combinator) and positional pseudo-classes are ignored.
         """
         snap = _Snapshot([node], 64)
         entry = snap.roots[0]
@@ -939,9 +1021,13 @@ _T_RPAREN = ")"
 _T_COLON = ":"
 _T_COMMA = ","
 _T_GT = ">"
+_T_PLUS = "+"
+_T_TILDE = "~"
 _T_STAR = "*"
 _T_OP = "OP"
 _T_EOF = "EOF"
+#: Combinators spelled with a token (the descendant combinator is whitespace).
+_COMBINATORS = (_T_GT, _T_PLUS, _T_TILDE)
 
 
 class _Tok:
@@ -1063,13 +1149,13 @@ class _Lexer:
         if ch == "=":
             self.i += 1
             return _Tok(_T_OP, "=", pos, ws)
-        if ch in "#.[]():,>*":
+        # ``~=`` was taken as an operator above, so a lone ``~`` is the general sibling
+        # combinator (inside ``[...]`` the parser accepts only operators: an error there).
+        if ch in "#.[]():,>*+~":
             self.i += 1
             return _Tok(ch, ch, pos, ws)
         if _ident_char(ch) or ch == "\\":
             return _Tok(_T_IDENT, self._read_ident(), pos, ws)
-        if ch in "+~":
-            raise self.error(pos, f"Sibling combinator {ch!r} is not supported")
         raise self.error(pos, f"Unexpected character {ch!r}")
 
     def raw_value(self, stop: str) -> Tuple[str, int]:
@@ -1153,6 +1239,10 @@ class _CssParser:
                 raise self.error(tok.pos, "Selector cannot start with '>'")
             self.lx.next()
             relative = ">"
+        elif tok.kind in (_T_PLUS, _T_TILDE):
+            if allow_relative:
+                raise self.error(tok.pos, f"':has()' can only start with '>', not the sibling combinator {tok.kind!r}")
+            raise self.error(tok.pos, f"Selector cannot start with {tok.kind!r}")
         tok = self.lx.peek()
         if self._ends_complex(tok, closing):
             raise self.error(tok.pos, "Expected a selector")
@@ -1161,12 +1251,12 @@ class _CssParser:
             tok = self.lx.peek()
             if self._ends_complex(tok, closing):
                 break
-            if tok.kind == _T_GT:
+            if tok.kind in _COMBINATORS:
                 self.lx.next()
                 nxt = self.lx.peek()
-                if self._ends_complex(nxt, closing) or nxt.kind == _T_GT:
-                    raise self.error(nxt.pos, "Expected a selector after '>'")
-                steps.append((">", self.parse_compound()))
+                if self._ends_complex(nxt, closing) or nxt.kind in _COMBINATORS:
+                    raise self.error(nxt.pos, f"Expected a selector after {tok.kind!r}")
+                steps.append((tok.kind, self.parse_compound()))
             elif tok.ws:
                 steps.append((" ", self.parse_compound()))
             else:
