@@ -2,16 +2,18 @@
 
 **Desktop automation for Python that understands the screen.** One library for
 mouse/keyboard input, screenshots and template matching, accessibility
-selectors, RPA robots, and LLM-agent control. Windows is the most-validated
-platform; macOS and Linux (X11) backends exist but have been tested less (see
-below). **Native Wayland is not supported**: on Linux, locum drives X11
-sessions and XWayland windows only.
+selectors, RPA robots, and LLM-agent control. Every push runs a real-desktop
+self-test on Windows, macOS and Linux/X11, and a failure fails the build (see
+below). Native Wayland support (through xdg-desktop-portal) is **experimental
+and not yet validated on a real compositor**. Changes are in
+[CHANGELOG.md](CHANGELOG.md); the stability promise is in [docs/API.md](docs/API.md).
 
 | Platform | Backend | How it is tested today |
 |----------|---------|------------------------|
-| Windows 10/11 | SendInput + **UI Automation** | unit tests against a fake Win32/UIA API; validated on a real Windows 11 machine by the built-in self-test |
-| macOS 12+ | Quartz events + **AX API** | unit tests against a fake Quartz/AX API only — **not yet validated on a real Mac** |
-| Linux (X11 / XWayland) | XTEST + **AT-SPI** | unit tests plus X11 tests under Xvfb in CI; native Wayland input/capture **not supported** |
+| Windows 10/11 | SendInput + **UI Automation** | unit tests; **blocking** real-desktop self-test and focus-steal tests on the GitHub Windows runner on every push; validated on a real Windows 11 machine |
+| macOS 12+ | Quartz events + **AX API** | unit tests; **blocking** real-desktop self-test on the GitHub macOS runner (Quartz, AX, TextEdit); passed on a real Apple Silicon Mac (0.1.1) |
+| Linux (X11 / XWayland) | XTEST + **AT-SPI** | unit tests plus X11 tests under Xvfb; **blocking** self-test on Xvfb + openbox with a real D-Bus/AT-SPI registry and a GTK editor (not a full desktop session) |
+| Linux (Wayland) | xdg-desktop-portal + **AT-SPI** | unit tests against a fake D-Bus portal only: **experimental, not yet validated on a real compositor** |
 
 * **Selectors, not coordinates.** `d.click('button "Save"')` finds the element
   through UI Automation / AX / AT-SPI, survives window moves, DPI and theme
@@ -124,6 +126,8 @@ d.find('window[name%="Invoice*"] button:has-text("save")')    # glob, case-insen
 d.find("<wnd app='erp' title='Invoice Entry*' /><ctrl automationid='amount' role='editable text' />")
 d.find({"role": "button", "name": "Clear", "within": {"role": "window", "name": "Invoice Entry - ERP"}})
 d.find('window "Book1 - Excel" > edit "Name Box"')             # child combinator
+d.find('window "Vendor*" text "Name:" + edit')                 # adjacent sibling: the edit right after the label
+d.find('window "Vendor*" group "Address" ~ button "Next"')     # general sibling: any later sibling
 cells = d.find_all('edit[name~="^[A-E]1$"]')                    # regex attribute match
 assert [c.name for c in cells] == ["A1", "B1", "C1", "D1", "E1"]
 
@@ -133,7 +137,9 @@ print(selector_for(el.node, roots=d.roots()))                   # window "Invoic
 print(d.tree(window="Invoice Entry*", interactive_only=True))   # readable tree dump
 ```
 
-Operators: `=` `!=` `*=` `^=` `$=` `~=` (regex) `%=` (glob), `i` flag for
+Combinators: descendant (space), child `>`, adjacent sibling `+`, general
+sibling `~` (same parent, accessibility-tree order; top-level windows have no
+siblings). Operators: `=` `!=` `*=` `^=` `$=` `~=` (regex) `%=` (glob), `i` flag for
 case-insensitive; pseudo-classes `:enabled :visible :focused :checked :unchecked :mixed
 :has-text() :has() :not() :nth() :first :last`. Every lookup waits up to
 `default_timeout` and failures say what *was* there:
@@ -152,7 +158,41 @@ excel = d.window("Book1*")
 excel.activate()
 print(excel.rect, excel.app, excel.is_active)
 d.window("Invoice Entry*").activate()
+
+img = excel.screenshot()                        # its own content, even when other windows cover it
+img = excel.screenshot(restore_minimized=True)  # minimized: shown without focus, captured, re-minimized
 ```
+
+`Window.screenshot()` captures from the window itself (PrintWindow on Windows,
+CGWindowListCreateImage on macOS, Composite on X11 with a compositing manager)
+when the window is covered or off-screen, and grabs the screen otherwise.
+`mode="screen"` or `mode="window"` forces one. CLI: `locum screenshot --window
+"Invoice*" -o inv.png`.
+
+### SAP GUI, Java and Citrix
+
+UI Automation can't see inside SAP GUI, Swing apps or remote sessions, so
+locum ships bridges ([docs/BRIDGES.md](docs/BRIDGES.md)). They are tested
+against fakes of the COM/DLL APIs; real SAP GUI and JVM runs are still to come.
+
+<!-- norun -->
+```python
+from locum.bridges import sap                       # pip install locum[sap]
+s = sap.attach(system="PRD", client="100")
+s.start_transaction("SE16N")
+s.find("wnd[0]/usr/ctxtGD-TAB").text = "T001"
+s.send_vkey(0)
+s.check_status()                                    # raises SapError on an error message
+
+from locum.bridges.java import JavaBridge           # jabswitch -enable, then restart the app
+with JavaBridge() as jab:
+    jab.window("Order Entry*").find('button "Save"').click()
+
+from locum.bridges.remote import ImageSession       # Citrix / RDP: pixels + OCR, bound to the window
+ImageSession(d.window(app="wfica32")).click_text("Purchase Orders")
+```
+
+Every bridge action goes through the same `Policy` as the rest of locum.
 
 ### Vision: template matching with alpha masks
 
@@ -373,8 +413,9 @@ authorized = Policy.strict(allow=[              # default-deny: only these run w
 The default policy is a **heuristic tripwire**, not authorization. A human
 `confirm` is needed (and without a callback the action is **blocked**) when the
 target looks like a commit — *pay, transfer, wire, submit, send, delete, approve,
-post, purchase, release, …*, their plurals and German SAP labels such as *Buchen*
-and *Überweisen* — when Ctrl/Cmd+Enter or Ctrl/Cmd+S is pressed, or when a click,
+post, purchase, release, …* in English, German, French, Spanish, Portuguese,
+Italian and Dutch, accents ignored (*Buchen*, *Überweisen*, *Supprimer*,
+*Eliminar*, *Verwijderen*) — when Ctrl/Cmd+Enter or Ctrl/Cmd+S is pressed, or when a click,
 Enter or field entry reaches a control that cannot be identified (nothing under
 the pointer, or no name, automation id, value or named child: an icon-only
 button). Keyword matching misses other languages, "Continue"/"Apply"-style
@@ -388,9 +429,24 @@ of your rules — a selector, `"window=..."`, `"app=..."`, `"launch=..."`,
 mouse actually presses (not the container around it), or the default button that
 Enter presses. A rule without `keys=` covers only typing, editing and navigation
 keys and Enter/Space on the control it names; application shortcuts such as
-Escape, F-keys or Alt+F4 need a `keys=` rule. Robots and flows are gated only when
-you pass a policy (`Robot(policy=...)`, `run_flow(..., policy=...)`); without one
-they run ungated as before. Text typed into password fields is masked in audit
+Escape, F-keys or Alt+F4 need a `keys=` rule.
+
+**Robots, flows and `locum run` are gated by default** with `Policy.default()`
+(since 0.3). They run unattended, so a flagged action is **blocked**, not asked
+about, and the error says how to allow it:
+
+```python
+from locum.llm import Policy
+from locum.rpa import Robot
+
+robot = Robot(policy=Policy.default(exempt=['button "Delete row"']))  # let this target through
+robot = Robot(confirm=lambda what, details: input(f"{what}? ") == "y")  # or ask a human
+robot = Robot(policy=Policy.off())                                        # or opt out, explicitly
+```
+
+A flow declares the commits it intends with a top-level `exempt:` list
+(`- {window: "*Excel*", keys: "mod+s"}`). On the CLI, `locum run flow.yaml
+--exempt 'button "Delete row"'`, `--confirm` and `--no-policy` do the same. Text typed into password fields is masked in audit
 logs and recordings. Details: [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md#6-safety-model).
 
 ### PyAutoGUI compatibility
@@ -440,17 +496,38 @@ backend uses.
 | Platform | Input | Screenshots | Windows | Accessibility | Notes |
 |----------|-------|-------------|---------|---------------|-------|
 | Windows 10/11 | SendInput (Unicode, DPI-aware, multi-monitor) | mss / GDI | Win32 | **UI Automation** (comtypes) | run as the same integrity level as the target app (UAC); text locum puts on the clipboard is kept out of Clipboard History (Win+V) and cloud sync (`WindowsBackend(clipboard_history=True)` allows it) |
-| macOS 12+ | Quartz events | Quartz (Retina-aware) | Quartz / AppKit | **AX API** | needs Accessibility + Screen Recording permission; not yet validated on a real Mac |
+| macOS 12+ | Quartz events | Quartz (Retina-aware) | Quartz / AppKit | **AX API** | needs Accessibility + Screen Recording permission |
 | Linux X11 | XTEST (Unicode via spare keycodes) | mss / XGetImage | EWMH | **AT-SPI** (PyGObject) | native X11 clipboard (xclip/xsel optional) |
-| Linux Wayland | XWayland apps only | XWayland only | XWayland only | AT-SPI works | see below |
+| Linux Wayland (experimental) | RemoteDesktop portal (keysyms on the active layout; absolute pointer per ScreenCast stream) | Screenshot portal (slow; may prompt) | list only (AT-SPI): no activate/move/close | **AT-SPI** (element bounds hidden by default) | `pip install locum[wayland]`, `LOCUM_BACKEND=wayland`; GNOME/KDE portals; not yet validated on a real compositor |
 | Any (tests, CI, evals) | `MockBackend` / `DemoBackend` | ✓ | ✓ | ✓ | deterministic, no display |
 
-**Wayland:** Wayland deliberately prevents applications from
-injecting input into, or capturing, other applications. The X11 backend works
-inside an X11 session and with XWayland windows; native Wayland windows cannot
-be driven or captured through it. Use an X11 session (“GNOME on Xorg”) for
-full-desktop automation; portal-based (`xdg-desktop-portal` RemoteDesktop /
-ScreenCast) support is not implemented yet.
+**Wayland (experimental):** Wayland deliberately prevents applications from
+injecting input into, or capturing, other applications. The sanctioned route
+is xdg-desktop-portal. With `pip install locum[wayland]` and
+`LOCUM_BACKEND=wayland`, locum uses three portal channels:
+RemoteDesktop + ScreenCast for keyboard and pointer (the compositor asks for
+approval once; the restore token is kept in
+`$XDG_STATE_HOME/locum/wayland-portal.json`), the Screenshot portal for capture
+(it may ask for permission and is much slower than X11), and AT-SPI for
+windows and elements. It is picked automatically only in a Wayland session
+with no X server. With XWayland present, the tested `x11` backend stays the
+default.
+
+What Wayland does not allow is refused, not faked:
+
+* windows cannot be activated, moved, resized or closed;
+* window positions and stacking order are unknown, so input bound to a window
+  is refused when its destination cannot be verified;
+* element bounds are hidden by default, because toolkits report
+  window-relative extents, so elements are driven with native actions;
+* the corner fail-safe cannot see you move the mouse, so use the kill hotkey;
+* typing is limited to characters on the active keyboard layout; others are
+  pasted when wl-clipboard is installed.
+
+GNOME and KDE implement the needed portals. xdg-desktop-portal-wlr (Sway and
+other wlroots compositors) has no RemoteDesktop, so only screenshots work
+there. `locum info` lists these limitations. For full-desktop automation, an
+X11 session ("GNOME on Xorg") remains the tested path.
 
 ## Safety notes for LLM control
 

@@ -10,7 +10,105 @@ were the only record at the time.
 
 ## [Unreleased]
 
-<!-- UNRELEASED -->
+### Breaking
+
+- **Safety policy on by default for RPA.** `Robot()`, `run_flow()` and `locum run`
+  now gate every action with `Policy.default()` instead of running ungated. The
+  default is the keyword and shortcut tripwire. Robots and flows are unattended,
+  so an action the tripwire flags is **blocked** unless a `confirm` callback is
+  given. Flagged actions are clicks on Delete/Pay/Submit/Post/Supprimer/
+  Überweisen…, Ctrl/Cmd+S, Ctrl/Cmd+Enter, and activating a control that
+  cannot be identified. Launch options `cwd=`/`env=` are refused unless allowed.
+  The `PolicyViolation` message says how to let the action run.
+  **Migration:** exempt the intended targets
+  (`Robot(policy=Policy.default(exempt=['button "Delete row"']))`, `exempt:` in
+  the flow, `locum run --exempt ...`) or pass `confirm=`. To restore the 0.2
+  behaviour, opt out explicitly with `policy=Policy.off()` (or `policy=None`)
+  or `locum run --no-policy`.
+- `RunReport.metadata["policy"]` now holds the preset name (`default` /
+  `strict` / `permissive` / `custom` / `off`). The mode moved to
+  `metadata["policy_mode"]`.
+- `Window.screenshot()` of a partly off-screen window now returns the whole
+  window (captured from the window itself) instead of the clipped screen area.
+  `mode="screen"` gives the old result.
+
+### Added
+
+- **Selectors: sibling combinators.** `A + B` matches a B right after an A
+  under the same parent. `A ~ B` matches any later sibling B. Both compose with
+  the other combinators and pseudo-classes
+  (`window "Calc" > pane text "Name:" + edit`). `~=` is still the regex
+  attribute operator.
+- **Covered and minimized windows can be captured.**
+  `Window.screenshot(mode="auto"|"screen"|"window", restore_minimized=False)`
+  uses `PrintWindow(PW_RENDERFULLCONTENT)` on Windows, `CGWindowListCreateImage`
+  on macOS and the Composite pixmap on X11, through the new
+  `Backend.capture_window` and `CAP_WINDOW_CAPTURE`. `restore_minimized=True`
+  shows a minimized window without activating it, captures it, and minimizes it
+  again (Windows). `observe(window=...)` of a covered window shows its real
+  content. `locum screenshot --window TITLE [--mode] [--restore-minimized]`.
+- **Bridges for UIs that UI Automation can't see into** ([docs/BRIDGES.md](docs/BRIDGES.md)):
+  - `locum.bridges.sap` (`pip install locum[sap]`): SAP GUI Scripting over COM.
+    `attach()` by system/client/user/connection/session and refuses ambiguous
+    matches. `find(id)` returns typed wrappers (text fields, buttons, combo
+    boxes, check/radio buttons, tabs, table controls, ALV grids, status bar).
+    Also `send_vkey`, `start_transaction`, busy waits, `check_status()` →
+    `SapError`, and locum selectors over SAP screens. Clear errors when
+    scripting is disabled on the PC or by `sapgui/user_scripting`.
+  - `locum.bridges.java`: Java Access Bridge via ctypes
+    (`WindowsAccessBridge-64/-32.dll`). Swing/AWT trees work as locum
+    accessibility nodes (selectors, `find`/`find_all`). `click()` uses
+    AccessibleAction or a window-bound mouse click. `set_text` reads back; Java
+    object references are released automatically.
+  - `locum.bridges.remote.ImageSession`: template matching and OCR confined to a
+    Citrix/RDP/Horizon window, with input bound to it.
+  - Every acting bridge call honours the fail-safe and goes through `Policy`
+    (confirmation, allow and exempt rules, dry run, audit).
+- **Native Wayland backend (experimental, not yet validated on a real
+  compositor).** `LOCUM_BACKEND=wayland` (`pip install locum[wayland]`) drives
+  Wayland through xdg-desktop-portal. RemoteDesktop + ScreenCast handle keyboard
+  and absolute pointer input (one approval; the restore token is kept in
+  `$XDG_STATE_HOME/locum/wayland-portal.json`). The Screenshot portal handles
+  capture, and AT-SPI handles windows and elements. It is chosen automatically
+  only in a Wayland session with no X server. With XWayland available, the
+  tested `x11` backend stays the default. Window activate/move/close raise
+  `NotSupported`. Input bound to a window is refused when its destination
+  cannot be verified. GNOME and KDE portals; xdg-desktop-portal-wlr has no
+  RemoteDesktop (screenshots only).
+- `Policy.default()`, `Policy.off()`, `Policy(exempt=[...])`, `Policy.preset`.
+  Flows can declare a top-level `exempt:` list. `locum run --policy
+  default|strict|permissive|off`, `--no-policy`, `--exempt RULE`, `--confirm`,
+  `--dry-run`, `--audit FILE`.
+- The keyword tripwire covers English, German, French, Spanish, Portuguese,
+  Italian and Dutch, matched accent-insensitively.
+- `python -m locum.selftest --strict` (a skipped check fails the run) and
+  `--retries N`. New self-test check: window capture. The window-list check now
+  requires the launched editor to be listed.
+- `locum info` lists backend limitations and the `jeepney` optional dependency.
+- [docs/API.md](docs/API.md): what is public, what counts as breaking, the
+  deprecation rule, and a snapshot test (`tests/data/public_api.txt`) that fails
+  CI on any unreviewed public API change. This changelog.
+
+<!-- AGENT6 -->
+
+### Fixed
+
+- **Linux: every text field read as empty.** On current libatspi/PyGObject,
+  `Atspi.Accessible.get_text()` is a deprecated zero-argument alias of
+  `get_text_iface()`. It shadowed `Atspi.Text.get_text(start, end)`, so
+  `Element.value`/`.text` returned `None`. Verified typing, `set_text`
+  verification and the self-test all failed on a real AT-SPI desktop. Found by
+  the new Linux real-desktop CI job.
+- A mouse move on a backend that cannot read the pointer position jumps to the
+  target instead of failing.
+
+### CI
+
+- The real-desktop self-tests are **blocking** on all three OSes, run with
+  `--strict --retries 2`: Windows (hosted runner desktop), macOS (hosted
+  runner: Quartz, AX, TextEdit) and Linux (Xvfb + openbox + real D-Bus/AT-SPI
+  registry + GTK mousepad). Before, Windows was `continue-on-error`, and macOS
+  and Linux had no real-desktop job.
 
 
 ## [0.2.0] - 2026-11-06
