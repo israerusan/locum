@@ -469,6 +469,30 @@ Exit codes: 0 ok · 1 failed (not found, timeout, policy, failed flow/agent) ·
 
 All of them run on the demo desktop: `LOCUM_BACKEND=mock python examples/<file>`.
 
+## Demos
+
+Two short scripts drive real Windows 11 apps through accessibility selectors and
+mouse drags. Run them on a Windows desktop (moving the mouse into a screen corner aborts):
+
+```bash
+python examples/calculator_selectors.py --expr "12+30"   # clicks button#num1Button, "Plus"... reads #CalculatorResults
+python examples/paint_drawing.py                           # draws a star and a spiral on the Paint canvas
+```
+
+Both ship a mock version of their app, so they run anywhere without touching your screen:
+
+```bash
+python examples/calculator_selectors.py --backend mock
+python examples/paint_drawing.py --backend mock
+python tools/make_demo_gif.py                              # re-records docs/demo.gif from the mock runs
+```
+
+![The Calculator and Paint demos running on locum's mock desktop](https://raw.githubusercontent.com/israerusan/locum/main/docs/demo.gif)
+
+*Recorded on locum's in-memory mock desktop (`tools/make_demo_gif.py`), not on a real
+Windows screen: the windows are the demos' mock Calculator and Paint, driven by the same
+selector and drag code that runs against the real apps.*
+
 ## License
 
 MIT.

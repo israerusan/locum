@@ -52,6 +52,10 @@ dev = ["pytest>=7", "pyyaml>=6.0"]
 locum = "locum.cli:main"
 locum-mcp = "locum.mcp:main"
 
+# pytest plugin: desktop/app fixtures, --locum-backend, traces of failing tests (docs/TESTING.md).
+[project.entry-points.pytest11]
+locum = "locum.pytest_plugin"
+
 [tool.hatch.version]
 source = "vcs"
 
@@ -60,7 +64,7 @@ version-file = "src/locum/_version.py"
 
 [tool.hatch.build.targets.sdist]
 # An explicit list: never ship stray local folders (agent worktrees, venvs, run output).
-include = ["src/locum", "tests", "docs", "examples", "README.md", "LICENSE", "pyproject.toml"]
+include = ["src/locum", "tests", "docs", "examples", "tools", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/locum"]

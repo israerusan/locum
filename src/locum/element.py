@@ -368,7 +368,15 @@ class Element:
             came from ``find_all()``/``wait()`` (``None`` = the first match, as
             for ``find()``). :meth:`refresh` and the ``"gone"``/``"exists"``
             waits use it so the element never silently turns into another match.
+
+    Attributes:
+        healed: A :class:`~locum.heal.HealInfo` when the element was found by a
+            self-repaired selector (its :attr:`selector` is then the new one),
+            else ``None``.
     """
+
+    #: Set by a healed lookup (see :mod:`locum.heal`); ``None`` for normal matches.
+    healed: Any = None
 
     def __init__(
         self,
@@ -499,9 +507,14 @@ class Element:
         kids = _safe(lambda: list(self._node.children()), []) or []
         return [self._wrap(k) for k in kids]
 
-    def find(self, selector: Any, timeout: Optional[float] = None) -> "Element":
+    def find(self, selector: Any, timeout: Optional[float] = None, *, heal: Optional[bool] = None,
+             fingerprint: Any = None) -> "Element":
         """First descendant matching ``selector``, polling up to ``timeout`` seconds
-        (``None`` = ``desktop.default_timeout``). Raises :class:`ElementNotFound`."""
+        (``None`` = ``desktop.default_timeout``). Raises :class:`ElementNotFound`.
+
+        ``heal`` (default: the desktop's ``heal_selectors``) and ``fingerprint``
+        enable self-repair inside this element as in :meth:`Desktop.find`."""
+        from .heal import enabled as _heal_enabled
         from .selectors import parse
 
         sel = parse(selector)
@@ -511,7 +524,21 @@ class Element:
             node = _poll_find(self.desktop, lambda: sel.find_first([self._node], include_roots=False), timeout)
         except ActionTimeout as exc:
             shown = selector if isinstance(selector, str) else str(sel)
-            raise ElementNotFound(f"No element matching {shown!r} inside {self!r} within {timeout:g}s") from exc
+            msg = f"No element matching {shown!r} inside {self!r} within {timeout:g}s"
+            default = getattr(self.desktop, "heal_selectors", False)
+            if not _heal_enabled(heal, default):
+                raise ElementNotFound(msg) from exc
+            from .heal import HealOptions, heal as _heal, log_heal
+
+            outcome = _heal(sel, [self._node], fingerprint=fingerprint, include_roots=False, selector_text=shown,
+                            selector_root=self._node, log=False,
+                            options=default if isinstance(default, HealOptions) else None)
+            if not outcome:
+                raise ElementNotFound(f"{msg} (self-healing: {outcome.reason})") from exc
+            el = Element(outcome.node, self.desktop, outcome.info.new_selector, scope=self)
+            el.healed = outcome.info
+            log_heal(outcome.info)
+            return el
         return Element(node, self.desktop, selector if isinstance(selector, str) else str(sel), scope=self)
 
     def find_all(self, selector: Any) -> List["Element"]:
@@ -526,9 +553,9 @@ class Element:
         ]
 
     def exists(self, selector: Any, timeout: float = 0) -> bool:
-        """Whether a descendant matching ``selector`` appears within ``timeout`` seconds."""
+        """Whether a descendant matching ``selector`` appears within ``timeout`` seconds (never heals)."""
         try:
-            self.find(selector, timeout=timeout)
+            self.find(selector, timeout=timeout, heal=False)
             return True
         except ElementNotFound:
             return False
@@ -1357,6 +1384,12 @@ class Element:
         return self
 
     # ------------------------------------------------------------------- misc
+    def fingerprint(self) -> Any:
+        """A :class:`~locum.heal.Fingerprint` of the element now (store it to help a later heal)."""
+        from .heal import Fingerprint
+
+        return Fingerprint.from_element(self)
+
     def to_dict(self) -> dict:
         b = self.bounds
         return {

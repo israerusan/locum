@@ -18,6 +18,7 @@
     locum agent "Enter invoice INV-7 for ACME, 120.50" --dry-run
     locum run flow.yaml --var customer=ACME --report-dir runs
     locum record -o recording.py
+    locum a11y-audit Paint --fail-on warning     # unnamed / unreachable controls, labels
 
 Global options come before the command: ``--backend NAME`` (``mock`` gives an
 in-memory demo desktop with an ERP form, a spreadsheet and a text editor, ideal
@@ -945,7 +946,7 @@ def cmd_record(ctx: _Ctx, *, sleep: Callable[[float], Any] = time.sleep, clock: 
         except ImportError:
             raise ImportError("Saving YAML flows requires PyYAML: pip install locum[yaml] "
                               "(or record to a .json/.py file)") from None
-    rec = Recorder(ctx.desktop)
+    rec = Recorder(ctx.desktop, use_selectors=not getattr(a, "no_selectors", False))
     source = a.source
     from .backends.mock import MockBackend
 
@@ -965,7 +966,7 @@ def cmd_record(ctx: _Ctx, *, sleep: Callable[[float], Any] = time.sleep, clock: 
     finally:
         actions = rec.stop()
     try:
-        path = rec.save(a.output)
+        path = rec.save(a.output, name=getattr(a, "name", None))
     except Exception as exc:
         # Never lose a recording session to a save error (unwritable path, missing PyYAML...):
         # keep it as JSON in the current (or temp) directory and still report the failure.
@@ -979,6 +980,29 @@ def cmd_record(ctx: _Ctx, *, sleep: Callable[[float], Any] = time.sleep, clock: 
     else:
         ctx.print(f"recorded {len(actions)} action(s) to {os.path.abspath(path)}")
     return EXIT_OK
+
+
+def cmd_a11y_audit(ctx: _Ctx) -> int:
+    from .a11y import audit
+
+    a = ctx.args
+    if a.max_depth < 0:
+        raise _UsageError("--max-depth must be >= 0")
+    if a.min_target_size < 0:
+        raise _UsageError("--min-target-size must be >= 0")
+    if a.time_budget is not None and a.time_budget < 0:
+        raise _UsageError("--time-budget must be >= 0")
+    report = audit(ctx.desktop, a.window, max_depth=a.max_depth, min_target_size=a.min_target_size,
+                   time_budget=a.time_budget or None, selectors=not a.no_selectors)
+    failed = report.failed(a.fail_on)
+    if ctx.json:
+        data = report.to_dict()
+        data["fail_on"] = a.fail_on
+        data["failed"] = failed
+        ctx.emit_json(data)
+    else:
+        ctx.print(report.format_text())
+    return EXIT_FAILURE if failed else EXIT_OK
 
 
 def _rescue_recording(rec: Any, wanted: str) -> Optional[str]:
@@ -1014,6 +1038,7 @@ COMMANDS: Dict[str, Callable[[_Ctx], int]] = {
     "agent": cmd_agent,
     "run": cmd_run,
     "record": cmd_record,
+    "a11y-audit": cmd_a11y_audit,
 }
 
 
@@ -1185,9 +1210,60 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--validate", action="store_true", help="only validate the flow")
 
     p = add("record", "record mouse/keyboard input as a Python script or a flow")
+    p.formatter_class = argparse.RawDescriptionHelpFormatter
+    p.description = "".join(line + "\n" for line in (
+        "Record your mouse/keyboard session and write it as a Python script (.py, Desktop API)",
+        "or a flow for `locum run` (.yaml/.yml/.json). Clicks and typing are recorded with",
+        "accessibility selectors (window 'Title' button 'OK'); screen coordinates are used",
+        "only where no element is under the pointer. Text typed into password fields is never",
+        "written: the script/flow reads it from the LOCUM_PASSWORD environment variable.",
+        "Live recording needs pynput (pip install locum[record]); with --backend mock only the",
+        "actions performed on the simulated desktop are recorded.",
+    ))
+    p.epilog = "\n".join((
+        "examples:",
+        "  locum record -o login.py                 # stop with Ctrl+C",
+        "  locum record -o login.yaml --duration 60",
+        "  locum run login.yaml                     # replay the flow",
+    ))
     p.add_argument("-o", "--output", default="recording.py", metavar="PATH", help=".py, .yaml/.yml or .json (default recording.py)")
     p.add_argument("--duration", type=float, default=None, metavar="SECONDS", help="stop after SECONDS (default: Ctrl+C)")
-    p.add_argument("--source", choices=("auto", "pynput"), default="auto", help=argparse.SUPPRESS)
+    p.add_argument("--no-selectors", action="store_true",
+                   help="record screen coordinates only (faster on huge accessibility trees, but brittle)")
+    p.add_argument("--name", metavar="NAME", help="flow name for .yaml/.json output (default: the file name)")
+    p.add_argument("--source", choices=("auto", "pynput"), default="auto",
+                   help="input source: global OS hooks via pynput (auto = pynput, or the simulated "
+                        "desktop's own actions with --backend mock)")
+
+    p = add("a11y-audit", "audit a window's accessibility: unnamed controls, unreachable controls, missing labels")
+    p.formatter_class = argparse.RawDescriptionHelpFormatter
+    p.description = "\n".join((
+        "Walk the accessibility tree of WINDOW (default: every window) read-only -- nothing is",
+        "clicked or typed -- and report: interactive controls without an accessible name",
+        "(unnamed-control), text inputs without a name/label (unlabeled-input), unnamed images,",
+        "untitled windows, controls the keyboard cannot focus (not-focusable), click targets",
+        "under --min-target-size px that crowd another target (small-target, WCAG 2.5.8),",
+        "sibling controls sharing a name (duplicate-name) and offscreen-flagged controls inside",
+        "a visible parent (offscreen-visible). Rules are described in docs/A11Y.md.",
+        "",
+        "Exit code 1 when findings at or above --fail-on exist (default: error).",
+    ))
+    p.epilog = "\n".join((
+        "examples:",
+        "  locum a11y-audit Paint",
+        "  locum a11y-audit \"Untitled - Notepad\" --fail-on warning --json",
+        "  locum --backend mock a11y-audit \"Invoice Entry\"",
+    ))
+    p.add_argument("window", nargs="?", metavar="WINDOW",
+                   help="window title (exact, substring or glob, like --window elsewhere); default: every window")
+    p.add_argument("--max-depth", type=int, default=32, metavar="N", help="maximum tree depth (default 32)")
+    p.add_argument("--min-target-size", type=int, default=24, metavar="PX",
+                   help="minimum click-target size in pixels for small-target (default 24; 0 disables)")
+    p.add_argument("--fail-on", choices=("error", "warning", "never"), default="error",
+                   help="exit 1 when findings of this severity or worse exist (default error)")
+    p.add_argument("--time-budget", type=float, default=30.0, metavar="SECONDS",
+                   help="stop walking after SECONDS and report partial results (default 30; 0 = no limit)")
+    p.add_argument("--no-selectors", action="store_true", help="do not compute a selector per finding (faster)")
     return parser
 
 

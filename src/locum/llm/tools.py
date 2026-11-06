@@ -901,7 +901,12 @@ class DesktopToolkit:
                     # A query tool the policy does not treat as read-only never reaches
                     # ``_act``: check (and count) it here, or it would run unchecked.
                     self.policy.check(name, kwargs, context=self._context(description=f"run {name}"))
-                result = _to_result(method(**kwargs))
+                # Never act on a self-healed (guessed) element from the LLM tools: the model
+                # re-observes instead, whatever Desktop(heal_selectors=...) says.
+                from ..heal import suppressed as _no_heal
+
+                with _no_heal():
+                    result = _to_result(method(**kwargs))
                 if result.is_error:
                     status = "error"
                 elif isinstance(result.data, dict) and result.data.get("dry_run"):

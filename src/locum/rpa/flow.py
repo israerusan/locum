@@ -60,7 +60,7 @@ A ``target`` that ends in an image extension (``warn.png``) or is a
 flow's directory; a missing file is an error, never a selector.
 
 Common step keys: ``name``, ``retries``, ``retry_delay``, ``timeout``,
-``continue_on_error``, ``description``. ``settings.retries``/``retry_delay``
+``continue_on_error``, ``description``, ``heal``, ``fingerprint``. ``settings.retries``/``retry_delay``
 apply to action steps only: a failing step inside ``for_each``/``try``/``call``...
 is retried on its own, the block is never re-run (iterations that already
 succeeded -- a payment -- are not repeated). An explicit ``retries:`` on a
@@ -83,6 +83,17 @@ that is exactly one ``${...}`` keeps the value's type (lists stay lists).
 
 Errors carry the step path, e.g. ``steps[3].for_each.steps[1]``; invalid
 documents are rejected *before* anything runs, with every problem listed.
+
+Self-repairing selectors (opt-in, see :mod:`locum.heal`): ``heal: true`` in
+``settings`` or on a step (a control step passes it to the steps inside it;
+the nearest explicit ``heal:`` wins) lets a step whose selector matches
+nothing act on the clear best look-alike instead of failing; ``heal: false``
+turns it off again (also against ``Desktop(heal_selectors=True)``). A step may
+carry ``fingerprint: {role, name, automation_id, bounds: [l, t, w, h], window}``
+-- what its element looked like when the flow was recorded -- to heal on the
+previous position too. Every heal is logged at warning level and recorded in
+the step's report data (``healed``). Existence checks (``if_exists``,
+``assert_exists``, ``wait_gone``) never heal.
 
 Safety policy (opt-in): ``run_flow(doc, desktop, policy=Policy.strict(allow=[...]),
 confirm=..., audit=...)`` runs the flow on a
@@ -133,7 +144,7 @@ __all__ = [
 
 PathLike = Union[str, "os.PathLike[str]"]
 
-COMMON_KEYS = frozenset({"name", "retries", "retry_delay", "timeout", "continue_on_error", "description"})
+COMMON_KEYS = frozenset({"name", "retries", "retry_delay", "timeout", "continue_on_error", "description", "heal", "fingerprint"})
 CONTROL_STEPS = frozenset({"if_exists", "for_each", "try", "repeat", "call"})
 _NESTED_KEYS = {"if_exists": ("then", "else"), "for_each": ("steps",), "try": ("steps", "catch", "finally"), "repeat": ("steps",), "call": ()}
 
@@ -493,13 +504,15 @@ def validate_flow(doc: Mapping[str, Any], *, prefix: str = "") -> List[str]:
         if not isinstance(doc["settings"], Mapping):
             problems.append(f"{prefix or 'flow'}: 'settings' must be a mapping")
         else:
-            allowed = {"timeout", "retries", "retry_delay", "continue_on_error", "screenshot_on_error"}
+            allowed = {"timeout", "retries", "retry_delay", "continue_on_error", "screenshot_on_error", "heal"}
             for k in doc["settings"]:
                 if k not in allowed:
                     problems.append(f"{prefix or 'flow'}: unknown setting {k!r}{_suggest(k, sorted(allowed))}")
             shot = doc["settings"].get("screenshot_on_error")
             if shot is not None and not isinstance(shot, bool) and str(shot).strip().lower() not in _TRUE_WORDS + _FALSE_WORDS:
                 problems.append(f"{prefix or 'flow'}: settings.screenshot_on_error must be true or false")
+            if not _is_bool_like(doc["settings"].get("heal")):
+                problems.append(f"{prefix or 'flow'}: settings.heal must be true or false")
     flows = doc.get("flows")
     if flows is not None:
         if not isinstance(flows, Mapping):
@@ -540,6 +553,19 @@ def _validate_step(step: Any, path: str, problems: List[str]) -> None:
     for key in ("retry_delay", "timeout"):
         if key in step and not _is_number_like(step[key]):
             problems.append(f"{path}: {key!r} must be a number")
+    if "heal" in step and not _is_bool_like(step["heal"]):
+        problems.append(f"{path}: 'heal' must be true or false")
+    if step.get("fingerprint") is not None:
+        if kind in CONTROL_STEPS:
+            problems.append(f"{path}: 'fingerprint' belongs on the step that acts on the element, not on {kind!r}")
+        elif not isinstance(step["fingerprint"], Mapping):
+            problems.append(f"{path}.fingerprint: must be a mapping (role, name, automation_id, bounds, window...)")
+        else:
+            from ..heal import FINGERPRINT_KEYS
+
+            for k in step["fingerprint"]:
+                if k not in FINGERPRINT_KEYS:
+                    problems.append(f"{path}.fingerprint: unknown key {k!r}{_suggest(k, FINGERPRINT_KEYS)}")
     value = step[kind]
     shorthand, allowed = _SPEC[kind]
     where = f"{path}.{kind}"
@@ -640,6 +666,15 @@ def _is_int_like(v: Any) -> bool:
     return False
 
 
+def _is_bool_like(v: Any) -> bool:
+    """``None`` (absent), a bool, a true/false word or a ``${variable}``."""
+    if v is None or isinstance(v, bool):
+        return True
+    if isinstance(v, str):
+        return "${" in v or v.strip().lower() in _TRUE_WORDS + _FALSE_WORDS
+    return False
+
+
 def _is_number_like(v: Any) -> bool:
     if isinstance(v, bool):
         return False
@@ -700,6 +735,8 @@ class FlowRunner:
         self.screenshot_on_error = screenshot_on_error
         self.logger = logger or logging.getLogger("locum.flow")
         self._contexts: List[str] = []  # human context (loop iterations) for error messages
+        # One entry per running step: its explicit ``heal:``, the resolved value, its fingerprint, its result.
+        self._heal_stack: List[Dict[str, Any]] = []
         self._shots = 0
 
     # ---------------------------------------------------------------- helpers
@@ -760,6 +797,59 @@ class FlowRunner:
                 return Point(int(round(float(m.group(1)))), int(round(float(m.group(2)))))
         return None
 
+    # ---------------------------------------------------------------- self-healing
+    def _push_heal(self, step: Mapping[str, Any], kind: str, scope: _Scope, result: StepResult, path: str) -> None:
+        explicit: Optional[bool] = None
+        if step.get("heal") is not None:
+            explicit = _bool_arg(interpolate(step["heal"], self.vars, path=path), "heal")
+        resolved = explicit
+        if resolved is None:
+            resolved = next((e["explicit"] for e in reversed(self._heal_stack) if e["explicit"] is not None), None)
+        if resolved is None and scope.settings.get("heal") is not None:
+            resolved = _bool_arg(interpolate(scope.settings["heal"], self.vars, path=path), "settings.heal")
+        fp = None
+        if step.get("fingerprint") is not None and kind not in CONTROL_STEPS:
+            from ..heal import Fingerprint
+
+            try:
+                fp = Fingerprint.from_dict(interpolate(step["fingerprint"], self.vars, path=path))
+            except (TypeError, ValueError) as exc:
+                raise WorkflowError(f"invalid fingerprint: {exc}") from None
+        self._heal_stack.append({"explicit": explicit, "heal": resolved, "fingerprint": fp, "result": result, "path": path})
+
+    def _heal_kw(self, *, allow: bool = True) -> Dict[str, Any]:
+        """Keyword arguments for ``desktop.find``/``wait`` (none when healing is not in play,
+        so desktops without the ``heal`` parameter keep working)."""
+        entry = self._heal_stack[-1] if self._heal_stack else None
+        want = entry["heal"] if entry is not None else None
+        default = bool(getattr(self.desktop, "heal_selectors", False))
+        if not allow:
+            return {"heal": False} if default else {}
+        kw: Dict[str, Any] = {}
+        if want is True:
+            kw["heal"] = True
+        elif want is False and default:
+            kw["heal"] = False
+        if entry is not None and entry["fingerprint"] is not None and (want or (want is None and default)):
+            kw["fingerprint"] = entry["fingerprint"]
+        return kw
+
+    def _record_heal(self, element: Any) -> None:
+        """Put a healed lookup in the running step's report data and the flow log."""
+        info = getattr(element, "healed", None) if element is not None else None
+        if info is None or not self._heal_stack:
+            return
+        entry = self._heal_stack[-1]
+        entry["result"].data.setdefault("healed", []).append(info.to_dict())
+        self.log(f"healed selector {info.old_selector!r} -> {info.new_selector!r} (score {info.score:.2f}): {info.diff}",
+                 level="warning", path=entry["path"])
+
+    def _find(self, value: Any, timeout: Optional[float]) -> Any:
+        """``desktop.find`` for a step's target, healing when the step allows it."""
+        el = self.desktop.find(value, timeout=timeout, **self._heal_kw())
+        self._record_heal(el)
+        return el
+
     def _target(self, args: Mapping[str, Any], timeout: Optional[float], scope: _Scope, *, key: str = "target") -> Any:
         """Resolve a target argument into an Element, Match or Point."""
         d = self.desktop
@@ -768,7 +858,7 @@ class FlowRunner:
                 raise WorkflowError("'x' and 'y' must be given together")
             return Point(int(round(float(args["x"]))), int(round(float(args["y"]))))
         if args.get("selector") is not None:
-            return d.find(args["selector"], timeout=timeout)
+            return self._find(args["selector"], timeout)
         if args.get("image") is not None:
             kw = {"confidence": float(args["confidence"])} if args.get("confidence") is not None else {}
             return d.wait_image(self._image(args["image"], scope), timeout=timeout, **kw)
@@ -786,7 +876,7 @@ class FlowRunner:
             image = self._image_ref(value, scope)
             if image is not None:
                 return self.desktop.wait_image(image, timeout=timeout)
-            return self.desktop.find(value, timeout=timeout)
+            return self._find(value, timeout)
         raise WorkflowError(f"cannot use {value!r} as a target (expected a selector, 'x,y', [x, y], or an image path)")
 
     def _element(self, value: Any, timeout: Optional[float]) -> Any:
@@ -794,7 +884,7 @@ class FlowRunner:
             value = value["selector"]
         if not isinstance(value, (str, Mapping)):
             raise WorkflowError(f"expected a selector, got {value!r}")
-        return self.desktop.find(value, timeout=timeout)
+        return self._find(value, timeout)
 
     def _keys(self, value: Any) -> List[str]:
         if isinstance(value, str):
@@ -825,7 +915,7 @@ class FlowRunner:
             parts = [p.strip() for p in value.split(",")]
             if len(parts) == 4 and all(p.lstrip("-").isdigit() for p in parts):
                 return Rect(*(int(p) for p in parts))
-            return self.desktop.find(value, timeout=0)
+            return self.desktop.find(value, timeout=0, **self._heal_kw(allow=False))
         raise WorkflowError(f"region must be [left, top, width, height] or a selector, got {value!r}")
 
     # ---------------------------------------------------------------- leaf actions
@@ -909,7 +999,11 @@ class FlowRunner:
             state = args.get("state", "visible")
             target = args["target"]
             image = self._image_ref(target, scope)
-            found = d.wait(target if image is None else image, state=state, timeout=self._timeout(args, step, scope))
+            heal_kw = self._heal_kw() if image is None and str(state).lower() != "gone" else {}
+            found = d.wait(target if image is None else image, state=state, timeout=self._timeout(args, step, scope),
+                           **heal_kw)
+            if image is None:
+                self._record_heal(found)
             if found is None:
                 return None
             return {"match": found.to_dict()} if image is not None else {"element": found.to_dict()}
@@ -1003,7 +1097,7 @@ class FlowRunner:
                     raise FlowAssertionError(message or f"expected image {target!r} on screen within {t:g}s")
                 return None
             try:
-                el = d.find(target, timeout=t)
+                el = d.find(target, timeout=t, **self._heal_kw(allow=False))
             except Exception as exc:
                 if type(exc).__name__ != "ElementNotFound":
                     raise
@@ -1324,6 +1418,19 @@ class FlowRunner:
             raise self._fail(result, kind, path, exc, t0) from None
         except (TypeError, ValueError) as exc:
             raise self._fail(result, kind, path, WorkflowError(f"invalid retries/retry_delay: {exc}"), t0) from None
+        try:
+            self._push_heal(step, kind, scope, result, path)
+        except WorkflowError as exc:
+            raise self._fail(result, kind, path, exc, t0) from None
+        try:
+            return self._run_attempts(kind, raw, shorthand, step, scope, path, depth, result, t0, first,
+                                      retries, delay, continue_on_error)
+        finally:
+            self._heal_stack.pop()
+
+    def _run_attempts(self, kind: str, raw: Any, shorthand: Optional[str], step: Mapping[str, Any], scope: _Scope,
+                      path: str, depth: int, result: StepResult, t0: float, first: int, retries: int, delay: float,
+                      continue_on_error: bool) -> StepResult:
         attempts = max(0, retries) + 1
         last: Optional[BaseException] = None
         for attempt in range(1, attempts + 1):

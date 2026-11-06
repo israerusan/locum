@@ -274,6 +274,154 @@ _PASSWORD_REF = "${env." + PASSWORD_ENV + "}"
 _PASSWORD_PY = f"os.environ[{PASSWORD_ENV!r}]"
 
 
+def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _same(a: Any, b: Any) -> bool:
+    if a is b:
+        return True
+    try:
+        return bool(a.same_as(b))
+    except Exception:
+        return False
+
+
+def _root_key(root: Any) -> Tuple[Any, ...]:
+    return (_safe(lambda: root.handle), _safe(lambda: root.role), _safe(lambda: root.name),
+            _safe(lambda: root.automation_id))
+
+
+def _fold(text: Any) -> str:
+    return str(text or "").casefold()
+
+
+class _SelectorCache:
+    """The ``prefix_cache`` of :func:`locum.selectors.selector_for`, kept valid across a recording.
+
+    Each entry ``(top window, prefix, unique)`` remembers whether a window's
+    selector prefix matches only that window among all roots, which costs a walk
+    of *every* window to prove. The cache is checked against the live roots on
+    each capture, and only invalidated where that proof may no longer hold:
+
+    * an entry whose window closed or was retitled is dropped;
+    * a unique prefix is dropped when a new or retitled window has the same
+      title/automation id (it may no longer be unique);
+    * non-unique prefixes (``:nth(k)`` positions among same-titled windows) are
+      dropped on any change of the window list, since positions shift.
+
+    A window with an animated title (a terminal spinner...) thus re-proves only
+    its own prefix, not every window's.
+
+    Missing prefixes are proven for *all* windows in one walk of the desktop
+    (:meth:`_warm`), instead of one full walk per window the first time the
+    user clicks in it.
+    """
+
+    def __init__(self) -> None:
+        self.keys: Optional[List[Tuple[Any, ...]]] = None
+        self.entries: List[Any] = []
+        self._tried: set = set()  # root keys already warmed (a non-unique prefix is not retried)
+
+    def refresh(self, roots: Sequence[Any]) -> List[Any]:
+        keys = [_root_key(r) for r in roots]
+        if self.keys is not None and keys != self.keys:
+            self.entries = self._still_valid(keys)
+        self.keys = keys
+        self._warm(roots)
+        return self.entries
+
+    def _warm(self, roots: Sequence[Any]) -> None:
+        """Add ``(root, prefix, True)`` for every root whose plain prefix is unique, in one walk.
+
+        :func:`~locum.selectors.selector_for` proves a window prefix by counting its
+        matches over every root (a whole-desktop walk per window). Here the prefixes
+        of all not-yet-cached roots are searched together as one union selector, so
+        the desktop is walked once. Prefixes matching several nodes are left to
+        ``selector_for`` (it disambiguates them with ``[app=]`` / ``:nth``).
+        """
+        missing = [r for r in roots if _root_key(r) not in self._tried
+                   and not any(isinstance(e, tuple) and len(e) == 3 and _same(e[0], r) for e in self.entries)]
+        self._tried.update(_root_key(r) for r in missing)
+        if len(missing) < 2:
+            return  # selector_for proves a single prefix just as fast
+        try:
+            from ..selectors import _compound_for, parse  # same package: the prefix selector_for builds
+        except ImportError:  # pragma: no cover - selectors refactored
+            return
+        prefixes: Dict[int, str] = {}
+        for r in missing:
+            sel = _safe(lambda: _compound_for(r, use_id=True))
+            if sel:
+                prefixes[id(r)] = sel
+        if len(prefixes) < 2:
+            return
+        texts = list(dict.fromkeys(prefixes.values()))
+        try:
+            compiled = {t: parse(t) for t in texts}
+            found = parse(", ".join(texts)).find_all(list(roots))
+        except Exception as exc:
+            _log.debug("selector prefix warm-up failed: %s", exc)
+            return
+        counts = {t: 0 for t in texts}
+        first: Dict[str, Any] = {}
+        for node in found:
+            for t, sel in compiled.items():
+                if _safe(lambda: sel.matches(node), False):
+                    counts[t] += 1
+                    first.setdefault(t, node)
+        for r in missing:
+            t = prefixes.get(id(r))
+            if t is not None and counts.get(t) == 1 and _same(first.get(t), r):
+                self.entries.append((r, t, True))
+
+    def _still_valid(self, keys: List[Tuple[Any, ...]]) -> List[Any]:
+        old = set(self.keys or ())
+        new = set(keys)
+        fresh = [k for k in keys if k not in old]
+        fresh_names = [_fold(k[2]) for k in fresh]
+        fresh_ids = {_fold(k[3]) for k in fresh if k[3]}
+        kept: List[Any] = []
+        for entry in self.entries:
+            if not (isinstance(entry, tuple) and len(entry) == 3):
+                return []  # unknown cache format: start over
+            top, _prefix, unique = entry
+            if unique is not True:
+                continue
+            key = _root_key(top)
+            if key not in new or (key[3] and _fold(key[3]) in fresh_ids):
+                continue
+            # Long titles are matched by their first line's first 60 characters (name^=).
+            head = _fold(str(key[2] or "").splitlines()[0][:60] if key[2] else "")
+            if any(f.startswith(head) for f in fresh_names):
+                continue
+            kept.append(entry)
+        return kept
+
+
+def _verify_scope(node: Any, roots: Sequence[Any], prefix_cache: Sequence[Any]) -> List[Any]:
+    """Roots a selector for ``node`` must be checked against.
+
+    When ``node`` lies inside a root whose prefix the cache proved unique, every
+    match of the selector lies inside that root, so checking it alone gives the
+    same answer as searching every window (selector_for relies on the same fact).
+    """
+    cur, hops = node, 0
+    while cur is not None and hops < 256:
+        top = next((r for r in roots if _same(cur, r)), None)
+        if top is not None:
+            entry = next((e for e in prefix_cache if isinstance(e, tuple) and len(e) == 3 and _same(e[0], top)), None)
+            if entry is not None and entry[2] is True:
+                return [top]
+            break
+        cur = _safe(lambda: cur.parent)
+        hops += 1
+    return list(roots)
+
+
 @dataclass
 class RecordedAction:
     """One coalesced user action.
@@ -509,6 +657,7 @@ class Recorder:
         self._hooks: Dict[str, Any] = {}
         self._listeners: List[Any] = []
         self._worker: Optional[Tuple[threading.Thread, "queue.Queue[Any]"]] = None
+        self._sel_caches: Dict[int, _SelectorCache] = {}
         self.started_at: Optional[float] = None
         self._reset_state()
 
@@ -564,6 +713,7 @@ class Recorder:
             if self._source is not None:
                 raise RuntimeError(f"Recorder is already recording (source={self._source!r})")
             self._reset_state()
+            self._sel_caches = {}  # windows may have changed since the last session
             self.started_at = time.time()
             if src in ("auto", "pynput"):
                 self._start_pynput()
@@ -730,13 +880,34 @@ class Recorder:
                 info[attr] = v
         return info
 
+    def _selector_cache(self) -> "_SelectorCache":
+        """This thread's selector cache (accessibility nodes are apartment/thread bound on Windows)."""
+        tid = threading.get_ident()
+        cache = self._sel_caches.get(tid)
+        if cache is None:
+            cache = self._sel_caches[tid] = _SelectorCache()
+        return cache
+
     def _selector(self, node: Any) -> Optional[str]:
+        """A selector that finds ``node`` again from the backend's roots, or ``None``.
+
+        Building one proves uniqueness among *every* window, which on a busy
+        desktop (thousands of accessible elements) costs seconds per element.
+        A recording session therefore shares one ``prefix_cache`` across
+        captures (see :class:`_SelectorCache`): the expensive "is this window's
+        prefix unique" proof runs once for all windows (one desktop walk) and is
+        kept while the windows do not change, and the selector is then built and
+        verified inside its own window only.
+        """
         from ..selectors import parse, selector_for
 
         try:
             roots = list(self.backend.accessibility_roots())
-            sel = selector_for(node, roots=roots)
-            found = parse(sel).find_first(roots)
+            cache = self._selector_cache()
+            prefix_cache = cache.refresh(roots)
+            sel = selector_for(node, roots=roots, prefix_cache=prefix_cache)
+            scope = _verify_scope(node, roots, prefix_cache)
+            found = parse(sel).find_first(scope)
         except Exception as exc:
             _log.debug("selector generation failed: %s", exc)
             return None
@@ -744,15 +915,19 @@ class Recorder:
             return None
         return sel
 
+    def _probe(self, x: int, y: int) -> Any:
+        """``backend.element_at(x, y)``, or ``None`` when unavailable."""
+        try:
+            return self.backend.element_at(x, y)
+        except Exception as exc:  # no accessibility support
+            _log.debug("element_at(%s, %s) failed: %s", x, y, exc)
+            return None
+
     def _capture_point(self, x: int, y: int) -> Dict[str, Any]:
         """Selector (+offset for containers) of the element at ``(x, y)``; empty when unavailable."""
         if not self.use_selectors:
             return {}
-        try:
-            node = self.backend.element_at(x, y)
-        except Exception as exc:  # no accessibility support
-            _log.debug("element_at(%s, %s) failed: %s", x, y, exc)
-            return {}
+        node = self._probe(x, y)
         if node is None:
             return {}
         try:
@@ -1059,7 +1234,7 @@ class Recorder:
         try:
             self.feed(event)
         except Exception as exc:  # recording must never break the automation
-            _log.warning("recorder failed to process %r: %s", event, exc)
+            _log.warning("recorder failed to process a %s event: %s", _event_kind(event), exc)
 
     def _start_pynput(self) -> None:
         try:
@@ -1103,7 +1278,8 @@ class Recorder:
                     if ev is not None:
                         rec.feed(ev)
                 except Exception as err:
-                    _log.warning("recorder failed to process %r: %s", item, err)
+                    _log.warning("recorder failed to process a %s event: %s",
+                                 item[1] if item[0] == "key" else _event_kind(item[1]), err)
 
         def on_move(x: Any, y: Any) -> None:
             events.put(("ev", {"event": "move", "x": x, "y": y, "time": rec._clock()}))
@@ -1203,7 +1379,8 @@ class Recorder:
         actions = self._final_actions()
         lines = [
             f'"""Recorded with locum on {_dt.datetime.now().isoformat(timespec="seconds")}."""',
-            *(["import os", ""] if any(a.secret for a in actions) else []),
+            *(["# Passwords are never recorded: set the LOCUM_PASSWORD environment variable before running.",
+               "import os", ""] if any(a.secret for a in actions) else []),
             "from locum import Desktop",
             "",
             f"{var} = {desktop_expr}",
@@ -1237,6 +1414,16 @@ class Recorder:
 
     def __repr__(self) -> str:
         return f"<Recorder source={self._source!r} actions={len(self._actions)}>"
+
+
+def _event_kind(event: Any) -> str:
+    """The kind of a raw event, for log messages: never the event itself, which may
+    carry typed text or the key of a password being typed."""
+    if isinstance(event, Mapping):
+        return str(event.get("event", event.get("type", "?")))
+    if isinstance(event, (list, tuple)) and event:
+        return str(event[0])
+    return type(event).__name__
 
 
 def _click_kind(button: str, clicks: int) -> str:

@@ -133,9 +133,16 @@ class Desktop:
             app has read it (raise it for slow apps or remote sessions); see :class:`Keyboard`.
         clipboard_timeout: Seconds to wait for the target app to read a paste on
             backends that can tell (X11 native clipboard); see :class:`Keyboard`.
+        heal_selectors: Self-repairing selectors (see :mod:`locum.heal`): when
+            :meth:`find` / :meth:`wait` match nothing within the timeout, use the
+            clear best look-alike (similar name, same role, same automation id,
+            near the previous position) instead of failing, and log what changed
+            on the ``locum.heal`` logger. ``False`` (the default: acting on the
+            wrong element is dangerous), ``True``, or a :class:`~locum.heal.HealOptions`.
+            Per call, ``find(..., heal=True/False)`` overrides it.
 
     Attributes:
-        backend, mouse, keyboard, screen, failsafe, default_timeout, humanize, typing_mode.
+        backend, mouse, keyboard, screen, failsafe, default_timeout, humanize, typing_mode, heal_selectors.
     """
 
     def __init__(
@@ -152,6 +159,7 @@ class Desktop:
         poll_interval: float = 0.1,
         clipboard_settle: float = DEFAULT_CLIPBOARD_SETTLE,
         clipboard_timeout: float = DEFAULT_CLIPBOARD_TIMEOUT,
+        heal_selectors: Any = False,
     ):
         from .backends import create_backend, get_backend
 
@@ -174,6 +182,12 @@ class Desktop:
             if poll_interval is None or not math.isfinite(float(poll_interval)) or float(poll_interval) < 0:
                 raise ValueError(f"poll_interval must be a finite number >= 0, got {poll_interval!r}")
 
+            from .heal import HealOptions
+
+            if not isinstance(heal_selectors, (bool, HealOptions)):
+                raise TypeError(f"heal_selectors must be a bool or a HealOptions, not {type(heal_selectors).__name__}")
+            #: Heal non-matching selectors in :meth:`find`/:meth:`wait` (``False``, ``True`` or a HealOptions).
+            self.heal_selectors = heal_selectors
             self.default_timeout = float(default_timeout)
             self.typing_mode = mode
             self.poll_interval = float(poll_interval)
@@ -966,27 +980,84 @@ class Desktop:
             return ""
         return "; did you mean: " + ", ".join(suggestions[:limit]) + tip
 
-    def find(self, selector: Any, *, timeout: Optional[float] = None, root: Any = None) -> Element:
+    def _heal_options(self) -> Any:
+        from .heal import HealOptions
+
+        opts = getattr(self, "heal_selectors", False)
+        return opts if isinstance(opts, HealOptions) else None
+
+    def _heal(self, sel: Any, text: str, *, fingerprint: Any, scope: Any = None) -> Any:
+        """One heal scan after a lookup timed out (:func:`locum.heal.heal`); returns its outcome."""
+        from .heal import HealOutcome, heal
+
+        opts = self._heal_options()
+        kw = {"log": False}  # logged by the caller once the element is accepted
+        if scope is None:
+            roots = self.roots()
+            return heal(sel, roots, fingerprint=fingerprint, options=opts, selector_text=text, selector_roots=roots, **kw)
+        if isinstance(scope, Element):
+            node = scope.node
+            return heal(sel, [node], fingerprint=fingerprint, options=opts, selector_text=text,
+                        include_roots=False, selector_root=node, **kw)
+        node = getattr(scope, "_root_node", lambda: None)()
+        if node is None:
+            return HealOutcome(reason="the window has no accessibility root")
+        return heal(sel, [node], fingerprint=fingerprint, options=opts, selector_text=text, selector_root=node, **kw)
+
+    def find(self, selector: Any, *, timeout: Optional[float] = None, root: Any = None,
+             heal: Optional[bool] = None, fingerprint: Any = None) -> Element:
         """Find the first element matching ``selector`` (CSS-like, UiPath XML or dict).
 
         Polls up to ``timeout`` seconds (``None`` = :attr:`default_timeout`, ``0`` =
         a single check). ``root`` scopes the search to an :class:`Element` or
         :class:`Window`. Raises :class:`ElementNotFound` (with close-match hints)
         or :class:`SelectorSyntaxError` immediately for invalid selectors.
+
+        ``heal`` (default: :attr:`heal_selectors`, off unless enabled) turns on
+        self-repair when nothing matches within the timeout: the clear best
+        look-alike is returned with ``element.healed`` describing the change
+        (see :mod:`locum.heal`). ``fingerprint`` -- a
+        :class:`~locum.heal.Fingerprint` or its dict -- is what the element
+        looked like before (role, name, automation id, bounds, window).
         """
+        from .heal import enabled as _heal_enabled, log_heal
         from .selectors import parse
 
         self._image_target(selector, "")
         scope = self._scope(root)
+        healing = _heal_enabled(heal, getattr(self, "heal_selectors", False))
         if scope is not None:
-            return scope.find(selector, timeout=timeout)
+            if not healing:
+                return scope.find(selector, timeout=timeout)
+            if isinstance(scope, Element):
+                return scope.find(selector, timeout=timeout, heal=True, fingerprint=fingerprint)
+            try:
+                return scope.find(selector, timeout=timeout)
+            except ElementNotFound as exc:
+                sel = parse(selector)
+                outcome = self._heal(sel, self._selector_text(selector, sel), fingerprint=fingerprint, scope=scope)
+                if not outcome:
+                    raise ElementNotFound(f"{exc} (self-healing: {outcome.reason})") from exc.__cause__
+                el = Element(outcome.node, self, outcome.info.new_selector, scope=scope)
+                el.healed = outcome.info
+                log_heal(outcome.info)
+                return el
         sel = parse(selector)
         t = self._timeout(timeout)
         text = self._selector_text(selector, sel)
         try:
             node = self._poll(lambda: sel.find_first(self.roots()), t, f"No element matching {text!r}", events=True)
         except ActionTimeout as exc:
-            raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}") from exc
+            if not healing:
+                raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}") from exc
+            outcome = self._heal(sel, text, fingerprint=fingerprint)
+            if not outcome:
+                raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}"
+                                      f" (self-healing: {outcome.reason})") from exc
+            el = Element(outcome.node, self, outcome.info.new_selector)
+            el.healed = outcome.info
+            log_heal(outcome.info)
+            return el
         return Element(node, self, text)
 
     def find_all(self, selector: Any, *, root: Any = None) -> List[Element]:
@@ -1011,12 +1082,15 @@ class Desktop:
         if self._image_target(selector, "exists"):
             return self.locate(selector, region=root, timeout=timeout) is not None
         try:
-            self.find(selector, timeout=timeout, root=root)
+            # An existence check never heals: "is the old element still there?" must not
+            # turn true because a look-alike exists.
+            self.find(selector, timeout=timeout, root=root, heal=False)
             return True
         except ElementNotFound:
             return False
 
-    def wait(self, selector: Any, *, state: Any = "visible", timeout: Optional[float] = None, root: Any = None) -> Any:
+    def wait(self, selector: Any, *, state: Any = "visible", timeout: Optional[float] = None, root: Any = None,
+             heal: Optional[bool] = None, fingerprint: Any = None) -> Any:
         """Wait for an element matching ``selector`` to reach ``state``.
 
         ``state`` is one of :data:`locum.element.ELEMENT_STATES` or a callable
@@ -1028,7 +1102,12 @@ class Desktop:
         return its :class:`Match` (as :meth:`wait_image`, raising
         :class:`ImageNotFound`) and ``"gone"`` waits until it is no longer on
         screen (:class:`ActionTimeout` otherwise); other states are rejected.
+
+        ``heal``/``fingerprint`` work as in :meth:`find` and apply only when
+        nothing ever matched (never to ``"gone"``): the healed element is
+        returned if it is in ``state``.
         """
+        from .heal import enabled as _heal_enabled, log_heal
         from .selectors import parse
 
         if self._image_target(selector, "wait"):
@@ -1075,7 +1154,19 @@ class Desktop:
             return self._poll(probe, t, f"Element {text!r} did not become {label!r} within {t:g}s", events=True)
         except ActionTimeout as exc:
             if not seen[0]:
-                raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}") from exc
+                msg = f"No element matching {text!r} within {t:g}s{self._hint(text)}"
+                if not _heal_enabled(heal, getattr(self, "heal_selectors", False)):
+                    raise ElementNotFound(msg) from exc
+                outcome = self._heal(sel, text, fingerprint=fingerprint, scope=scope)
+                if not outcome:
+                    raise ElementNotFound(f"{msg} (self-healing: {outcome.reason})") from exc
+                el = Element(outcome.node, self, outcome.info.new_selector, scope=scope)
+                if not el._state_predicate(state)():
+                    raise ElementNotFound(
+                        f"{msg} (self-healing: {outcome.info.new_selector!r} is not {label!r})") from exc
+                el.healed = outcome.info
+                log_heal(outcome.info)
+                return el
             raise
 
     def element_at(self, x: Any, y: Optional[float] = None) -> Optional[Element]:
