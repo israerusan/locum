@@ -188,9 +188,13 @@ class SelfTest:
         return "absolute + humanized moves land exactly"
 
     def c_windows(self) -> str:
+        # Runs after the editor was launched: the list must contain it (a fresh CI
+        # desktop may have no other windows, so "any window" proves nothing).
         wins = self.d.windows()
         if not wins:
             raise AssertionError("no top-level windows listed")
+        if self.editor_window is not None and self.editor_window.handle not in {w.handle for w in wins}:
+            raise AssertionError(f"the launched editor {self.editor_window.title!r} is missing from the window list")
         active = self.d.active_window()
         listing = "; ".join(f"{w.title[:40]!r} [{w.app}]" for w in wins[:8])
         return f"{len(wins)} windows, active={active.title[:40] if active else None!r}: {listing}"
@@ -342,6 +346,26 @@ class SelfTest:
             raise AssertionError(f"element at the editor's center belongs to pid {el.node.pid}, editor pid is {win.pid}")
         return f"{el.role} {el.name!r}"
 
+    def c_window_capture(self) -> str:
+        """The window's own content via the backend (PrintWindow / CGWindowListCreateImage / Composite)."""
+        from .backends.base import CAP_WINDOW_CAPTURE
+
+        win = self._win()
+        if not self.d.backend.has(CAP_WINDOW_CAPTURE):
+            if sys.platform.startswith("linux"):
+                raise _Warn("no compositing manager: X11 cannot capture covered windows (screen grabs still work)")
+            raise AssertionError(f"the {self.d.backend.name} backend should support window capture")
+        img = win.screenshot(mode="window")
+        from .backends.base import is_blank_image
+
+        if is_blank_image(img):
+            raise AssertionError("window capture returned a blank image")
+        r = win.rect
+        if not (0.6 * r.width <= img.width <= 1.4 * r.width and 0.6 * r.height <= img.height <= 1.4 * r.height):
+            raise AssertionError(f"window capture is {img.width}x{img.height}, the window is {r.width}x{r.height}")
+        img.save(self.path("05_window_capture.png"))
+        return f"{img.width}x{img.height} captured from the window itself"
+
     def c_vision(self) -> str:
         win = self._win()
         r = win.rect
@@ -487,8 +511,8 @@ class SelfTest:
             self.run_check("environment", self.c_environment)
             self.run_check("screenshot", self.c_screenshot, needs=CAP_SCREENSHOT)
             self.run_check("mouse movement", self.c_mouse, needs=CAP_MOUSE)
-            self.run_check("window list", self.c_windows, needs=CAP_WINDOWS)
             if self.run_check("launch editor", self.c_launch_editor, needs=CAP_WINDOWS):
+                self.run_check("window list", self.c_windows, needs=CAP_WINDOWS)
                 self.run_check("accessibility tree + selector", self.c_accessibility, needs=CAP_ACCESSIBILITY)
                 self.run_check("raw keystrokes (unverified, informational)", self.c_type_raw, needs=CAP_KEYBOARD)
                 self.run_check("unicode typing (Desktop.type)", self.c_type_unicode, needs=CAP_KEYBOARD)
@@ -498,6 +522,7 @@ class SelfTest:
                 self.run_check("set_text (native)", self.c_set_text, needs=CAP_ACCESSIBILITY)
                 self.run_check("element_at", self.c_element_at, needs=CAP_ACCESSIBILITY)
                 self.run_check("vision locate", self.c_vision, needs=CAP_SCREENSHOT)
+                self.run_check("window capture", self.c_window_capture, needs=CAP_SCREENSHOT)
                 self.run_check("window operations", self.c_window_ops, needs=CAP_WINDOWS)
                 self.run_check("close editor without saving", self.c_close_editor, needs=CAP_WINDOWS)
         finally:
