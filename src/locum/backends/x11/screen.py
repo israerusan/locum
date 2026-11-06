@@ -8,8 +8,9 @@ import os
 import weakref
 from typing import Any, List, Optional, Tuple
 
-from ...errors import BackendError
+from ...errors import BackendError, NotSupported
 from ...types import Monitor, Rect
+from ..base import is_blank_image
 from ._xcore import _close_quietly, _x_errors
 
 
@@ -147,27 +148,103 @@ class _ScreenMixin:
         shot = self._mss().grab({"left": r.left, "top": r.top, "width": r.width, "height": r.height})
         return Image.frombuffer("RGB", (shot.width, shot.height), bytes(shot.bgra), "raw", "BGRX", 0, 1)
 
-    def _grab_xlib(self, r: Rect) -> Any:
+    def _image_format(self, img: Any) -> Tuple[int, int, bool]:
+        """``(depth, bits_per_pixel, msb_first)`` of a ``GetImage`` reply (call under the lock)."""
+        X = self._xl.X
+        depth = int(img.depth)
+        bpp = next((f.bits_per_pixel for f in self._d.display.info.pixmap_formats if f.depth == depth), 32)
+        msb = int(self._d.display.info.image_byte_order) == X.MSBFirst
+        return depth, bpp, msb
+
+    @staticmethod
+    def _ximage_to_pil(data: Any, width: int, height: int, depth: int, bpp: int, msb: bool) -> Any:
+        """RGB PIL image of ZPixmap ``data`` (``width`` x ``height``) in the given pixel format."""
         from PIL import Image
 
+        data = data if isinstance(data, bytes) else bytes(data)
+        stride = len(data) // height if height else 0
+        if bpp == 32:
+            return Image.frombuffer("RGB", (width, height), data, "raw", "XRGB" if msb else "BGRX", stride, 1)
+        if bpp == 16 and depth == 16 and not msb:
+            return Image.frombuffer("RGB", (width, height), data, "raw", "BGR;16", stride, 1)
+        if bpp == 24 and not msb:
+            return Image.frombuffer("RGB", (width, height), data, "raw", "BGR", stride, 1)
+        raise BackendError(f"Unsupported X visual for screenshots (depth {depth}, {bpp} bpp, msb={msb})")
+
+    def _grab_xlib(self, r: Rect) -> Any:
         X = self._xl.X
         with self._lock:
             img = self._root.get_image(r.left, r.top, r.width, r.height, X.ZPixmap, 0xFFFFFFFF)
-            depth = int(img.depth)
-            bpp = next((f.bits_per_pixel for f in self._d.display.info.pixmap_formats if f.depth == depth), 32)
-            msb = int(self._d.display.info.image_byte_order) == X.MSBFirst
-        data = img.data if isinstance(img.data, bytes) else bytes(img.data)
-        if bpp == 32:
-            raw = "XRGB" if msb else "BGRX"
-            stride = len(data) // r.height if r.height else 0
-            return Image.frombuffer("RGB", (r.width, r.height), data, "raw", raw, stride, 1)
-        if bpp == 16 and depth == 16 and not msb:
-            stride = len(data) // r.height if r.height else 0
-            return Image.frombuffer("RGB", (r.width, r.height), data, "raw", "BGR;16", stride, 1)
-        if bpp == 24 and not msb:
-            stride = len(data) // r.height if r.height else 0
-            return Image.frombuffer("RGB", (r.width, r.height), data, "raw", "BGR", stride, 1)
-        raise BackendError(f"Unsupported X visual for screenshots (depth {depth}, {bpp} bpp, msb={msb})")
+            depth, bpp, msb = self._image_format(img)
+        return self._ximage_to_pil(img.data, r.width, r.height, depth, bpp, msb)
+
+    # ============================================================ window capture
+    def _has_composite(self) -> bool:
+        try:
+            return bool(self._d.has_extension("Composite"))
+        except Exception:
+            return False
+
+    def _toplevel_ancestor(self, win: Any) -> Any:
+        """The root child containing ``win`` (the window manager's frame, or ``win`` itself)."""
+        root_id = int(self._root.id)
+        cur = win
+        for _ in range(32):
+            parent = cur.query_tree().parent
+            pid = int(getattr(parent, "id", parent) or 0)
+            if pid == 0 or pid == root_id:
+                return cur
+            cur = parent
+        return cur
+
+    @_x_errors
+    def capture_window(self, handle: Any, *, restore_minimized: bool = False) -> Any:
+        """The window's own content from its composited off-screen pixmap
+        (``XCompositeNameWindowPixmap`` of its frame, then ``XGetImage``), covered
+        and off-screen parts included.
+
+        Needs the Composite extension *and* a running compositing manager (which
+        redirects the windows to off-screen pixmaps); without one the X server
+        keeps no image of covered areas and :class:`NotSupported` is raised. An
+        unmapped (minimized) window has no pixmap at all; ``restore_minimized``
+        is not supported on X11 (mapping a window lets the window manager focus it).
+        """
+        self._check()
+        X = self._xl.X
+        XError = self._xl.error.XError
+        with self._lock:
+            win = self._handle(handle)
+            if int(win.get_attributes().map_state) != X.IsViewable:
+                raise NotSupported(f"X11 window {int(win.id):#x} is not mapped (minimized or hidden): "
+                                   "the X server keeps no image of it"
+                                   + ("; restore_minimized is not supported on X11" if restore_minimized else ""))
+            frame = self._toplevel_ancestor(win)
+            if not self._has_composite() or not hasattr(frame, "composite_name_window_pixmap"):
+                raise NotSupported("Off-screen window capture needs the X Composite extension")
+            fr = self._abs_geometry(frame)
+            client = self._abs_geometry(win)
+            el, er, et, eb = self._frame_extents(win)
+            want = Rect(client.left - el, client.top - et, client.width + el + er, client.height + et + eb)
+            try:
+                pix = frame.composite_name_window_pixmap()
+                try:
+                    reply = pix.get_image(0, 0, fr.width, fr.height, X.ZPixmap, 0xFFFFFFFF)
+                finally:
+                    try:
+                        pix.free()
+                    except Exception:
+                        pass
+            except XError as exc:
+                raise NotSupported(f"X11 window {int(win.id):#x} has no composited pixmap (is a compositing "
+                                   f"manager running?): {exc}") from None
+            depth, bpp, msb = self._image_format(reply)
+        img = self._ximage_to_pil(reply.data, fr.width, fr.height, depth, bpp, msb)
+        part = want.intersect(fr) or fr
+        if part != fr:
+            img = img.crop((part.left - fr.left, part.top - fr.top, part.right - fr.left, part.bottom - fr.top))
+        if is_blank_image(img):
+            raise NotSupported(f"X11 window {int(win.id):#x}: the composited pixmap is blank")
+        return img
 
     def _grab(self, r: Rect) -> Any:
         if not self._mss_broken:

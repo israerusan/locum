@@ -42,6 +42,8 @@ kCGWindowListOptionIncludingWindow = 8
 kCGWindowListExcludeDesktopElements = 16
 kCGNullWindowID = 0
 kCGWindowImageDefault = 0
+kCGWindowImageBoundsIgnoreFraming = 1 << 0  # no window shadow
+kCGWindowImageBestResolution = 1 << 3  # full backing (Retina) resolution
 
 # CGEventFlags (device independent)
 FLAG_ALPHA_SHIFT = 0x00010000

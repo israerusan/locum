@@ -20,6 +20,7 @@ from ..base import (
     CAP_MOUSE,
     CAP_SCREENSHOT,
     CAP_UNICODE_TYPING,
+    CAP_WINDOW_CAPTURE,
     CAP_WINDOWS,
     Backend,
 )
@@ -158,6 +159,8 @@ class MacOSBackend(_InputMixin, _ScreenMixin, _WindowsMixin, _ClipboardMixin, _A
             caps.add(CAP_CLIPBOARD)
         if self._ax is not None:
             caps.add(CAP_ACCESSIBILITY)
+        if getattr(self._q, "CGWindowListCreateImage", None) is not None:
+            caps.add(CAP_WINDOW_CAPTURE)
         return frozenset(caps)
 
     def close(self) -> None:

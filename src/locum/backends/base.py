@@ -40,10 +40,29 @@ CAP_WINDOWS = "windows"  # list/activate/move windows
 CAP_CLIPBOARD = "clipboard"
 CAP_ACCESSIBILITY = "accessibility"  # accessibility_roots() returns a real tree
 CAP_HSCROLL = "hscroll"
+CAP_WINDOW_CAPTURE = "window_capture"  # capture_window() renders a window's own content (covered/off-screen)
 
 ALL_CAPABILITIES = frozenset(
-    {CAP_MOUSE, CAP_KEYBOARD, CAP_UNICODE_TYPING, CAP_SCREENSHOT, CAP_WINDOWS, CAP_CLIPBOARD, CAP_ACCESSIBILITY, CAP_HSCROLL}
+    {CAP_MOUSE, CAP_KEYBOARD, CAP_UNICODE_TYPING, CAP_SCREENSHOT, CAP_WINDOWS, CAP_CLIPBOARD, CAP_ACCESSIBILITY,
+     CAP_HSCROLL, CAP_WINDOW_CAPTURE}
 )
+
+
+def is_blank_image(img: "Image") -> bool:
+    """Whether ``img`` is a single flat color (or empty).
+
+    Off-screen window capture returns such an image when the window draws
+    through a surface the API cannot read (GPU / DirectComposition / UWP
+    content, a minimized window): a real window always has a frame, a caption
+    or content, so one flat color means "nothing was captured".
+    """
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return True
+    ext = img.getextrema()
+    if ext and not isinstance(ext[0], tuple):  # single-band image
+        ext = (ext,)
+    return all(lo == hi for lo, hi in ext)
 
 
 class AccessibleNode(abc.ABC):
@@ -271,6 +290,23 @@ class Backend(abc.ABC):
 
     def pixel(self, x: int, y: int) -> tuple:
         return self.screenshot(Rect(x, y, 1, 1)).getpixel((0, 0))[:3]
+
+    def capture_window(self, handle: Any, *, restore_minimized: bool = False) -> "Image":
+        """RGB image of top-level window ``handle``'s own content, even where other
+        windows cover it or it extends past the screen (:data:`CAP_WINDOW_CAPTURE`).
+
+        The image covers the window's :attr:`WindowInfo.rect` (pixel (0, 0) is
+        its top-left corner). A minimized window has no up-to-date content on
+        most platforms: with ``restore_minimized=True`` a backend may show it
+        *without activating it* for the capture and minimize it again; otherwise
+        it raises :class:`NotSupported`.
+
+        Raises:
+            NotSupported: no window capture on this backend, or the capture came
+                back blank (GPU-composited surfaces, a minimized window).
+            WindowNotFound: the handle is invalid.
+        """
+        raise NotSupported(f"{self.name} backend cannot capture a window's content off-screen")
 
     # --------------------------------------------------------------------- windows
     def list_windows(self) -> List[WindowInfo]:

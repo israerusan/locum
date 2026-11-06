@@ -37,9 +37,11 @@ from .base import (
     CAP_MOUSE,
     CAP_SCREENSHOT,
     CAP_UNICODE_TYPING,
+    CAP_WINDOW_CAPTURE,
     CAP_WINDOWS,
     AccessibleNode,
     Backend,
+    is_blank_image,
 )
 
 _handles = itertools.count(0x1000)
@@ -175,6 +177,9 @@ class MockWindow:
     closed: bool = False
     fill: Tuple[int, int, int] = (240, 240, 240)
     class_name: str = "MockWindow"
+    #: Simulates a window drawn through a surface off-screen capture cannot read
+    #: (GPU / UWP content): :meth:`MockBackend.capture_window` comes back blank.
+    capture_blank: bool = False
     root: MockWidget = field(init=False)
     _restore_rect: Optional[Rect] = field(default=None, repr=False)
     #: The widget that had keyboard focus when the window was last active (restored on activation).
@@ -349,7 +354,10 @@ class MockBackend(Backend):
         monitors: Optional[Sequence[RectLike]] = None,
         background: Tuple[int, int, int] = (32, 48, 64),
         scale: float = 1.0,
+        window_capture: bool = True,
     ):
+        #: Whether :meth:`capture_window` is supported (:data:`CAP_WINDOW_CAPTURE`).
+        self.window_capture = bool(window_capture)
         rects = [Rect.coerce(r) for r in monitors] if monitors else [Rect(0, 0, width, height)]
         self._monitors = [Monitor(i, r, scale, i == 0, f"MOCK{i}") for i, r in enumerate(rects)]
         self.background = background
@@ -370,9 +378,11 @@ class MockBackend(Backend):
     # ---------------------------------------------------------------- scene setup
     @property
     def capabilities(self) -> frozenset:
-        return frozenset(
-            {CAP_MOUSE, CAP_KEYBOARD, CAP_UNICODE_TYPING, CAP_SCREENSHOT, CAP_WINDOWS, CAP_CLIPBOARD, CAP_ACCESSIBILITY, CAP_HSCROLL}
-        )
+        caps = {CAP_MOUSE, CAP_KEYBOARD, CAP_UNICODE_TYPING, CAP_SCREENSHOT, CAP_WINDOWS, CAP_CLIPBOARD, CAP_ACCESSIBILITY,
+                CAP_HSCROLL}
+        if self.window_capture:
+            caps.add(CAP_WINDOW_CAPTURE)
+        return frozenset(caps)
 
     def add_window(self, title: str, rect: RectLike = (100, 100, 640, 480), app: str = "mockapp", pid: int = 4242, activate: bool = True, **kw: Any) -> MockWindow:
         w = MockWindow(title=title, rect=Rect.coerce(rect), app=app, pid=pid, **kw)
@@ -633,40 +643,44 @@ class MockBackend(Backend):
         for win in reversed(self.windows):  # back to front
             if win.minimized or not win.visible:
                 continue
-            r = win.rect.offset(ox, oy)
-            draw.rectangle([r.left, r.top, r.right - 1, r.bottom - 1], fill=win.fill, outline=(90, 90, 90))
-            title_bg = (40, 90, 160) if win is self._active else (120, 120, 130)
-            draw.rectangle([r.left, r.top, r.right - 1, r.top + 27], fill=title_bg)
-            draw.text((r.left + 8, r.top + 6), win.title, fill=(255, 255, 255), font=font)
-            for wd in win.root.iter_shown():  # an invisible panel hides its whole subtree
-                if wd is win.root:
-                    continue
-                wr = wd.screen_rect.offset(ox, oy)
-                if wr.is_empty:
-                    continue
-                if wd.fill is not None:
-                    outline = (0, 120, 215) if wd is self._focus else (130, 130, 130)
-                    draw.rectangle([wr.left, wr.top, wr.right - 1, wr.bottom - 1], fill=wd.fill, outline=outline)
-                color = wd.text_color if wd.enabled else (150, 150, 150)
-                if wd.role == "checkbox":
-                    side = min(wr.height, wr.width) - 8  # the box is inset 4px; tiny widgets get no box
-                    if side > 0:
-                        box = [wr.left + 4, wr.top + 4, wr.left + 4 + side, wr.top + 4 + side]
-                        draw.rectangle(box, outline=(0, 0, 0), fill=(0, 0, 0) if wd.checked else (255, 255, 255))
-                    draw.text((wr.left + wr.height + 2, wr.top + max(0, (wr.height - 14) // 2)), wd.name, fill=color, font=font)
-                elif wd.role == "edit":
-                    draw.text((wr.left + 4, wr.top + max(0, (wr.height - 14) // 2)), wd.value or "", fill=color, font=font)
-                elif wd.role in ("button", "text", "listitem", "menuitem", "link", "tab"):
-                    label = wd.name if wd.role != "text" else (wd.value or wd.name)
-                    if wd.attrs.get("selected"):
-                        draw.rectangle([wr.left, wr.top, wr.right - 1, wr.bottom - 1], fill=(0, 120, 215))
-                        color = (255, 255, 255)
-                    tw = draw.textlength(label, font=font) if hasattr(draw, "textlength") else len(label) * 7
-                    tx = wr.left + max(2, int((wr.width - tw) // 2)) if wd.role == "button" else wr.left + 4
-                    draw.text((tx, wr.top + max(0, (wr.height - 14) // 2)), label, fill=color, font=font)
+            self._draw_window(draw, win, ox, oy, font)
         for overlay, at in self.overlays:
             img.paste(overlay, (at.x + ox, at.y + oy))
         return img
+
+    def _draw_window(self, draw: Any, win: MockWindow, ox: int, oy: int, font: Any) -> None:
+        """Paint ``win`` (frame, caption, widgets) with its screen rect shifted by ``(ox, oy)``."""
+        r = win.rect.offset(ox, oy)
+        draw.rectangle([r.left, r.top, r.right - 1, r.bottom - 1], fill=win.fill, outline=(90, 90, 90))
+        title_bg = (40, 90, 160) if win is self._active else (120, 120, 130)
+        draw.rectangle([r.left, r.top, r.right - 1, r.top + 27], fill=title_bg)
+        draw.text((r.left + 8, r.top + 6), win.title, fill=(255, 255, 255), font=font)
+        for wd in win.root.iter_shown():  # an invisible panel hides its whole subtree
+            if wd is win.root:
+                continue
+            wr = wd.screen_rect.offset(ox, oy)
+            if wr.is_empty:
+                continue
+            if wd.fill is not None:
+                outline = (0, 120, 215) if wd is self._focus else (130, 130, 130)
+                draw.rectangle([wr.left, wr.top, wr.right - 1, wr.bottom - 1], fill=wd.fill, outline=outline)
+            color = wd.text_color if wd.enabled else (150, 150, 150)
+            if wd.role == "checkbox":
+                side = min(wr.height, wr.width) - 8  # the box is inset 4px; tiny widgets get no box
+                if side > 0:
+                    box = [wr.left + 4, wr.top + 4, wr.left + 4 + side, wr.top + 4 + side]
+                    draw.rectangle(box, outline=(0, 0, 0), fill=(0, 0, 0) if wd.checked else (255, 255, 255))
+                draw.text((wr.left + wr.height + 2, wr.top + max(0, (wr.height - 14) // 2)), wd.name, fill=color, font=font)
+            elif wd.role == "edit":
+                draw.text((wr.left + 4, wr.top + max(0, (wr.height - 14) // 2)), wd.value or "", fill=color, font=font)
+            elif wd.role in ("button", "text", "listitem", "menuitem", "link", "tab"):
+                label = wd.name if wd.role != "text" else (wd.value or wd.name)
+                if wd.attrs.get("selected"):
+                    draw.rectangle([wr.left, wr.top, wr.right - 1, wr.bottom - 1], fill=(0, 120, 215))
+                    color = (255, 255, 255)
+                tw = draw.textlength(label, font=font) if hasattr(draw, "textlength") else len(label) * 7
+                tx = wr.left + max(2, int((wr.width - tw) // 2)) if wd.role == "button" else wr.left + 4
+                draw.text((tx, wr.top + max(0, (wr.height - 14) // 2)), label, fill=color, font=font)
 
     def screenshot(self, region: Optional[Rect] = None) -> Any:
         region = Rect.coerce(region) if region is not None else None
@@ -677,6 +691,40 @@ class MockBackend(Backend):
         vs = self.virtual_screen()
         r = Rect.coerce(region).offset(-vs.left, -vs.top)
         return img.crop(r.as_ltrb())
+
+    def capture_window(self, handle: Any, *, restore_minimized: bool = False) -> Any:
+        """The window rendered on its own (as if nothing covered it and the screen were
+        unbounded). A minimized window, or one with ``capture_blank``, renders blank:
+        then :class:`NotSupported`, unless ``restore_minimized`` (minimized only) shows
+        it without activation for the capture (events ``restore_noactivate`` and
+        ``minimize_noactivate``)."""
+        from PIL import Image, ImageDraw
+
+        if not self.window_capture:
+            raise NotSupported("mock backend: window capture disabled (window_capture=False)")
+        w = self._win(handle)
+        self._log("capture_window", w.handle, bool(restore_minimized))
+
+        def render_one() -> Any:
+            if w.capture_blank or w.minimized:
+                return Image.new("RGB", (max(1, w.rect.width), max(1, w.rect.height)), (0, 0, 0))
+            img = Image.new("RGB", (w.rect.width, w.rect.height), self.background)
+            self._draw_window(ImageDraw.Draw(img), w, -w.rect.left, -w.rect.top, self._font(14))
+            return img
+
+        img = render_one()
+        if is_blank_image(img) and w.minimized and restore_minimized and not w.capture_blank:
+            self._log("restore_noactivate", w.handle)
+            w.minimized = False
+            try:
+                img = render_one()
+            finally:
+                w.minimized = True
+                self._log("minimize_noactivate", w.handle)
+        if is_blank_image(img):
+            why = "is minimized" if w.minimized else "drew a blank surface"
+            raise NotSupported(f"mock window {w.title!r} {why}: window capture came back blank")
+        return img
 
     # --------------------------------------------------------------------- windows
     def _info(self, w: MockWindow) -> WindowInfo:

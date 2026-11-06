@@ -656,14 +656,36 @@ def cmd_info(ctx: _Ctx) -> int:
 
 def cmd_screenshot(ctx: _Ctx) -> int:
     a = ctx.args
-    region = _parse_region(a.region)
     out = a.output or _dt.datetime.now().strftime("screenshot-%Y%m%d-%H%M%S.png")
-    img = ctx.desktop.screenshot(region, monitor=a.monitor, path=out)
+    window = getattr(a, "window", None)
+    mode = getattr(a, "mode", "auto")
+    restore_minimized = bool(getattr(a, "restore_minimized", False))
+    how = None
+    if window is not None:
+        if a.region or a.monitor is not None:
+            raise _UsageError("--window cannot be combined with --region or --monitor")
+        win = ctx.desktop.window(window, timeout=0)
+        img, how = win._capture(mode, restore_minimized=restore_minimized)
+        p = os.path.expanduser(out)
+        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+        if os.path.splitext(p)[1]:
+            img.save(p)
+        else:
+            img.save(p, format="PNG")
+    else:
+        if mode != "auto" or restore_minimized:
+            raise _UsageError("--mode and --restore-minimized need --window")
+        region = _parse_region(a.region)
+        img = ctx.desktop.screenshot(region, monitor=a.monitor, path=out)
     path = os.path.abspath(os.path.expanduser(out))
     if ctx.json:
-        ctx.emit_json({"path": path, "width": img.size[0], "height": img.size[1]})
+        data = {"path": path, "width": img.size[0], "height": img.size[1]}
+        if how is not None:
+            data["capture"] = how
+        ctx.emit_json(data)
     else:
-        ctx.print(f"saved {img.size[0]}x{img.size[1]} screenshot to {path}")
+        via = " (window captured off-screen)" if how == "window" else ""
+        ctx.print(f"saved {img.size[0]}x{img.size[1]} screenshot to {path}{via}")
     return EXIT_OK
 
 
@@ -1260,6 +1282,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", metavar="PATH", help="output file (default screenshot-<time>.png)")
     p.add_argument("--region", metavar="L,T,W,H", help="capture only this rectangle")
     p.add_argument("--monitor", type=int, metavar="N", help="capture monitor N (0 = primary)")
+    p.add_argument("--window", metavar="TITLE", help="capture this window (even when covered by other windows)")
+    p.add_argument("--mode", choices=("auto", "screen", "window"), default="auto",
+                   help="with --window: auto (default; off-screen capture when covered/off-screen/minimized), "
+                        "screen (grab its screen rectangle) or window (always capture off-screen)")
+    p.add_argument("--restore-minimized", action="store_true",
+                   help="with --window: briefly show a minimized window without activating it to capture it")
 
     p = add("windows", "list top-level windows (front-most first)")
     p.add_argument("--title", help="filter: exact, substring (case-insensitive) or glob title")

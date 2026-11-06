@@ -156,6 +156,8 @@ from .constants import (
     kCGMouseEventDeltaY,
     kCGNullWindowID,
     kCGScrollEventUnitLine,
+    kCGWindowImageBestResolution,
+    kCGWindowImageBoundsIgnoreFraming,
     kCGWindowImageDefault,
     kCGWindowListExcludeDesktopElements,
     kCGWindowListOptionAll,
