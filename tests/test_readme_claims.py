@@ -12,10 +12,12 @@ HEAD = README.split("## Install", 1)[0]  # everything above the first real secti
 
 def test_platform_support_table_sits_next_to_the_headline():
     assert "| Platform |" in HEAD
-    assert re.search(r"macOS.*not yet validated on a real Mac", HEAD)
-    assert re.search(r"Windows 11 machine by the built-in self-test", HEAD)
-    assert "Xvfb" in HEAD
-    assert re.search(r"Native Wayland is not supported", HEAD)
+    # Each platform says how it is validated, and CI backs it: the real-desktop
+    # self-test jobs are blocking (tests/test_packaging_metadata.py).
+    assert re.search(r"macOS.*\*\*blocking\*\* real-desktop self-test on the GitHub macOS runner", HEAD)
+    assert re.search(r"Windows 10/11.*\*\*blocking\*\* real-desktop self-test", HEAD)
+    assert re.search(r"Xvfb.*AT-SPI.*not a full desktop session", HEAD)
+    assert re.search(r"Wayland.*experimental, not yet validated on a real compositor", HEAD)
 
 
 def test_headline_does_not_claim_equal_support_on_all_platforms():

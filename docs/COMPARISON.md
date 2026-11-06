@@ -19,7 +19,7 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 | | PyAutoGUI | UiPath | locum |
 |---|---|---|---|
 | Coordinates | ✓ | ✓ | ✓ (any "target": point, rect, element, selector, image) |
-| Accessibility tree | — | ✓ UIA / MSAA / browser DOM / SAP / Java bridges | ✓ UIA (Windows), AX (macOS), AT-SPI (Linux), browser DOM over DevTools (`locum.browser`) <!--BRIDGES--> |
+| Accessibility tree | — | ✓ UIA / MSAA / browser DOM / SAP / Java bridges | ✓ UIA (Windows), AX (macOS), AT-SPI (Linux), browser DOM over DevTools (`locum.browser`), SAP GUI Scripting, Java Access Bridge (`locum.bridges`) |
 | Selectors | — | XML selectors, fuzzy & anchor-based targeting | CSS-like (`window "ERP" button:has-text("Save")`), **UiPath-XML compatible subset** (`<wnd app='x' title='*'/><ctrl name='OK' role='push button'/>`), dict form |
 | Selector generation | — | Studio "Indicate element" | `locum inspect`, `selector_for(node)`, the recorder |
 | Native actions (invoke / set value / toggle / expand) | — | ✓ ("simulate" input) | ✓ with automatic mouse fallback |
@@ -47,7 +47,8 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
 | Work queues | — | Orchestrator queues (central, SLA, multi-robot) | `WorkQueue`: local JSON, resumable, business vs system exceptions, CSV/JSON/XLSX loading — single machine |
 | Declarative workflows | — | XAML workflows from Studio | YAML/JSON flows: loops over CSV, try/catch, sub-flows, interpolation, validation before run |
 | Recorder | — | ✓ (rich) | ✓ emits Python or YAML **with selectors**, coalesces typing/hotkeys/drags |
-| Scheduling, credential vault, robot fleet management | — | ✓ Orchestrator | — use cron/Task Scheduler/CI and your secret manager |
+| Credential vault | — | ✓ Orchestrator assets | local: `locum.rpa.credentials` (Credential Manager / keyring), `${credential:NAME.password}` in flows, scrubbed from logs |
+| Scheduling, robot fleet management | — | ✓ Orchestrator | — by design: use cron/Task Scheduler/CI, and a real queue for several machines |
 | Governance, RBAC, audit, support | — | ✓ enterprise | audit log of LLM tool calls only; community support |
 | Testing without a desktop | — | — | `MockBackend` / demo desktop: deterministic, runs in CI |
 
@@ -88,16 +89,29 @@ LLM control. It is **not** a replacement for the UiPath platform as a whole.
   GitHub macOS runner, and 0.1.1 passed it on a real Apple Silicon Mac.
   Linux runs Xvfb with a window manager, a real AT-SPI registry and a GTK
   editor. That is real X11 and AT-SPI, but not a full desktop session.
-* No visual designer, no central orchestrator or credential vault.
-* Native Wayland sessions cannot be driven (Wayland forbids it by design;
-  XWayland apps and X11 sessions work).
-* No dedicated Citrix/RDP "remote runtime"; inside remote sessions use vision,
-  OCR or computer-use mode.
+* No visual designer and no orchestrator. locum is a library that runs on one
+  machine. It has a local credential vault (`locum.rpa.credentials`: Windows
+  Credential Manager, keyring elsewhere). It has no scheduler and no
+  multi-machine queue: the work queue deliberately refuses network shares and
+  synced folders, because file locks across machines are not reliable. Schedule
+  with Task Scheduler, cron or CI. For a fleet, put a real queue (a database, a
+  message broker) in front of several locum workers. If central orchestration
+  is the requirement, UiPath is the right tool.
+* Native Wayland: an experimental portal-based backend (input and capture via
+  xdg-desktop-portal, AT-SPI for elements, no window control). It has not yet
+  been validated on a real compositor. XWayland apps and X11 sessions are the
+  tested path.
+* SAP GUI Scripting, Java Access Bridge and an image-only remote-session
+  helper (`locum.bridges`, since 0.3) have been tested only against fakes of
+  the COM and DLL APIs, not yet against real SAP GUI, JVMs or Citrix
+  sessions. Inside remote sessions everything is pixels: vision and OCR,
+  confined to the session window.
 * Browser DOM automation (`locum.browser`, since 0.1.5) speaks the DevTools
   protocol to Edge/Chrome: launch with a separate profile or attach, navigate,
   evaluate, click, type, shadow roots and same-origin frames. It goes
   through the same safety policy. It is not a Playwright replacement: no
   Firefox/WebKit, no network interception, no auto-waiting test runner. Pair
   with Playwright for heavy web testing.
-* SAP GUI is driven through UI Automation like any app; for SAP GUI
-  Scripting-only fields, call the scripting API (pywin32) from the same robot.
+* SAP GUI: UI Automation sees part of it. `locum.bridges.sap` drives the
+  rest through SAP GUI Scripting (it needs scripting enabled on the server and
+  the client).

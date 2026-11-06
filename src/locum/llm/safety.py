@@ -1393,13 +1393,17 @@ class Policy:
             else:
                 description = ctx.get("description") or f"{tool_name} {json.dumps(args, default=str)[:200]}"
                 confirm_cb = confirm if confirm is not None else self.confirm
+                from .._secret import scrub, scrub_data  # noqa: PLC0415
+
+                # The human (or the error) sees what is being done, never a credential typed by it.
+                description = scrub(description) or description
                 if confirm_cb is None:
                     exc = PolicyViolation(
                         f"Action {description!r} needs human confirmation ({reason}) but no confirm callback is configured"
                     )
                     exc.needs_confirmation = reason  # type: ignore[attr-defined]
                     raise exc
-                details = {"tool": tool_name, "args": args, "reason": reason}
+                details = {"tool": tool_name, "args": scrub_data(dict(args)), "reason": reason}
                 details.update({k: v for k, v in ctx.items() if k not in ("desktop",)})
                 try:
                     approved = bool(confirm_cb(description, details))
@@ -1547,11 +1551,24 @@ def console_confirm(description: str, details: Dict[str, Any]) -> bool:
 _MAX_STR = 2000
 
 
+def _plain_text(text: Any) -> str:
+    """Typed text as a plain string: a credential :class:`~locum.rpa.credentials.Secret` is revealed
+    (the gate then recognizes it and masks it everywhere it is shown)."""
+    from .._secret import Secret
+
+    return text.reveal() if isinstance(text, Secret) else str(text)
+
+
 def _scrub(value: Any, depth: int = 0) -> Any:
-    """JSON-safe copy with long strings (base64 images) truncated."""
+    """JSON-safe copy with long strings (base64 images) truncated and credentials masked."""
+    from .._secret import Secret, scrub
+
     if depth > 8:
         return "..."
+    if isinstance(value, Secret):
+        return "***"
     if isinstance(value, str):
+        value = scrub(value) or value
         return value if len(value) <= _MAX_STR else value[:200] + f"...<{len(value)} chars>"
     if isinstance(value, dict):
         return {str(k): _scrub(v, depth + 1) for k, v in value.items() if k != "desktop"}
@@ -1814,13 +1831,21 @@ class GuardedDesktop(_GuardedProxy):
         """Check the policy; ``True`` when the action may run (``False``: dry-run). Raises PolicyViolation.
 
         ``log_args`` replaces ``args`` in the audit log (the policy still judges ``args``).
+        Text holding a credential (:class:`~locum.rpa.credentials.Secret`) is secret: it is
+        masked in the log, the description and the confirmation prompt.
         """
+        from .._secret import contains_secret, reveal, scrub
+
+        clean = {k: reveal(v) for k, v in args.items() if v is not None}
+        shown = clean if log_args is None else {k: reveal(v) for k, v in log_args.items() if v is not None}
+        secret = secret or any(contains_secret(v) for v in list(args.values()) + list((log_args or {}).values()))
+        description = scrub(description) or description
+        if "description" in ctx:
+            ctx["description"] = scrub(ctx["description"]) or ctx["description"]
         ctx.setdefault("description", description)
         extra = object.__getattribute__(self, "_g_exempt")
         if extra:
             ctx["exempt_rules"] = extra
-        clean = {k: v for k, v in args.items() if v is not None}
-        shown = clean if log_args is None else {k: v for k, v in log_args.items() if v is not None}
         logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in shown.items()}
         policy = self.policy
         try:
@@ -2114,10 +2139,14 @@ class GuardedDesktop(_GuardedProxy):
 
     # ------------------------------------------------------------------ keyboard
     def type(self, text: str, *, interval: float = 0.0, mode: Optional[str] = None) -> None:
-        text = str(text)
+        from .._secret import is_secret, scrubbing_errors
+
+        forced = is_secret(text)  # a credential: secret wherever it lands
+        text = _plain_text(text)
         pieces = split_typed_text(text) or [""]
         first = pieces[0]
         ctx, secret = self._focus_ctx(activating=typed_text_activates(first), enter="\n" in first or "\r" in first)
+        secret = secret or forced
         # Only the first piece lands in the focused control; later pieces (after a Tab/newline)
         # may land in a password field, so the log shows each piece in its own event.
         logged = first if len(pieces) > 1 else text
@@ -2126,17 +2155,20 @@ class GuardedDesktop(_GuardedProxy):
         if not self._gate("type_text", {"text": text}, ctx, f"type {shown!r}{part}", secret=secret,
                           log_args={"text": logged}):
             return None
-        self._type_pieces(pieces, interval=interval, mode=mode, first_done=False)
+        with scrubbing_errors(forced):
+            self._type_pieces(pieces, interval=interval, mode=mode, first_done=False, secret=forced)
         return None
 
     def _type_pieces(self, pieces: List[str], *, interval: float, mode: Optional[str],
-                     first_done: bool) -> None:
+                     first_done: bool, secret: bool = False) -> None:
         raw = self._raw
+        forced = secret
         for i, piece in enumerate(pieces):
             if i == 0 and first_done:
                 continue
             if i:  # a Tab/newline was typed: the rest may land in another control
                 ctx, secret = self._focus_ctx(activating=typed_text_activates(piece), enter="\n" in piece or "\r" in piece)
+                secret = secret or forced
                 self._gate("type_text", {"text": piece}, ctx,
                            f"type {'***' if secret else piece!r} (part {i + 1} of {len(pieces)})",
                            count=False, secret=secret)
@@ -2406,11 +2438,18 @@ class GuardedElement(_GuardedProxy):
         return self
 
     def type(self, text: str, **kw: Any) -> "GuardedElement":
-        text = str(text)
+        from .._secret import Secret, is_secret, scrubbing_errors
+
+        forced = is_secret(text)  # a credential: masked in the gate's log whatever the field is
+        text = _plain_text(text)
+        with scrubbing_errors(forced):
+            return self._type(text, forced, Secret if forced else (lambda s: s), **kw)
+
+    def _type(self, text: str, forced: bool, mark: Callable[[str], Any], **kw: Any) -> "GuardedElement":
         pieces = split_typed_text(text) or [""]
         # Later pieces (after a Tab/newline) are logged in their own events: they may land in a
         # password field.
-        logged = {"text": pieces[0] if len(pieces) > 1 else text}
+        logged = {"text": mark(pieces[0] if len(pieces) > 1 else text)}
         enter = "\n" in pieces[0] or "\r" in pieces[0]
         extra = None
         if enter:
@@ -2430,16 +2469,17 @@ class GuardedElement(_GuardedProxy):
             ctx.pop("target_unknown", None)
             from .._nodeinfo import is_password  # noqa: PLC0415
 
-            ok = guard._gate("type_text", {"text": text}, ctx, f"type into {ctx['target']!r}",
-                             secret=is_password(self.unwrapped.node), log_args=logged)
+            ok = guard._gate("type_text", {"text": mark(text)}, ctx, f"type into {ctx['target']!r}",
+                             secret=forced or is_password(self.unwrapped.node), log_args=logged)
         else:
-            ok = self._act("type_text", {"text": text}, "type into", activates=True, log_args=logged)
+            ok = self._act("type_text", {"text": mark(text)}, "type into", activates=True, log_args=logged)
         if not ok:
             return self
         self.unwrapped.type(pieces[0], **kw)
         if len(pieces) > 1:
             guard = object.__getattribute__(self, "_g_guard")
-            guard._type_pieces(pieces, interval=float(kw.get("interval", 0.0) or 0.0), mode=kw.get("mode"), first_done=True)
+            guard._type_pieces(pieces, interval=float(kw.get("interval", 0.0) or 0.0), mode=kw.get("mode"), first_done=True,
+                               secret=forced)
         return self
 
     def press(self, *keys: Any, **kw: Any) -> "GuardedElement":

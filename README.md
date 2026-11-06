@@ -126,8 +126,8 @@ d.find('window[name%="Invoice*"] button:has-text("save")')    # glob, case-insen
 d.find("<wnd app='erp' title='Invoice Entry*' /><ctrl automationid='amount' role='editable text' />")
 d.find({"role": "button", "name": "Clear", "within": {"role": "window", "name": "Invoice Entry - ERP"}})
 d.find('window "Book1 - Excel" > edit "Name Box"')             # child combinator
-d.find('window "Vendor*" text "Name:" + edit')                 # adjacent sibling: the edit right after the label
-d.find('window "Vendor*" group "Address" ~ button "Next"')     # general sibling: any later sibling
+d.find('window "Invoice Entry - ERP" text "Amount:" + edit')   # adjacent sibling: the edit right after the label
+d.find('checkbox "Urgent" ~ button "Submit Payment"')           # general sibling: any later sibling
 cells = d.find_all('edit[name~="^[A-E]1$"]')                    # regex attribute match
 assert [c.name for c in cells] == ["A1", "B1", "C1", "D1", "E1"]
 
@@ -448,6 +448,19 @@ A flow declares the commits it intends with a top-level `exempt:` list
 (`- {window: "*Excel*", keys: "mod+s"}`). On the CLI, `locum run flow.yaml
 --exempt 'button "Delete row"'`, `--confirm` and `--no-policy` do the same. Text typed into password fields is masked in audit
 logs and recordings. Details: [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md#6-safety-model).
+
+### Credentials
+
+<!-- norun -->
+```python
+from locum.rpa.credentials import get_credential
+cred = get_credential("erp")            # stored with: locum credential set erp --username robot01
+d.find('edit "User"').set_text(cred.username)
+d.find('edit "Password"').type(cred.password)   # a Secret: typed, but *** in traces, logs and reports
+```
+
+In a flow: `- type: {text: "${credential:erp.password}", into: 'edit "Password"'}`.
+Windows uses Credential Manager; macOS/Linux need `pip install locum[credentials]`.
 
 ### PyAutoGUI compatibility
 

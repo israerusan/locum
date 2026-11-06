@@ -113,7 +113,9 @@ class StepResult:
         return self.status == FAILED
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        from .._secret import scrub_data
+
+        return scrub_data({
             "name": self.name,
             "status": self.status,
             "kind": self.kind,
@@ -131,7 +133,7 @@ class StepResult:
             "handled": self.handled,
             "ok": self.ok,
             "data": _jsonable(self.data),
-        }
+        })
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "StepResult":
@@ -250,6 +252,13 @@ class RunReport:
 
     # ----------------------------------------------------------- serialization
     def to_dict(self) -> Dict[str, Any]:
+        """The report as JSON-able data. Credential values (:class:`~locum.rpa.credentials.Secret`)
+        are replaced by ``***`` wherever they appear (errors, logs, results)."""
+        from .._secret import scrub_data
+
+        return scrub_data(self._to_dict())
+
+    def _to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "run_id": self.run_id,
@@ -300,7 +309,9 @@ class RunReport:
 
     def to_html(self, *, thumbnail_size: int = 480) -> str:
         """Render the report as a self-contained HTML document (see module docstring)."""
-        return _render_html(self, thumbnail_size=thumbnail_size)
+        from .._secret import scrub
+
+        return scrub(_render_html(self, thumbnail_size=thumbnail_size)) or ""
 
     def save_html(self, path: PathLike, *, thumbnail_size: int = 480) -> str:
         """Write :meth:`to_html` to ``path`` (parent directories are created). Returns the path."""

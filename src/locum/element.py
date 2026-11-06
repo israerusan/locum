@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 from . import _inputlock, _target
 from ._cancel import check as _cancel_check
+from ._secret import accepts_secret
 from .backends.base import CAP_CLIPBOARD, AccessibleNode
 from .errors import (
     ActionTimeout,
@@ -1151,6 +1152,7 @@ class Element:
     def _typing_mode(self, mode: Optional[str]) -> str:
         return mode or getattr(self.desktop, "typing_mode", None) or "auto"
 
+    @accepts_secret
     @_bound_input(keyboard=True, lock=False)  # the native path needs no input lock: taken for typing only
     def set_text(self, text: str, *, native: NativeMode = "auto", clear: bool = True, verify: VerifyMode = True,
                  decimal: Optional[str] = None, require_focus: Optional[bool] = None,
@@ -1322,6 +1324,7 @@ class Element:
             self._raise_mismatch(target, last[0], vmode)
         return self._conclude(target, vmode, decimal, last[0])
 
+    @accepts_secret
     @_bound_input(keyboard=True)
     def type(self, text: str, *, verify: bool = True, require_focus: Optional[bool] = None,
              **kw: Any) -> "Element":

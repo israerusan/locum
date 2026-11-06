@@ -624,19 +624,27 @@ locum.heal.name_similarity def(a: 'str', b: 'str', *, partial: 'bool' = False) -
 locum.heal.suppressed def() -> 'Iterator[None]'
 
 # locum.a11y
-locum.a11y.AuditReport class(findings: 'List[Finding]' = <factory>, windows: 'List[str]' = <factory>, nodes: 'int' = 0, elapsed: 'float' = 0.0, truncated: 'bool' = False, notes: 'List[str]' = <factory>, min_target_size: 'int' = 24) -> None
+locum.a11y.AuditReport class(findings: 'List[Finding]' = <factory>, windows: 'List[str]' = <factory>, nodes: 'int' = 0, elapsed: 'float' = 0.0, truncated: 'bool' = False, notes: 'List[str]' = <factory>, min_target_size: 'int' = 24, tab_walk: "Optional['TabWalk']" = None) -> None
     .at_least(self, severity: 'str') -> 'List[Finding]'
     .counts(self) -> 'Dict[str, int]'
     .failed(self, fail_on: 'str' = 'error') -> 'bool'
     .format_text(self) -> 'str'
     .summary(self) -> 'str'
     .to_dict(self) -> 'Dict[str, Any]'
+locum.a11y.DEFAULT_MAX_TABS int
 locum.a11y.DEFAULT_MIN_TARGET_SIZE int
 locum.a11y.Finding class(rule: 'str', severity: 'str', message: 'str', element: 'str', selector: 'Optional[str]' = None, bounds: 'Optional[Rect]' = None, role: 'str' = '', name: 'str' = '', window: 'str' = '') -> None
     .to_dict(self) -> 'Dict[str, Any]'
 locum.a11y.RULES dict
 locum.a11y.SEVERITIES tuple
-locum.a11y.audit def(desktop: 'Any' = None, window: 'Any' = None, *, max_depth: 'int' = 32, time_budget: 'Optional[float]' = 30.0, min_target_size: 'int' = 24, max_nodes: 'int' = 20000, selectors: 'bool' = True, rules: 'Optional[Iterable[str]]' = None, clock: 'Callable[[], float]' = <built-in function monotonic>) -> 'AuditReport'
+locum.a11y.TAB_RULES frozenset
+locum.a11y.TabStop class(index: 'int', role: 'str', name: 'str', element: 'str', selector: 'Optional[str]' = None, bounds: 'Optional[Rect]' = None, visible: 'bool' = True) -> None
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.a11y.TabWalk class(window: 'str' = '', stops: 'List[TabStop]' = <factory>, presses: 'int' = 0, reverse_presses: 'int' = 0, complete: 'bool' = False, stopped: 'str' = '', reverse_ok: 'Optional[bool]' = None, restored_focus: 'Optional[bool]' = None, findings: 'List[Finding]' = <factory>, notes: 'List[str]' = <factory>) -> None
+    .format_lines(self) -> 'List[str]'
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.a11y.audit def(desktop: 'Any' = None, window: 'Any' = None, *, max_depth: 'int' = 32, time_budget: 'Optional[float]' = 30.0, min_target_size: 'int' = 24, max_nodes: 'int' = 20000, selectors: 'bool' = True, rules: 'Optional[Iterable[str]]' = None, clock: 'Callable[[], float]' = <built-in function monotonic>, tab_walk: 'bool' = False, max_tabs: 'int' = 200, reverse_check: 'bool' = False, policy: 'Any' = None, confirm: 'Any' = None, settle: 'float' = 0.05) -> 'AuditReport'
+locum.a11y.tab_walk def(desktop: 'Any' = None, window: 'Any' = None, *, max_tabs: 'int' = 200, reverse_check: 'bool' = False, policy: 'Any' = None, confirm: 'Any' = None, settle: 'float' = 0.05, selectors: 'bool' = True, rules: 'Optional[Iterable[str]]' = None) -> 'TabWalk'
 
 # locum.compat.pyautogui
 locum.compat.pyautogui.Box class(left, top, width, height)
@@ -644,11 +652,13 @@ locum.compat.pyautogui.DARWIN_CATCH_UP_TIME float
 locum.compat.pyautogui.FAILSAFE bool
 locum.compat.pyautogui.FAILSAFE_POINTS list
 locum.compat.pyautogui.FailSafeException exception(LocumError)
+locum.compat.pyautogui.G_LOG_SCREENSHOTS_FILENAMES list
 locum.compat.pyautogui.ImageNotFoundException exception(LocumError, LookupError)
 locum.compat.pyautogui.KEYBOARD_KEYS list
 locum.compat.pyautogui.KEY_NAMES list
 locum.compat.pyautogui.LEFT str
 locum.compat.pyautogui.LOG_SCREENSHOTS bool
+locum.compat.pyautogui.LOG_SCREENSHOTS_LIMIT int
 locum.compat.pyautogui.MIDDLE str
 locum.compat.pyautogui.MINIMUM_DURATION float
 locum.compat.pyautogui.MINIMUM_SLEEP float
@@ -957,3 +967,25 @@ locum.bridges.remote.ImageSession class(window: 'Any', desktop: 'Any' = None, *,
     .to_screen(self, x: 'int', y: 'int') -> 'Point'
     .type(self, text: 'str', *, interval: 'float' = 0.0, mode: 'Optional[str]' = None) -> 'None'
     .wait_image(self, image: 'Any', *, timeout: 'Optional[float]' = None, region: 'Any' = None, **kw: 'Any') -> 'Match'
+
+# locum.rpa.credentials
+locum.rpa.credentials.Credential class(name: 'str', username: 'str', password: 'Secret', source: 'str' = '') -> None
+locum.rpa.credentials.CredentialNotFound exception(LocumError, LookupError)
+locum.rpa.credentials.CredentialStore class(*args, **kwargs)
+    .delete(self, name: 'str') -> 'bool'
+    .get(self, name: 'str') -> 'Optional[Tuple[str, str]]'
+    .names(self) -> 'List[str]'
+    .set(self, name: 'str', username: 'str', password: 'str') -> 'None'
+locum.rpa.credentials.CredentialStoreUnavailable exception(BackendUnavailable)
+locum.rpa.credentials.ENV_FALLBACK_VAR str
+locum.rpa.credentials.Secret class(value: 'Any') -> 'None'
+    .get_secret_value(self) -> 'str'
+    .reveal(self) -> 'str'
+locum.rpa.credentials.TARGET_PREFIX str
+locum.rpa.credentials.delete_credential def(name: 'str', *, missing_ok: 'bool' = False) -> 'bool'
+locum.rpa.credentials.enable_env_fallback def(enabled: 'Optional[bool]' = True) -> 'None'
+locum.rpa.credentials.get_credential def(name: 'str', *, env: 'Optional[bool]' = None) -> 'Credential'
+locum.rpa.credentials.get_store def() -> 'Any'
+locum.rpa.credentials.list_credentials def() -> 'List[str]'
+locum.rpa.credentials.set_credential def(name: 'str', username: 'str', password: 'Any') -> 'None'
+locum.rpa.credentials.set_store def(store: 'Any') -> 'Any'

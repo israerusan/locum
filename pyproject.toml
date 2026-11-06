@@ -49,7 +49,9 @@ yaml = ["pyyaml>=6.0"]
 sap = ["pywin32>=306; sys_platform == 'win32'"]
 # Native Wayland backend (xdg-desktop-portal over D-Bus); experimental.
 wayland = ["jeepney>=0.8"]
-all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0", "pywin32>=306; sys_platform == 'win32'", "jeepney>=0.8; sys_platform == 'linux'"]
+# OS credential store on macOS/Linux (Windows uses Credential Manager directly).
+credentials = ["keyring>=24"]
+all = ["anthropic>=0.40", "pytesseract>=0.3.10", "pynput>=1.7", "pyyaml>=6.0", "pywin32>=306; sys_platform == 'win32'", "jeepney>=0.8; sys_platform == 'linux'", "keyring>=24"]
 # jeepney: the Wayland backend's D-Bus adapter test (pure Python, imports on every OS).
 dev = ["pytest>=7", "pyyaml>=6.0", "jeepney>=0.8"]
 

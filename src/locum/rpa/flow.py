@@ -80,6 +80,12 @@ takes precedence; a bare ``${env}`` is never the whole environment), loop state 
 ``catch`` block ``${error.message}`` / ``${error.type}`` / ``${error.step}``,
 defaults ``${name:-fallback}`` and ``$${`` for a literal ``${``. A string
 that is exactly one ``${...}`` keeps the value's type (lists stay lists).
+Credentials from the OS credential store (:mod:`locum.rpa.credentials`):
+``${credential:NAME.username}`` and ``${credential:NAME.password}``. A
+password is a :class:`~locum.rpa.credentials.Secret`, and so is any text built
+around one (``"${credential:erp.password}\\n"``): ``type``/``set_text``/
+``clipboard_set`` steps type it, but it shows as ``***`` everywhere else
+(``log``, the run report, errors, traces, the safety audit log).
 
 Errors carry the step path, e.g. ``steps[3].for_each.steps[1]``; invalid
 documents are rejected *before* anything runs, with every problem listed.
@@ -143,6 +149,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .._policy import DEFAULT_POLICY, resolve_policy
+from .._secret import Secret
 from ..errors import FailSafeTriggered, PolicyViolation, WorkflowError
 from ..types import Point, Rect
 from .report import FAILED, PASSED, RunReport, StepResult
@@ -255,7 +262,30 @@ class _Undefined(LookupError):
 
 # ============================================================ interpolation
 
+_CREDENTIAL_RE = re.compile(r"^credential:\s*(.+?)\s*\.\s*(username|password)$")
+
+
+def _credential(variables: Mapping[str, Any], expr: str) -> Any:
+    """``${credential:NAME.password}`` (a :class:`~locum.rpa.credentials.Secret`) / ``.username``."""
+    m = _CREDENTIAL_RE.match(expr)
+    if not m:
+        raise _Undefined(f"${{{expr}}}: write ${{credential:NAME.password}} or ${{credential:NAME.username}}")
+    name, part = m.group(1), m.group(2)
+    getter = variables.get("_credentials") if isinstance(variables, Mapping) else None
+    if getter is None:
+        from .credentials import get_credential as getter
+    try:
+        cred = getter(name)
+    except LookupError as exc:  # CredentialNotFound
+        raise _Undefined(str(exc)) from None
+    except Exception as exc:  # no credential store, access denied...
+        raise _Undefined(f"credential {name!r}: {type(exc).__name__}: {exc}") from None
+    return cred.password if part == "password" else cred.username
+
+
 def _lookup(variables: Mapping[str, Any], expr: str) -> Any:
+    if expr.startswith("credential:"):
+        return _credential(variables, expr)
     parts = [p.strip() for p in expr.split(".")]
     if not parts or not parts[0]:
         raise _Undefined(f"empty variable reference ${{{expr}}}")
@@ -323,6 +353,11 @@ def _to_text(value: Any) -> str:
     return str(value)
 
 
+def _typed_text(value: Any) -> Any:
+    """Text to type: a credential stays a :class:`Secret` (revealed only by the typing call)."""
+    return value if isinstance(value, Secret) else _to_text(value)
+
+
 def interpolate(value: Any, variables: Mapping[str, Any], *, path: str = "") -> Any:
     """Recursively substitute ``${...}`` references in strings inside ``value``.
 
@@ -338,15 +373,24 @@ def interpolate(value: Any, variables: Mapping[str, Any], *, path: str = "") -> 
             except _Undefined as exc:
                 raise WorkflowError(f"{path or 'flow'}: cannot resolve ${{{whole.group(1)}}}: {exc}") from None
 
+        holds_secret = False
+
         def sub(m: "re.Match[str]") -> str:
+            nonlocal holds_secret
             if m.group(0) == "$${":
                 return "${"
             try:
-                return _to_text(_resolve_expr(m.group(1), variables))
+                resolved = _resolve_expr(m.group(1), variables)
             except _Undefined as exc:
                 raise WorkflowError(f"{path or 'flow'}: cannot resolve ${{{m.group(1)}}}: {exc}") from None
+            if isinstance(resolved, Secret):
+                holds_secret = True
+                return resolved.reveal()
+            return _to_text(resolved)
 
-        return _VAR_RE.sub(sub, value)
+        text = _VAR_RE.sub(sub, value)
+        # Text built around a credential ("${credential:db.password}\n") is itself secret.
+        return Secret(text) if holds_secret else text
     if isinstance(value, dict):
         return {k: interpolate(v, variables, path=path) for k, v in value.items()}
     if isinstance(value, list):
@@ -807,6 +851,9 @@ class FlowRunner:
         lvl = _LOG_LEVELS.get(str(level).lower())
         if lvl is None:
             raise WorkflowError(f"{path}: unknown log level {level!r}; expected one of {', '.join(sorted(_LOG_LEVELS))}")
+        from .._secret import scrub
+
+        message = scrub(str(message)) or ""  # a credential never reaches the log or the report
         record = {"time": time.time(), "level": logging.getLevelName(lvl).lower(), "message": str(message), "path": path, **fields}
         if lvl >= logging.INFO:
             self.report.logs.append(record)
@@ -1022,7 +1069,7 @@ class FlowRunner:
             d.scroll(int(args.get("dy", 0) or 0), int(args.get("dx", 0) or 0), at=at)
             return None
         if kind == "type":
-            text = _to_text(args.get("text", ""))
+            text = _typed_text(args.get("text", ""))
             into = args.get("into", args.get("target"))
             kw: Dict[str, Any] = {"interval": float(args.get("interval", 0.0))}
             if args.get("mode") is not None:
@@ -1048,14 +1095,14 @@ class FlowRunner:
                 d.click(pt)
                 if _bool_arg(args.get("clear", True), "set_text.clear"):
                     d.hotkey("mod+a")
-                d.type(_to_text(args.get("text")))
+                d.type(_typed_text(args.get("text")))
                 return None
             el = self._element(args["target"], self._timeout(args, step, scope))
             native = args.get("native", "auto")
             verify = args.get("verify", True)
             if not isinstance(verify, (bool, str)):
                 raise ValueError(f"set_text.verify must be a bool or a mode name, got {verify!r}")
-            el.set_text(_to_text(args.get("text")), native=native, clear=_bool_arg(args.get("clear", True), "set_text.clear"),
+            el.set_text(_typed_text(args.get("text")), native=native, clear=_bool_arg(args.get("clear", True), "set_text.clear"),
                         verify=verify, decimal=args.get("decimal"))
             return None
         if kind in _ELEMENT_ACTIONS:
@@ -1194,7 +1241,7 @@ class FlowRunner:
             self.vars[str(args["var"])] = value
             return {"value": value}
         if kind == "clipboard_set":
-            d.clipboard_set(_to_text(args.get("text", "")))
+            d.clipboard_set(_typed_text(args.get("text", "")))
             return None
         if kind == "clipboard_get":
             name = args.get("var")

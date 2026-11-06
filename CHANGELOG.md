@@ -89,7 +89,23 @@ were the only record at the time.
   deprecation rule, and a snapshot test (`tests/data/public_api.txt`) that fails
   CI on any unreviewed public API change. This changelog.
 
-<!-- AGENT6 -->
+- **Credential vault** `locum.rpa.credentials`: Windows Credential Manager
+  (ctypes), `keyring` on macOS/Linux (`pip install locum[credentials]`), and
+  an env-var fallback only when explicitly enabled. Passwords are `Secret`
+  values: `***` in str/repr, and scrubbed from traces, audit logs, run reports,
+  confirmation prompts and CLI output. Flows reference
+  `${credential:NAME.password}` / `.username`.
+  `locum credential set|delete|list` (list shows names only).
+- `locum a11y-audit --window W --tab-walk [--reverse] [--max-tabs N]`
+  (opt-in, sends keys). It presses only Tab (and Shift+Tab) in that window,
+  bound to it under the desktop input lock and through the policy, and records
+  the focus order. It reports `tab-trap`, `tab-escape`, `tab-focus-lost`,
+  `tab-focus-invisible`, `tab-focus-unnamed`, `tab-unreachable`,
+  `tab-order-asymmetric` and `tab-order-backwards`, then restores the initial
+  focus. Python: `audit(..., tab_walk=True)` / `locum.a11y.tab_walk()`.
+- `locum.compat.pyautogui.LOG_SCREENSHOTS` and `LOG_SCREENSHOTS_LIMIT` now work
+  like PyAutoGUI: a screenshot before each action, the newest 10 kept in the
+  current directory. Before, the flag was accepted and ignored.
 
 ### Fixed
 
