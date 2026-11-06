@@ -507,3 +507,19 @@ def test_repeated_lookups_do_not_pile_up_references(fake):
         with pytest.raises(ElementNotFound):
             win.find('button "Nope"', timeout=1.0)
         assert jab.live_references == held
+
+
+def test_re_reading_a_big_container_costs_a_bounded_number_of_bridge_calls(fake):
+    panel = fake.roots[HWND].kids[0]
+    panel.kids[:] = [Obj(f"row {i}", "label", "enabled,visible,showing", (0, 0, 1, 1)) for i in range(500)]
+    calls = []
+    same = fake.isSameObject
+    fake.isSameObject = lambda vm, a, b: calls.append(1) or same(vm, a, b)
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        assert len(win.find_all("text")) == 500
+        del calls[:]
+        del panel.kids[0]  # every row moves up one place
+        rows = win.find_all("text")
+        assert len(rows) == 499 and rows[0].name == "row 1"
+        assert len(calls) <= 3 * 500  # index-aligned matching, not 500 x 500

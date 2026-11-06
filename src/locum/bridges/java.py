@@ -281,6 +281,8 @@ _STATE_MAP = {"indeterminate": "mixed", "collapsed": "collapsed", "expanded": "e
               "enabled": "enabled", "busy": "busy", "modal": "modal", "active": "active", "pressed": "pressed"}
 #: AccessibleAction names that mean "press this control" (Swing's AbstractButton action is "click").
 CLICK_ACTIONS = ("click", "press", "activate", "doclick")
+#: How far from its old position a cached child is looked for when the tree is re-read.
+_MATCH_WINDOW = 4
 
 
 class JavaBridge:
@@ -580,7 +582,9 @@ class JavaNode(AccessibleNode):
         if self._kids is None or self._kids_stale:
             info = self.info
             count = min(int(info.childrenCount), self.bridge.max_children) if info is not None else 0
-            old = list(self._kids or ())
+            prev = list(self._kids or ())
+            used: set = set()
+            shift = 0  # rows inserted/removed above: the old index of child i is i - shift
             kids: List[JavaNode] = []
             for i in range(max(0, count)):
                 try:
@@ -589,7 +593,16 @@ class JavaNode(AccessibleNode):
                     child = 0
                 if not child:
                     continue
-                same = next((k for k in old if not k._released and self._same_ref(k.ac, child)), None)
+                # Same position first, then a few neighbours: a bounded number of isSameObject
+                # calls per child, not a scan of every cached child (a JTable has thousands).
+                same = None
+                for j in sorted(range(i - shift - _MATCH_WINDOW, i - shift + _MATCH_WINDOW + 1),
+                                key=lambda j: abs(j - (i - shift))):
+                    if 0 <= j < len(prev) and j not in used and not prev[j]._released \
+                            and self._same_ref(prev[j].ac, child):
+                        same, shift = prev[j], i - j
+                        used.add(j)
+                        break
                 if same is not None:
                     # A second reference to a child we already hold: keep the node, drop the new reference.
                     if child != same.ac:
@@ -597,7 +610,6 @@ class JavaNode(AccessibleNode):
                             self.bridge.dll.releaseJavaObject(self.vm, child)
                         except Exception:  # noqa: BLE001
                             pass
-                    old.remove(same)
                     kids.append(same)
                     continue
                 self.bridge._track(self.vm, child)
