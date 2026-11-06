@@ -197,12 +197,13 @@ def test_guard_does_not_stack(app):
 # ------------------------------------------------------------------------- robot
 
 
-def test_robot_without_policy_is_ungated(app, tmp_path):
+def test_robot_with_explicit_opt_out_is_ungated(app, tmp_path):
     be, d, w = app
-    r = Robot(d, run_dir=tmp_path, save_reports=False)
-    assert r.desktop is d and r.policy is None and r.audit is None
-    r.desktop.click('button "Post"')
-    assert w["post"].clicks == 1
+    for off in (None, False, Policy.off()):
+        r = Robot(d, run_dir=tmp_path, save_reports=False, policy=off)
+        assert r.desktop is d and r.policy is None and r.audit is None
+        r.desktop.click('button "Post"')
+    assert w["post"].clicks == 3
 
 
 def test_robot_with_policy_gates_its_desktop_and_never_retries_refusals(app, tmp_path):
@@ -253,11 +254,11 @@ def test_robot_desktop_replaced_or_policy_changed_rewraps(app, tmp_path):
 # ------------------------------------------------------------------------- flows
 
 
-def test_run_flow_without_policy_is_ungated(app):
+def test_run_flow_with_explicit_opt_out_is_ungated(app):
     be, d, w = app
-    report = run_flow({"steps": [{"click": 'button "Post"'}]}, d)
+    report = run_flow({"steps": [{"click": 'button "Post"'}]}, d, policy=Policy.off())
     assert report.ok and w["post"].clicks == 1
-    assert "policy" not in report.metadata
+    assert report.metadata["policy"] == "off"
 
 
 def test_run_flow_with_policy_fails_the_refused_step_without_retrying(app):
@@ -276,7 +277,7 @@ def test_run_flow_with_policy_fails_the_refused_step_without_retrying(app):
     report = run_flow(flow, d, policy=Policy(allow=["edit#amount", 'button "OK"']),
                       confirm=lambda desc, x: asked.append(desc) or False, audit=audit)
     assert not report.ok and "PolicyViolation" in report.error
-    assert report.metadata["policy"] == "allow-list"
+    assert report.metadata["policy"] == "custom" and report.metadata["policy_mode"] == "allow-list"
     failed = next(s for s in report.steps if s.status == FAILED)
     assert failed.path == "steps[2]" and failed.attempts == 1
     assert asked == ["click Apply"]

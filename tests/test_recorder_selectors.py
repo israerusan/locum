@@ -168,7 +168,7 @@ def test_backend_session_replays_with_cached_selectors():
     assert [list(s)[0] for s in flow["steps"]] == ["click", "type", "click", "click"]
     assert flow["steps"][1] == {"type": {"text": "ACME", "into": 'window "Orders" edit "Customer"'}}
     be2, a2, b2, c2 = scene()
-    report = run_flow(flow, Desktop(be2, sleep=lambda s: None, default_timeout=0))
+    report = run_flow(flow, Desktop(be2, sleep=lambda s: None, default_timeout=0), policy=None)  # replays a recorded Send click
     assert report.ok, [s.error for s in report.failures]
     assert a2.find("Customer").value == "ACME"
     assert c2.find("Save").clicks == 1 and b2.find("Send").clicks == 1 and a2.find("Save").clicks == 0

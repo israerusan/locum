@@ -47,15 +47,22 @@ Features:
 * Steps (or :meth:`Robot.screenshot`) used outside :meth:`Robot.run` start an
   implicit run; the next :meth:`Robot.run` (or :meth:`Robot.start`) adopts it,
   and :meth:`Robot.finish` ends it.
-* **Safety policy (opt-in).** ``Robot(policy=Policy.strict(allow=[...]),
-  confirm=..., audit=...)`` makes :attr:`Robot.desktop` a
+* **Safety policy (on by default).** :attr:`Robot.desktop` is a
   :class:`~locum.llm.safety.GuardedDesktop`: every click, keystroke, text
   entry, launch and clipboard write -- including actions on elements and
   windows reached through ``find()``/``window()`` -- is checked against the
   policy first and raises :class:`~locum.errors.PolicyViolation` (never
-  retried) when it is refused or declined. **Without a policy nothing is
-  gated** (the default, as before): the LLM safety layer does not apply to
-  plain robot code.
+  retried) when it is refused or declined. Without a ``policy=`` argument
+  the robot uses :meth:`Policy.default() <locum.llm.safety.Policy.default>`,
+  the keyword/shortcut tripwire: a click on "Delete", "Pay now", "Supprimer",
+  "Überweisen"..., Ctrl+S or Ctrl+Enter, or a click on a control nobody can
+  identify needs a confirmation -- and since a robot runs unattended, without
+  a ``confirm`` callback it is **blocked**. To let such a step run, exempt its
+  target (``Robot(policy=Policy.default(exempt=['button "Delete row"']))``),
+  pass ``confirm=``, or opt out explicitly with ``policy=Policy.off()`` (or
+  ``policy=None``). For money or data actions use an allow-list instead:
+  ``Robot(policy=Policy.strict(allow=[...]))``. The policy applied is recorded
+  in ``report.metadata["policy"]``.
 """
 
 from __future__ import annotations
@@ -73,6 +80,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Union
 
 from .. import failsafe as _failsafe
+from .._policy import DEFAULT_POLICY, policy_label, resolve_policy
 from ..errors import ActionTimeout, FailSafeTriggered, PolicyViolation
 from .queue import TASK_DEADLINE_ATTR as _DEADLINE_ATTR
 from .queue import BusinessException
@@ -93,6 +101,14 @@ _LEVELS = {
 }
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SHOT_ATTR = "_locum_screenshot"
+
+
+def _policy_metadata(policy: Any) -> Dict[str, Any]:
+    """``RunReport.metadata`` entries naming the policy a run was gated by."""
+    if policy is None:
+        return {"policy": "off"}
+    return {"policy": policy_label(policy),
+            "policy_mode": "allow-list" if getattr(policy, "allow", None) is not None else "heuristic"}
 
 
 def _deadline_error(message: str) -> ActionTimeout:
@@ -385,9 +401,11 @@ class Robot:
             directory at the end of :meth:`run` / :meth:`finish`.
         sleep: Sleep function for retry delays (default: the desktop's sleep, which honours the abort flag).
         clock: Monotonic clock used for durations and timeouts.
-        policy: A :class:`~locum.llm.safety.Policy` that every desktop action
-            of the robot must pass (see the module docstring). ``None``
-            (default): actions are not gated.
+        policy: The :class:`~locum.llm.safety.Policy` every desktop action of
+            the robot must pass (see the module docstring). Default:
+            :meth:`Policy.default() <locum.llm.safety.Policy.default>`. A preset
+            name (``"default"``, ``"strict"``, ``"permissive"``) is accepted;
+            ``Policy.off()`` / ``None`` / ``False`` turn gating off explicitly.
         confirm: Confirmation callback for actions the policy sends to a human
             (default: the policy's own ``confirm``; none = such actions are blocked).
         audit: :class:`~locum.llm.safety.AuditLog` for the policy decisions
@@ -410,11 +428,13 @@ class Robot:
         save_reports: bool = True,
         sleep: Optional[Callable[[float], Any]] = None,
         clock: Callable[[], float] = time.monotonic,
-        policy: Any = None,
+        policy: Any = DEFAULT_POLICY,
         confirm: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
         audit: Any = None,
     ):
         self._desktop = desktop
+        policy = resolve_policy(policy)
+        #: The resolved :class:`~locum.llm.safety.Policy`, or ``None`` when gating was turned off.
         self.policy = policy
         self.confirm = confirm
         if policy is not None and audit is None:
@@ -453,7 +473,7 @@ class Robot:
             from ..desktop import Desktop
 
             self._desktop = Desktop()
-        if self.policy is None:
+        if not self.policy:  # None, False or Policy.off(): not gated
             return self._desktop
         if self._guarded is None or self._guarded.unwrapped is not _unguarded(self._desktop) \
                 or self._guarded.policy is not self.policy:
@@ -831,6 +851,7 @@ class Robot:
         self.report = RunReport(name=self.name, run_id=_new_run_id(self.name), started_at=time.time(),
                                 run_dir=None, metadata=dict(metadata or {}))
         self.report.metadata.setdefault("robot", self.name)
+        self.report.metadata.update(_policy_metadata(self.policy))
         self._active = True
         self._stack = []
         self._shot_seq = 0

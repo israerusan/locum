@@ -9,13 +9,16 @@
 Importing this package only needs the core dependencies; PyYAML, openpyxl and
 pynput are imported lazily when a feature needs them.
 
-Safety: robots and flows are **not** checked by the LLM safety policy unless
-you pass one -- ``Robot(policy=...)``, ``run_flow(..., policy=...)`` or
-``FlowRunner(..., policy=...)`` -- which makes them drive a
-:class:`~locum.llm.safety.GuardedDesktop` (every action checked first;
-refusals raise :class:`~locum.errors.PolicyViolation` and are never retried).
-Use ``Policy(allow=[...])`` / ``Policy.strict(allow=[...])`` for authorization
-by explicit rules; the default ``Policy()`` is only a keyword tripwire.
+Safety: robots and flows are checked by the safety policy **by default**.
+``Robot()`` and ``run_flow()`` drive a :class:`~locum.llm.safety.GuardedDesktop`
+under :meth:`Policy.default() <locum.llm.safety.Policy.default>` (every action
+checked first; refusals raise :class:`~locum.errors.PolicyViolation` and are
+never retried). The default is a keyword/shortcut tripwire, and because robots
+run unattended the actions it flags are blocked unless a ``confirm`` callback
+is given; ``Policy.default(exempt=[...])`` lets named targets through and
+``policy=Policy.off()`` (or ``None``) opts out explicitly. Use
+``Policy.strict(allow=[...])`` for authorization by explicit rules.
+:class:`FlowRunner` (the embedding API) gates only when given ``policy=``.
 """
 
 from __future__ import annotations

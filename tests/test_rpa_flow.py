@@ -168,7 +168,7 @@ def test_launch_and_image_steps(scene, tmp_path):
         {"if_exists": {"image": "btn.png", "then": [{"set_var": {"seen": True}}]}},
         {"assert_exists": {"image": "btn.png"}},
     ]}
-    report = run(doc, d, base_dir=tmp_path)
+    report = run(doc, d, base_dir=tmp_path, policy=None)  # coordinate image click: not about the policy
     assert report.ok, [s.error for s in report.failures]
     assert be.launched == ["notepad.exe"]
     assert report.variables["m"]["center"] == {"x": 712, "y": 612}
