@@ -267,9 +267,15 @@ class Observation:
         )
 
     def add_element(self, node: AccessibleNode, *, selector: str = "") -> ObservedElement:
-        """Append ``node`` (if not already present) with a fresh id; returns its entry."""
+        """Append ``node`` (if not already present) with a fresh id; returns its entry.
+
+        An element already in the observation keeps its id but is refreshed from the
+        live node: the entry was a snapshot from ``observe`` time, and a later
+        ``find_elements`` / ``wait_for`` must not describe what it *used* to show
+        (a calculator display still reading "0" after the result came in)."""
         for el in self.elements:
             if _same(el.node, node):
+                _refresh(el, node)
                 return el
         b = _safe(lambda: node.bounds)
         next_id = max((e.id for e in self.elements), default=0) + 1
@@ -383,6 +389,34 @@ def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
         return bool(a.same_as(b))
     except Exception:
         return False
+
+
+def _refresh(el: ObservedElement, node: AccessibleNode) -> None:
+    """Update ``el``'s description fields from the live ``node`` (id unchanged).
+
+    A field that can no longer be read keeps its old value. When the name changes, a
+    selector already built from the old name is dropped and rebuilt on next use."""
+    missing = object()
+    role = _safe(lambda: node.role, missing)
+    if role is not missing and role:
+        el.role = str(role).lower()
+    name = _safe(lambda: node.name, missing)
+    if name is not missing:
+        name = name or ""
+        if name != el.name and el.selector_ready:
+            del el.__dict__["selector"]
+            if el._selector_source is None:
+                el._selector_source = lambda n=node: _selector(n)
+        el.name = name
+    el.value = _node_value(node)
+    b = _safe(lambda: node.bounds)
+    if b is not None:
+        el.bounds = b
+    states = _safe(lambda: node.states, missing)
+    if states is not missing:
+        # "occluded" is computed by observe (window stacking), not read from the node.
+        keep = {"occluded"} & el.states
+        el.states = frozenset(states or ()) | keep
 
 
 def _selector(node: AccessibleNode, roots: Optional[Sequence[AccessibleNode]] = None,
