@@ -181,7 +181,7 @@ class ComputerUseAdapter:
             self.max_long_edge = int(max_long_edge)
             if self.max_long_edge <= 0:
                 raise ValueError("max_long_edge must be positive or 'auto'")
-        self.policy = policy if policy is not None else Policy()
+        self.policy = policy if policy is not None else Policy.default()
         self.audit = audit if audit is not None else AuditLog()
         self.monitor = monitor
         self.zoom_enabled = bool(zoom)

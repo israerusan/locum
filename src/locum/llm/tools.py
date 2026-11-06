@@ -805,7 +805,7 @@ class DesktopToolkit:
         launch_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.desktop = desktop
-        self.policy = policy if policy is not None else Policy()
+        self.policy = policy if policy is not None else Policy.default()
         self.audit = audit if audit is not None else AuditLog()
         self.observe_kwargs = dict(observe_kwargs or {})
         self.find_timeout = float(find_timeout)

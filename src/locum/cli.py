@@ -18,6 +18,7 @@
     locum mcp --policy strict                    # MCP server over stdio (Claude Desktop / Code)
     locum agent "Enter invoice INV-7 for ACME, 120.50" --dry-run
     locum run flow.yaml --var customer=ACME --report-dir runs
+    locum run flow.yaml --exempt 'button "Delete row"'   # the policy is on by default
     locum record -o recording.py
     locum a11y-audit Paint --fail-on warning     # unnamed / unreachable controls, labels
 
@@ -526,7 +527,7 @@ def _build_policy(name: str, *, dry_run: bool = False, confirm: Optional[Callabl
         return Policy.strict(**kw)
     if name == "permissive":
         return Policy.permissive(**kw)
-    return Policy(**kw)
+    return Policy.default(**kw)
 
 
 def _short_json(value: Any, limit: int = 160) -> str:
@@ -1054,6 +1055,45 @@ def cmd_agent(ctx: _Ctx) -> int:
     return EXIT_OK if result.success else EXIT_FAILURE
 
 
+def _flow_policy(ctx: _Ctx) -> Tuple[Any, Any, Any]:
+    """``(policy, confirm, audit)`` for ``locum run`` from ``--policy``/``--no-policy``/``--exempt``/``--confirm``."""
+    a = ctx.args
+    name = "off" if a.no_policy else a.policy
+    if name == "off":
+        if a.exempt:
+            raise _UsageError("--exempt needs a policy; it cannot be combined with --no-policy / --policy off")
+        if a.confirm:
+            raise _UsageError("--confirm needs a policy; it cannot be combined with --no-policy / --policy off")
+        if a.dry_run:
+            raise _UsageError("--dry-run needs a policy; it cannot be combined with --no-policy / --policy off")
+        return None, None, None
+    from .llm.safety import AllowRule, AuditLog, Policy
+
+    try:
+        exempt = [AllowRule.coerce(rule) for rule in a.exempt or ()]
+    except (TypeError, ValueError) as exc:
+        raise _UsageError(f"--exempt: {exc}") from None
+    kw: Dict[str, Any] = {"exempt": exempt, "dry_run": a.dry_run}
+    if name == "strict":
+        policy = Policy.strict(**kw)
+    elif name == "permissive":
+        policy = Policy.permissive(**kw)
+    else:
+        policy = Policy.default(**kw)
+    confirm = None
+    if a.confirm:
+        if not bool(getattr(ctx.inp, "isatty", lambda: False)()):
+            raise _UsageError("--confirm asks on the terminal, but stdin is not a terminal")
+
+        def confirm(description: str, details: Dict[str, Any]) -> bool:
+            ctx.err.write(f"[locum] Allow: {description}? (reason: {details.get('reason')}) [y/N] ")
+            ctx.err.flush()
+            answer = ctx.inp.readline()
+            return answer.strip().lower() in ("y", "yes")
+    audit = AuditLog(os.path.expanduser(a.audit)) if a.audit else None
+    return policy, confirm, audit
+
+
 def cmd_run(ctx: _Ctx) -> int:
     from .rpa.flow import load_flow, run_flow, validate_flow
 
@@ -1071,7 +1111,9 @@ def cmd_run(ctx: _Ctx) -> int:
         else:
             ctx.print(f"{a.flow}: valid ({len(doc.get('steps') or [])} top-level step(s))")
         return EXIT_OK if not problems else EXIT_USAGE
-    report = run_flow(a.flow, ctx.desktop, variables, run_dir=a.report_dir)
+    policy, confirm, audit = _flow_policy(ctx)
+    report = run_flow(a.flow, ctx.desktop, variables, run_dir=a.report_dir, policy=policy, confirm=confirm,
+                      audit=audit)
     if ctx.json:
         ctx.emit_json(report.to_dict())
     else:
@@ -1378,6 +1420,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--var", action="append", default=[], metavar="KEY=VALUE", help="override a flow variable (repeatable)")
     p.add_argument("--report-dir", metavar="DIR", help="write report.json/report.html and error screenshots under DIR/<run-id>/")
     p.add_argument("--validate", action="store_true", help="only validate the flow")
+    p.add_argument("--policy", choices=("default", "strict", "permissive", "off"), default="default",
+                   help="safety policy for the flow's actions (default: 'default', the keyword/shortcut tripwire; "
+                        "a flagged action is blocked unless --confirm or --exempt lets it run)")
+    p.add_argument("--no-policy", action="store_true",
+                   help="do not gate the flow's actions at all (same as --policy off)")
+    p.add_argument("--exempt", action="append", default=[], metavar="RULE",
+                   help="let actions on this target skip the tripwire (repeatable): a selector "
+                        "('button \"Delete row\"') or window=/app=/keys=/launch=/tool= shorthand")
+    p.add_argument("--confirm", action="store_true",
+                   help="ask on the terminal before an action the policy flags (default: block it)")
+    p.add_argument("--dry-run", action="store_true", help="simulate the flow's actions; nothing touches the desktop")
+    p.add_argument("--audit", metavar="FILE", help="append a JSON-lines audit log of every policy decision")
 
     p = add("record", "record mouse/keyboard input as a Python script or a flow")
     p.formatter_class = argparse.RawDescriptionHelpFormatter

@@ -159,6 +159,10 @@ def queue_invoices(queue: WorkQueue, csv_path: str) -> List[QueueItem]:
 def build_robot(desktop: Desktop, csv_path: str, queue_path: str, run_dir: str, launch: Optional[str] = None,
                 decimal_comma: bool = False) -> Robot:
     robot = Robot(desktop, name="invoice-entry", run_dir=run_dir)
+    # Act through robot.desktop: it is checked by the robot's safety policy (Policy.default()
+    # unless one is passed), so a stray click on "Delete"/"Post"/"Pay" or a Ctrl+S is blocked
+    # in this unattended run instead of committing something. Clicking "Save" is not flagged.
+    desktop = robot.desktop
     queue = WorkQueue("invoices", path=queue_path)
     robot.vars["queue"] = queue
 

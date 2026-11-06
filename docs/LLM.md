@@ -261,7 +261,7 @@ one you are relying on:
 
 | | Default: heuristic tripwire (`Policy()`) | Allow-list: authorization (`Policy(allow=[...])`, `Policy.strict(allow=[...])`) |
 |---|---|---|
-| Needs a human when… | the target's label, selector, command or arguments match `confirm_patterns` (English/German commit verbs), a `confirm_keys` shortcut is pressed, or an activating input reaches a control with no usable identity | **every** consequential action, unless an allow rule you wrote matches its target |
+| Needs a human when… | the target's label, selector, command or arguments match `confirm_patterns` (commit verbs in English, German, French, Spanish, Portuguese, Italian and Dutch, accent-insensitive), a `confirm_keys` shortcut is pressed, or an activating input reaches a control with no usable identity | **every** consequential action, unless an allow rule you wrote matches its target |
 | Misses | icon-only controls that report some unrelated name, labels in other languages, *Continue*/*Apply*/*OK*-style commits, app shortcuts it was not told about | nothing it was not told to allow (keywords still apply on top as a tripwire) |
 | Use it for | catching common mistakes while an agent explores | money, data and anything irreversible |
 
@@ -355,15 +355,34 @@ An authorized action records the rule in `context["allowed_by"]`.
 
 ### RPA behind the policy
 
-`Robot`, `run_flow` and `FlowRunner` take the same policy. They then drive a
-`GuardedDesktop` that checks every click, keystroke, text entry, native
-invoke/toggle, launch and clipboard write — including actions on elements
-and windows reached through `find()`, `find_all()`, `wait()` and `window()`,
-and the `mouse`/`keyboard` objects — before it is sent. A refused or declined
-action raises `PolicyViolation` and is **never retried** (also when it
-happens inside a `for_each`/`repeat`/`try`/subflow step that has `retries`,
-or inside a Robot task that wraps it in another error). Without a policy
-(the default) RPA is not gated at all, exactly as before.
+`Robot`, `run_flow` and `locum run` are gated **by default**: without a
+`policy=` argument they use `Policy.default()` (the keyword/shortcut
+tripwire). They drive a `GuardedDesktop` that checks every click, keystroke,
+text entry, native invoke/toggle, launch and clipboard write — including
+actions on elements and windows reached through `find()`, `find_all()`,
+`wait()` and `window()`, and the `mouse`/`keyboard` objects — before it is
+sent. A refused or declined action raises `PolicyViolation` and is **never
+retried** (also when it happens inside a `for_each`/`repeat`/`try`/subflow
+step that has `retries`, or inside a Robot task that wraps it in another
+error).
+
+Robots and flows run unattended, so an action the tripwire would send to a
+human (a click on *Delete*, *Pay now*, *Supprimer*, *Überweisen*…, Ctrl/Cmd+S,
+Ctrl/Cmd+Enter, a click on a control nobody can identify) is **blocked**
+unless a `confirm` callback is given. The error says how to let it run:
+
+* exempt that target: `Robot(policy=Policy.default(exempt=['button "Delete row"']))`,
+  `locum run flow.yaml --exempt 'button "Delete row"'`, or in the flow itself a
+  top-level `exempt:` list (`- {window: "*Excel*", keys: "mod+s"}`; each rule
+  must name a selector, keys or a launch command);
+* pass `confirm=` (`locum run --confirm` asks on the terminal);
+* or opt out explicitly: `policy=Policy.off()` (or `policy=None`),
+  `locum run --no-policy`.
+
+`report.metadata["policy"]` records the policy applied (`"default"`,
+`"strict"`, `"permissive"`, `"custom"` or `"off"`; `policy_mode` is
+`"heuristic"` or `"allow-list"`). `FlowRunner`, the embedding API, gates only
+when given `policy=`.
 
 ```python
 from locum.llm import AuditLog, Policy
@@ -393,9 +412,16 @@ nobody authorized; it is not a sandbox against code that reaches
 * **Confirmations.** By default (`DEFAULT_CONFIRM`), targets that look like
   they commit something — *delete, remove, pay, transfer, wire, submit, send,
   purchase, approve, post, buy, checkout, refund, authorize, release* and their
-  plurals (*Payments, Transfers, make_payments*), plus the German SAP labels
-  *Buchen, Zahlen, Überweisen, Freigeben, Löschen, Senden* — need
-  `confirm(description, details) -> bool`. No callback = blocked. Typed text
+  plurals (*Payments, Transfers, make_payments*), and the same categories in
+  German (*Buchen, Zahlen, Überweisen, Freigeben, Löschen, Senden*), French
+  (*Supprimer, Payer, Virement, Envoyer, Valider*), Spanish (*Eliminar, Pagar,
+  Transferir, Enviar*), Portuguese (*Excluir, Pagamento, Enviar*), Italian
+  (*Elimina, Paga, Bonifico, Invia*) and Dutch (*Verwijderen, Betalen,
+  Overboeken, Verzenden*) — need `confirm(description, details) -> bool`
+  (`CONFIRM_KEYWORDS` has the lists). Matching ignores case and accents
+  (`Überweisen` = `Uberweisen` = `Ueberweisen`). No callback = blocked. This
+  is a tripwire: the allow-list (`Policy.strict(allow=[...])`) is the real
+  control; `Policy(exempt=[...])` lets named targets past it. Typed text
   is not matched; the click that submits it is. A click on an element is
   judged by what the mouse really hits: clicking a group or toolbar whose
   centre lies on a "Pay now" button counts as clicking "Pay now".

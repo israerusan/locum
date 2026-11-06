@@ -243,7 +243,7 @@ def test_backend_recording_replays_via_flow_on_fresh_scene():
     json.dumps(flow)  # plain data
     be2, w2 = build_scene()
     d2 = Desktop(be2, sleep=lambda s: None, default_timeout=0)
-    report = run_flow(flow, d2)
+    report = run_flow(flow, d2, policy=None)  # replays a recorded Submit click
     assert report.ok, [s.error for s in report.failures]
     assert snapshot(w2) == expected
     assert w2.find("pending").value == "submitted"
@@ -260,7 +260,7 @@ def test_recorded_flow_survives_layout_change():
     be2, w2 = build_scene()
     be2.move_window(w2.handle, w2.rect.offset(150, 120))
     w2.find("Submit").rect = w2.find("Submit").rect.offset(200, 0)
-    report = run_flow(rec.to_flow(), Desktop(be2, sleep=lambda s: None, default_timeout=0))
+    report = run_flow(rec.to_flow(), Desktop(be2, sleep=lambda s: None, default_timeout=0), policy=None)
     assert report.ok, [s.error for s in report.failures]
     assert snapshot(w2) == expected
 
@@ -315,7 +315,7 @@ def test_save_formats(tmp_path):
     loaded = yaml.safe_load(open(y))
     assert loaded["steps"][0] == {"click": 'window "Signup" button "Submit"'}
     be2, w2 = build_scene()
-    report = run_flow(y, Desktop(be2, sleep=lambda s: None, default_timeout=0))
+    report = run_flow(y, Desktop(be2, sleep=lambda s: None, default_timeout=0), policy=None)
     assert report.ok and w2.find("pending").value == "submitted"
     with pytest.raises(ValueError):
         rec.save(tmp_path / "out.txt")

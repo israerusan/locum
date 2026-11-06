@@ -341,7 +341,7 @@ class Agent:
         # ones, adopt those of the prepared object that executes this mode's tools.
         primary, secondary = (toolkit, computer) if mode == "tools" else (computer, toolkit)
         if policy is None:
-            policy = primary.policy if primary is not None else (secondary.policy if secondary is not None else Policy())
+            policy = primary.policy if primary is not None else (secondary.policy if secondary is not None else Policy.default())
         if audit is None:
             audit = primary.audit if primary is not None else (secondary.audit if secondary is not None else AuditLog())
         self.policy = policy

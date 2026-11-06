@@ -95,17 +95,36 @@ previous position too. Every heal is logged at warning level and recorded in
 the step's report data (``healed``). Existence checks (``if_exists``,
 ``assert_exists``, ``wait_gone``) never heal.
 
-Safety policy (opt-in): ``run_flow(doc, desktop, policy=Policy.strict(allow=[...]),
-confirm=..., audit=...)`` runs the flow on a
+Safety policy (on by default): every flow runs on a
 :class:`~locum.llm.safety.GuardedDesktop`, so every step that acts (clicks,
 typing, ``set_text``, ``invoke``/``toggle``/..., keys, ``launch``,
 ``clipboard_set``, ``activate_window``) is checked against the policy first;
 a refused or declined action fails its step with
 :class:`~locum.errors.PolicyViolation` and is never retried (neither the
 step nor an enclosing ``for_each``/``repeat``/``try``/subflow step with
-``retries``). **Without a
-policy, flows are not gated** (the default, as before). A flow document cannot
-declare its own allow rules: authorization comes from the caller.
+``retries``). Without ``policy=`` the flow runs under
+:meth:`Policy.default() <locum.llm.safety.Policy.default>` (the keyword and
+shortcut tripwire); a flow runs unattended, so a step the tripwire flags --
+a click on "Delete"/"Pay"/"Supprimer", Ctrl+S, a click on a control nobody
+can identify -- is **blocked** unless ``confirm=`` is given. Let it run with
+``policy=Policy.default(exempt=[...])`` naming that target, or opt out
+explicitly with ``policy=Policy.off()`` / ``policy=None`` (``locum run
+--no-policy``). For money or data actions use an allow-list:
+``policy=Policy.strict(allow=[...])``.
+
+A flow may declare the commits it *intends* under a top-level ``exempt:`` list
+(top-level flow only), so they pass the tripwire::
+
+    exempt:
+      - {window: "*Excel*", keys: mod+s}     # the final save
+      - 'button "Delete row"'
+
+Each rule must name a ``selector``, ``keys`` or a ``launch`` command (see
+:func:`flow_exempt_rules`). A document cannot declare ``allow`` rules or turn
+the policy off: authorization comes from the caller, and under an allow-list
+(``Policy.strict(allow=[...])``) an exempt action still needs a caller's rule.
+``report.metadata["policy"]`` names the policy applied (``policy_exempt`` lists
+the exemptions).
 """
 
 from __future__ import annotations
@@ -123,6 +142,7 @@ import traceback as _tb
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from .._policy import DEFAULT_POLICY, resolve_policy
 from ..errors import FailSafeTriggered, PolicyViolation, WorkflowError
 from ..types import Point, Rect
 from .report import FAILED, PASSED, RunReport, StepResult
@@ -483,15 +503,54 @@ def _suggest(word: str, options: Sequence[str]) -> str:
     return f" (did you mean {close[0]!r}?)" if close else ""
 
 
+def flow_exempt_rules(doc: Mapping[str, Any]) -> list:
+    """The :class:`~locum.llm.safety.AllowRule` s a flow document lists under ``exempt:``.
+
+    They let the flow's own intended commits (``{window: "*Excel*", keys: mod+s}``,
+    ``'button "Delete row"'``) skip the policy's keyword/shortcut tripwire. Each
+    rule must be specific -- name a ``selector``, ``keys`` or a ``launch``
+    command -- because a bare ``window=``/``app=``/``tool=`` rule would exempt
+    everything in that window. Values are taken literally (no ``${...}``).
+    They never authorize anything in allow-list mode and never turn the policy off.
+    Raises ``ValueError``/``TypeError`` for a malformed rule.
+    """
+    raw = doc.get("exempt")
+    if raw is None:
+        return []
+    if isinstance(raw, (str, Mapping)):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise TypeError(f"must be a list of rules, got {type(raw).__name__}")
+    from ..llm.safety import AllowRule
+
+    rules = []
+    for i, item in enumerate(raw):
+        rule = AllowRule.coerce(dict(item) if isinstance(item, Mapping) else item)
+        if not (rule.selector or rule.keys or rule.command):
+            raise ValueError(f"rule {i} ({rule}) is too broad: a flow's exempt rule must name a selector, "
+                             "keys or a launch command (a window/app/tool rule alone would exempt everything there)")
+        rules.append(rule)
+    return rules
+
+
 def validate_flow(doc: Mapping[str, Any], *, prefix: str = "") -> List[str]:
     """Check a flow document's structure. Returns a list of problems (empty = valid)."""
     problems: List[str] = []
     if not isinstance(doc, Mapping):
         return [f"{prefix or 'flow'}: must be a mapping, got {type(doc).__name__}"]
-    known_top = {"name", "description", "vars", "settings", "steps", "flows", "version"}
+    known_top = {"name", "description", "vars", "settings", "steps", "flows", "version", "exempt"}
     for k in doc:
         if k not in known_top:
             problems.append(f"{prefix or 'flow'}: unknown top-level key {k!r}{_suggest(k, sorted(known_top))}")
+    if "exempt" in doc:
+        if prefix:
+            problems.append(f"{prefix}: 'exempt' is only allowed in the top-level flow (the one run_flow / "
+                            "`locum run` starts), not in a sub-flow")
+        else:
+            try:
+                flow_exempt_rules(doc)
+            except (TypeError, ValueError) as exc:
+                problems.append(f"flow: exempt: {exc}")
     if "steps" not in doc:
         problems.append(f"{prefix or 'flow'}: missing 'steps' list")
     elif not isinstance(doc["steps"], list):
@@ -722,11 +781,15 @@ class FlowRunner:
         policy: Any = None,
         confirm: Any = None,
         audit: Any = None,
+        exempt: Any = (),
     ):
+        # The low-level runner gates only when given a policy (``run_flow`` passes the default
+        # one); a desktop that is already guarded (``Robot.desktop``) stays guarded.
+        policy = resolve_policy(policy)
         if policy is not None:
             from ..llm.safety import GuardedDesktop
 
-            desktop = GuardedDesktop(desktop, policy, confirm=confirm, audit=audit)
+            desktop = GuardedDesktop(desktop, policy, confirm=confirm, audit=audit, exempt=exempt)
         #: The desktop steps act on (a :class:`~locum.llm.safety.GuardedDesktop` when a policy is given).
         self.desktop = desktop
         self.report = report
@@ -1563,7 +1626,7 @@ def run_flow(
     screenshot_on_error: Optional[bool] = None,
     raise_on_error: bool = False,
     logger: Optional[logging.Logger] = None,
-    policy: Any = None,
+    policy: Any = DEFAULT_POLICY,
     confirm: Any = None,
     audit: Any = None,
 ) -> RunReport:
@@ -1580,8 +1643,11 @@ def run_flow(
         screenshot_on_error: Save a screenshot when a step fails (default: the document's
             ``settings.screenshot_on_error``, else ``True`` when ``run_dir`` is set).
         raise_on_error: Raise the :class:`FlowStepError` instead of returning a failed report.
-        policy: A :class:`~locum.llm.safety.Policy` every acting step must pass
-            (``None``, the default: steps are not gated).
+        policy: The :class:`~locum.llm.safety.Policy` every acting step must pass.
+            Default: :meth:`Policy.default() <locum.llm.safety.Policy.default>`
+            (actions it flags are blocked unless ``confirm`` is given). A preset
+            name (``"default"``, ``"strict"``, ``"permissive"``) is accepted;
+            ``Policy.off()`` / ``None`` / ``False`` turn gating off explicitly.
         confirm: Confirmation callback for actions the policy sends to a human
             (default: the policy's ``confirm``; none = such actions are blocked).
         audit: :class:`~locum.llm.safety.AuditLog` for the policy decisions.
@@ -1589,8 +1655,9 @@ def run_flow(
     Raises:
         WorkflowError: The document is invalid (all problems are listed), before anything runs.
     """
-    from .robot import _new_run_id
+    from .robot import _new_run_id, _policy_metadata
 
+    policy = resolve_policy(policy)
     doc, file_path = load_flow(path_or_dict)
     source = str(file_path) if file_path is not None else "<dict>"
     problems = validate_flow(doc)
@@ -1614,10 +1681,12 @@ def run_flow(
     base = pathlib.Path(base_dir).expanduser() if base_dir is not None else (
         file_path.parent if file_path is not None else pathlib.Path.cwd())
     vars_: Dict[str, Any] = {}
+    exempt = flow_exempt_rules(doc) if policy is not None else []
     runner = FlowRunner(desktop, report, vars_, run_dir=evidence_dir, screenshot_on_error=shots, logger=logger,
-                        policy=policy, confirm=confirm, audit=audit)
-    if policy is not None:
-        report.metadata["policy"] = "allow-list" if getattr(policy, "allow", None) is not None else "heuristic"
+                        policy=policy, confirm=confirm, audit=audit, exempt=exempt)
+    report.metadata.update(_policy_metadata(policy))
+    if policy is not None and (policy.exempt or exempt):
+        report.metadata["policy_exempt"] = [str(r) for r in tuple(policy.exempt) + tuple(exempt)]
     settings = dict(doc.get("settings") or {})
     scope = _Scope(base_dir=base, flows=dict(doc.get("flows") or {}), settings=settings)
     error: Optional[BaseException] = None

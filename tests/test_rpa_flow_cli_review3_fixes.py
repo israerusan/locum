@@ -81,7 +81,7 @@ def test_settings_retries_do_not_rerun_finished_loop_iterations(be, desk):
                 {"click": 'button "Submit Payment"'},
                 {"click": "${inv.after}"},
             ]}}]}
-    r = run_flow(flow, desk)
+    r = run_flow(flow, desk, policy=None)  # about retries, the flow clicks "Submit Payment"
     assert not r.ok
     assert be.payments == [{"invoices": ["INV-1"], "total": 100.0}, {"invoices": ["INV-2"], "total": 250.0}]
     pays = [s for s in r.steps if s.name == 'click button "Submit Payment"']
@@ -163,7 +163,7 @@ def test_yaml_scalars_are_kept_as_written(tmp_path, desk):
         "  - click: [10, 20]\n",
         encoding="utf-8",
     )
-    r = run_flow(f, desk)
+    r = run_flow(f, desk, policy=None)  # about YAML scalars, the flow clicks "Post"
     assert r.ok, r.error
     assert r.variables["inv"] == "00123" and r.variables["amt"] == "1250.50"
     assert r.logs[0]["message"] == "12345678901234567.89 NO 12:30"

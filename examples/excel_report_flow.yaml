@@ -19,8 +19,14 @@ vars:
   workbook: "*Excel*"          # window title glob
   excel_command: excel         # what to launch when no workbook is open
 
+# Flows run under the default safety policy, which blocks Ctrl/Cmd+S (and clicks on
+# Delete/Pay/Submit...) in an unattended run. The final save is intended, so the flow
+# exempts exactly that: the save shortcut, in the workbook window.
+exempt:
+  - {window: "*Excel*", keys: "mod+s"}
+
 settings:
-  timeout: 15                  # seconds to wait for windows/elements
+  timeout: 15                 # seconds to wait for windows/elements
   retries: 1                   # retry each failing action step once (loops/blocks are never re-run)
   retry_delay: 1
 

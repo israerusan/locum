@@ -2,10 +2,14 @@
 
 Every tool call an agent makes (custom desktop tools, computer-use actions,
 MCP tool calls) passes through :meth:`Policy.check` *before* anything touches
-the desktop. RPA code (:class:`~locum.rpa.Robot`, YAML/JSON flows) is
-checked the same way **only when it is given a policy**: ``Robot(policy=...)``
-/ ``run_flow(..., policy=...)`` drive a :class:`GuardedDesktop`; without one
-they act exactly as before, ungated. A policy can:
+the desktop. RPA code (:class:`~locum.rpa.Robot`, YAML/JSON flows, ``locum
+run``) is checked the same way **by default**: without a ``policy=`` argument
+they drive a :class:`GuardedDesktop` under :meth:`Policy.default`. Robots and
+flows run unattended, so an action the tripwire would send to a human is
+**blocked** (:class:`~locum.errors.PolicyViolation`) unless a ``confirm``
+callback is given; the error says how to let it run -- an ``exempt`` rule for
+that target, a callback, or an explicit opt-out (``policy=Policy.off()`` /
+``policy=None``; ``locum run --no-policy``). A policy can:
 
 * allow/deny tools by name (globs: ``"click"``, ``"*clipboard*"``);
 * restrict which applications may be driven (``allowed_apps`` / ``blocked_apps``);
@@ -18,19 +22,23 @@ they act exactly as before, ungated. A policy can:
 
 Two ways to decide what needs a human:
 
-* **Heuristic tripwire (default, ``Policy()``).** Confirmation is required
+* **Heuristic tripwire (default, ``Policy()`` / :meth:`Policy.default`).** Confirmation is required
   when the target's label, selector, command or arguments match
-  ``confirm_patterns`` (English/German finance and destructive verbs such as
-  *pay, transfer, submit, delete, send, Buchen*), when a ``confirm_keys``
+  ``confirm_patterns`` (finance and destructive verbs in English, German,
+  French, Spanish, Portuguese, Italian and Dutch -- *pay, transfer, submit,
+  delete, send, Buchen, Supprimer, Eliminar, Excluir, Elimina, Verwijderen*;
+  :data:`CONFIRM_KEYWORDS` -- matched accent-insensitively), when a ``confirm_keys``
   shortcut is pressed (Ctrl/Cmd+Enter, Ctrl/Cmd+S), or when an activating
   input (click, Enter/Space, typing that clicks to focus) reaches a control
   with **no usable identity** -- nothing under the pointer, an unreadable
   focus, or a control with no name, automation id, text value or named
   descendant at the click point (``unknown_target``). This is keyword
   inference: it misses icon-only buttons that report a name it does not
-  know, labels in other languages, "Continue"/"Apply"-style commits and
-  application shortcuts it was not told about. Treat it as a tripwire that
-  catches common mistakes, **not** as authorization for money or data actions.
+  know, labels in languages it has no list for, "Continue"/"OK"/"Apply"-style
+  commits and application shortcuts it was not told about. Treat it as a
+  tripwire that catches common mistakes, **not** as authorization for money or
+  data actions: the allow-list below is the real control. Targets a robot
+  legitimately commits can be listed in ``Policy(exempt=[...])``.
 * **Allow-list authorization (``Policy(allow=[...])`` / ``Policy.strict(allow=[...])``).**
   Every consequential action -- clicks and other activations, text entry,
   native invoke/toggle/select, ``launch_app``, ``write_clipboard``,
@@ -64,37 +72,142 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Pattern, Sequence, Tuple, Union
 
+from .._policy import DEFAULT_POLICY, POLICY_OFF
 from ..errors import PolicyViolation
 from ..types import Point, Rect, coerce_point
 
-#: Verbs and nouns whose targets usually commit something irreversible (money, messages,
-#: data), with their plural/inflected forms ("Payments", "Transfers", "make_payments") and
-#: the main German SAP labels (Buchen, Zahlen, Überweisen, Freigeben, Löschen, Senden).
-DEFAULT_CONFIRM: tuple = (
-    r"\b(?:delete|deletes|deleting)\b", r"\b(?:remove|removes|removing)\b", r"\bpay(?:s|ing|ments?|outs?)?\b", r"\btransfers?\b",
-    r"\bwires?\b", r"\bsubmits?\b", r"\bsend(?:s|ing)?\b", r"\bpurchases?\b", r"\bapproves?\b",
-    r"\bpost(?:s|ing)?\b", r"\bbuy\b", r"\bcheck ?out\b", r"\bplace orders?\b", r"\brefunds?\b",
-    r"\bauthori[sz]es?\b", r"\bexecute payments?\b", r"\breleases?\b",
-    r"\bbuchen\b", r"\bverbuchen\b", r"\bzahl(?:en|ungen|ung)\b", r"\büberweis(?:en|ung|ungen)\b",
-    r"\bfreigeben\b", r"\bfreigabe\b", r"\blöschen\b", r"\bsenden\b",
-)
+def fold_text(text: str) -> str:
+    """``text`` without diacritics (NFKD, combining marks dropped, ``ß`` -> ``ss``).
+
+    The keyword tripwire matches folded text against folded patterns, so
+    ``"Überweisen"``, ``"uberweisen"`` and ``"Supprimer"``/``"Réglement"`` match
+    whatever accents the label (or the pattern) carries.
+    """
+    s = unicodedata.normalize("NFKD", str(text))
+    return "".join(c for c in s if not unicodedata.combining(c)).replace("ß", "ss").replace("ẞ", "SS")
+
+
+#: Keyword tripwire, per language (ISO 639-1 code -> regexes). Every entry is matched
+#: case- and **accent-insensitively** (both the target text and the pattern are folded
+#: with :func:`fold_text`) against the *target* of an action: the clicked control's
+#: label, selector or text, the control a shortcut presses, a launched command. Every
+#: language covers the same categories -- delete/remove, pay/payment, transfer/wire,
+#: send/submit, buy/purchase/checkout/order, approve, post (accounting), refund,
+#: authorize, release -- in the forms buttons carry (infinitive and imperative:
+#: ``Supprimer``, ``Eliminar``, ``Elimina``, ``Verwijder``, ``Überweisen``).
+#:
+#: This is a **tripwire**, not authorization: no word list knows every label, icon
+#: or language, and commits labelled "Continue"/"OK"/"Apply" pass it. The real control
+#: is an allow-list (``Policy.strict(allow=[...])``), where nothing consequential runs
+#: unless a rule you wrote names its target.
+CONFIRM_KEYWORDS: Dict[str, tuple] = {
+    "en": (
+        r"\b(?:delete|deletes|deleting)\b", r"\b(?:remove|removes|removing)\b", r"\bpay(?:s|ing|ments?|outs?)?\b",
+        r"\btransfers?\b", r"\bwires?\b", r"\bsubmits?\b", r"\bsend(?:s|ing)?\b", r"\bpurchases?\b",
+        r"\bapproves?\b", r"\bpost(?:s|ing)?\b", r"\bbuy\b", r"\bcheck ?out\b", r"\bplace orders?\b",
+        r"\brefunds?\b", r"\bauthori[sz]es?\b", r"\bexecute payments?\b", r"\breleases?\b",
+    ),
+    "de": (
+        r"\bbuchen\b", r"\bverbuchen\b", r"\bzahl(?:en|ungen|ung)\b", r"\b(?:u|ue)berweis(?:en|ung|ungen)\b",
+        r"\bfreigeben\b", r"\bfreigabe\b", r"\bl(?:o|oe)schen\b", r"\b(?:ab|ver)?senden\b", r"\bentfernen\b",
+        r"\bbezahlen\b", r"\bkaufen\b", r"\bkostenpflichtig bestellen\b", r"\bgenehmigen\b",
+        r"\berstatt(?:en|ung)\b", r"\bautorisieren\b",
+    ),
+    "fr": (
+        r"\bsupprim(?:er|ez|e)\b", r"\bsuppression\b", r"\bretir(?:er|ez)\b", r"\benlev(?:er|ez)\b",
+        r"\bpa(?:yer|yez|iement|iements)\b", r"\breglements?\b", r"\bvirements?\b",
+        r"\btransf(?:erer|erez|ert|erts)\b", r"\benvoy(?:er|ez)\b", r"\benvoi\b", r"\bsoumett(?:re|ez)\b",
+        r"\bvalid(?:er|ez)\b", r"\bachet(?:er|ez)\b", r"\bachats?\b", r"\bapprouv(?:er|ez)\b",
+        r"\bcomptabilis(?:er|ez)\b", r"\bpasser (?:la )?commande\b", r"\bcommander\b",
+        r"\brembours(?:er|ez|ement)\b", r"\bautoris(?:er|ez)\b", r"\bliber(?:er|ez)\b",
+    ),
+    "es": (
+        r"\belimin(?:ar|e)\b", r"\bborr(?:ar|e)\b", r"\bsuprimir\b", r"\bquitar\b",
+        r"\bpag(?:ar|ue|o|os)\b", r"\btransferir\b", r"\btransferencias?\b", r"\benvi(?:ar|e|o)\b",
+        r"\bcompr(?:ar|a|as)\b", r"\baprobar\b", r"\bapruebe\b", r"\bcontabilizar\b",
+        r"\b(?:realizar|hacer|tramitar) (?:el )?pedido\b", r"\breembols(?:ar|o)\b", r"\bautorizar\b",
+        r"\bliberar\b",
+    ),
+    "pt": (
+        r"\bexcluir\b", r"\bapagar\b", r"\bremover\b", r"\bpagamentos?\b", r"\bpague\b",
+        r"\btransfira\b", r"\bsubmeter\b", r"\bcompre\b", r"\baprov(?:ar|e)\b", r"\blancar\b",
+        r"\bfinalizar compra\b", r"\bfazer (?:o )?pedido\b", r"\breembolsar\b",
+    ),
+    "it": (
+        r"\belimin(?:a|are)\b", r"\bcancell(?:a|are)\b", r"\brimuov(?:i|ere)\b", r"\bpag(?:a|are|amento|amenti)\b",
+        r"\bbonific(?:o|i)\b", r"\btrasferi(?:re|sci|mento)\b", r"\binvi(?:a|are)\b", r"\binoltr(?:a|are)\b",
+        r"\bacquist(?:a|are|o|i)\b", r"\bapprov(?:a|are)\b", r"\bcontabilizz(?:a|are)\b",
+        r"\beffettua (?:l')?ordine\b", r"\brimbors(?:a|are|o)\b", r"\bautorizz(?:a|are)\b",
+    ),
+    "nl": (
+        r"\bverwijder(?:en)?\b", r"\bbetal(?:en|ing|ingen)?\b", r"\bbetaal\b", r"\boverma(?:ken|ak)\b",
+        r"\boverboek(?:en|ing)?\b", r"\boverschrijving(?:en)?\b", r"\bverzend(?:en)?\b", r"\bverstu(?:ren|ur)\b",
+        r"\bindienen\b", r"\bdien in\b", r"\bkopen\b", r"\bkoop\b", r"\baankoop\b", r"\bbestel(?:len)?\b",
+        r"\bafrekenen\b", r"\bgoedkeuren\b", r"\bkeur goed\b", r"\bboeken\b", r"\bterugbetal(?:en|ing)\b",
+        r"\bautoriseren\b", r"\bvrijgeven\b", r"\bvrijgave\b",
+    ),
+}
+
+#: Extra triggers :meth:`Policy.strict` adds, per language: save, close/quit, install,
+#: format/erase/empty, log out, order, confirm/accept, publish, sign, overwrite, reset.
+STRICT_KEYWORDS: Dict[str, tuple] = {
+    "en": (
+        r"\bsave\b", r"\bclose\b", r"\bquit\b", r"\bexit\b", r"\binstall\b", r"\buninstall\b", r"\bformat\b",
+        r"\blog ?out\b", r"\bsign ?out\b", r"\border\b", r"\bconfirm\b", r"\baccept\b", r"\bpublish\b",
+        r"\bshutdown\b", r"\brestart\b", r"\breset\b", r"\boverwrite\b", r"\bempty\b",
+        r"\bsign\b(?!\s*(?:in|up)\b)", r"\berase\b", r"\bwipe\b",
+    ),
+    "de": (
+        r"\bspeichern\b", r"\bbestatigen\b", r"\bakzeptieren\b", r"\bschliessen\b", r"\bbeenden\b",
+        r"\bformatieren\b", r"\b(?:u|ue)berschreiben\b", r"\bver(?:o|oe)ffentlichen\b", r"\bunterschreiben\b",
+        r"\bleeren\b", r"\babmelden\b", r"\bbestellen\b", r"\bzurucksetzen\b", r"\binstallieren\b",
+    ),
+    "fr": (
+        r"\benregistrer\b", r"\bconfirmer\b", r"\baccepter\b", r"\bfermer\b", r"\bquitter\b", r"\bformater\b",
+        r"\beffacer\b", r"\becraser\b", r"\bpublier\b", r"\bsigner\b", r"\bvider\b", r"\bdeconnexion\b",
+        r"\breinitialiser\b", r"\binstaller\b",
+    ),
+    "es": (
+        r"\bguardar\b", r"\bconfirmar\b", r"\baceptar\b", r"\bcerrar\b", r"\bsalir\b", r"\bformatear\b",
+        r"\bsobrescribir\b", r"\bpublicar\b", r"\bfirmar\b", r"\bvaciar\b", r"\bcerrar sesion\b",
+        r"\brestablecer\b", r"\binstalar\b",
+    ),
+    "pt": (
+        r"\bsalvar\b", r"\bgravar\b", r"\baceitar\b", r"\bfechar\b", r"\bsair\b", r"\bformatar\b",
+        r"\bsobrescrever\b", r"\bassinar\b", r"\besvaziar\b", r"\bredefinir\b",
+    ),
+    "it": (
+        r"\bsalv(?:a|are)\b", r"\bconferm(?:a|are)\b", r"\baccett(?:a|are)\b", r"\bchiud(?:i|ere)\b",
+        r"\besci\b", r"\bformatt(?:a|are)\b", r"\bsovrascriv(?:i|ere)\b", r"\bpubblic(?:a|are)\b",
+        r"\bfirm(?:a|are)\b", r"\bsvuot(?:a|are)\b", r"\breimposta\b", r"\binstall(?:a|are)\b",
+    ),
+    "nl": (
+        r"\bopslaan\b", r"\bbevestig(?:en)?\b", r"\baccepteren\b", r"\bsluiten\b", r"\bafsluiten\b",
+        r"\bformatteren\b", r"\boverschrijven\b", r"\bpubliceren\b", r"\bondertekenen\b", r"\blegen\b",
+        r"\buitloggen\b", r"\bafmelden\b", r"\binstalleren\b",
+    ),
+}
+
+#: Every :data:`CONFIRM_KEYWORDS` entry: verbs and nouns whose targets usually commit
+#: something irreversible (money, messages, data) in English, German, French, Spanish,
+#: Portuguese, Italian and Dutch, with their inflected forms ("Payments", "Transfers",
+#: "make_payments") and the main SAP labels (Buchen, Überweisen, Freigeben, Comptabiliser,
+#: Contabilizar). The default ``confirm_patterns`` of :class:`Policy`.
+DEFAULT_CONFIRM: tuple = tuple(itertools.chain.from_iterable(CONFIRM_KEYWORDS.values()))
 
 #: Keyboard shortcuts that commit whatever is focused, so they always need confirmation
 #: (``Policy(confirm_keys=...)``): Ctrl/Cmd+Enter sends (Outlook, Teams, web forms) and
 #: Ctrl/Cmd+S saves -- which *posts* the document in SAP transactions such as FB60.
 DEFAULT_CONFIRM_KEYS: tuple = ("ctrl+enter", "cmd+enter", "ctrl+s", "cmd+s")
 
-#: Extra confirmation triggers used by :meth:`Policy.strict`.
-STRICT_CONFIRM: tuple = DEFAULT_CONFIRM + (
-    r"\bsave\b", r"\bclose\b", r"\bquit\b", r"\bexit\b", r"\binstall\b", r"\buninstall\b", r"\bformat\b",
-    r"\blog ?out\b", r"\bsign ?out\b", r"\border\b", r"\bconfirm\b", r"\baccept\b", r"\bpublish\b",
-    r"\bshutdown\b", r"\brestart\b", r"\breset\b", r"\boverwrite\b", r"\bempty\b",
-    r"\bsign\b(?!\s*(?:in|up)\b)",
-)
+#: Confirmation triggers used by :meth:`Policy.strict`: :data:`DEFAULT_CONFIRM` plus every
+#: :data:`STRICT_KEYWORDS` entry.
+STRICT_CONFIRM: tuple = DEFAULT_CONFIRM + tuple(itertools.chain.from_iterable(STRICT_KEYWORDS.values()))
 
 #: Tools that only read state. They skip app/region/confirmation checks and
 #: rate limits, and still run in dry-run mode (but obey allow/deny lists).
@@ -165,6 +278,20 @@ def _compile(patterns: Iterable[Union[str, Pattern]]) -> List[Pattern]:
         # Compiled regexes and matcher objects (``.search(text)`` + ``.pattern``, e.g. CARD_NUMBER) are kept.
         out.append(re.compile(p, re.IGNORECASE) if isinstance(p, str) else p)
     return out
+
+
+def _compile_folded(patterns: Iterable[Union[str, Pattern]]) -> List[Pattern]:
+    """Like :func:`_compile`, but string patterns are folded (:func:`fold_text`) first.
+
+    Used for ``confirm_patterns``, which are matched against folded text (and the
+    original), so they match accented and unaccented spellings alike.
+    """
+    return _compile(fold_text(p) if isinstance(p, str) else p for p in patterns)
+
+
+def _text_variants(text: str) -> List[str]:
+    folded = fold_text(text)
+    return [folded] if folded == text else [folded, text]
 
 
 def launch_program(command: Any) -> str:
@@ -790,7 +917,15 @@ class Policy:
             (default) keeps the heuristic mode; ``[]`` confirms everything
             consequential. ``confirm_patterns``/``confirm_keys`` still apply on
             top as tripwires (pass ``confirm_patterns=()`` to make the allow
-            rules final).
+            rules final, or list the targets in ``exempt``).
+        exempt: :class:`AllowRule` s (same forms as ``allow``) whose matching
+            actions skip the **tripwire** -- ``confirm_patterns``, ``confirm_keys``
+            and ``unknown_target`` -- e.g. a robot that legitimately clicks
+            ``button "Delete row"`` or presses Ctrl+S in its editor:
+            ``Policy.default(exempt=['button "Delete row"', {"window": "*Notepad", "keys": "ctrl+s"}])``.
+            Unlike ``allow`` this does not switch to allow-list mode, and in
+            allow-list mode an exempt action still needs an ``allow`` rule.
+            ``require_confirmation`` (``ToolSpec(confirm=True)``) is never exempted.
         dry_run: Tools describe what they would do instead of acting.
         max_actions: Maximum number of (non read-only) actions in total.
         max_actions_per_minute: Sliding-window rate limit for actions.
@@ -824,6 +959,7 @@ class Policy:
         clock: Callable[[], float] = time.monotonic,
         allow: Optional[Iterable[Any]] = None,
         launch_options: Iterable[str] = (),
+        exempt: Iterable[Any] = (),
     ):
         launch_options = frozenset(launch_options)
         forbidden = launch_options & FORBIDDEN_LAUNCH_OPTIONS
@@ -837,12 +973,18 @@ class Policy:
         #: Allow rules (allow-list mode), or ``None`` in the default heuristic mode.
         self.allow: Optional[Tuple[AllowRule, ...]] = (
             None if allow is None else tuple(AllowRule.coerce(r) for r in allow))
+        if isinstance(exempt, (str, dict, AllowRule)):
+            exempt = [exempt]
+        #: Rules whose actions skip the keyword/shortcut/unknown-target tripwire (see ``exempt``).
+        self.exempt: Tuple[AllowRule, ...] = tuple(AllowRule.coerce(r) for r in exempt or ())
+        #: Name of the preset that built this policy (``"default"``, ``"strict"``, ``"permissive"``), else ``None``.
+        self.preset: Optional[str] = None
         self.allow_tools = None if allow_tools is None else tuple(allow_tools)
         self.deny_tools = tuple(deny_tools)
         self.allowed_apps = None if allowed_apps is None else tuple(allowed_apps)
         self.blocked_apps = tuple(blocked_apps)
         self.deny_text_patterns = _compile(deny_text_patterns)
-        self.confirm_patterns = _compile(confirm_patterns)
+        self.confirm_patterns = _compile_folded(confirm_patterns)
         self.confirm = confirm
         self.confirm_keys = tuple(confirm_keys)
         self._confirm_combos = [c for spec in self.confirm_keys for c in _combo_sets(spec)]
@@ -867,11 +1009,42 @@ class Policy:
 
     # ------------------------------------------------------------------ presets
     @classmethod
+    def default(cls, **kw: Any) -> "Policy":
+        """The policy applied when none is given: ``Policy()`` with the preset name ``"default"``.
+
+        :class:`~locum.rpa.Robot`, :func:`~locum.rpa.run_flow`, ``locum run``,
+        the :class:`~locum.llm.Agent`, the MCP server and the LLM toolkits all
+        start from it. It is the keyword **tripwire** (:data:`DEFAULT_CONFIRM`
+        in seven languages, :data:`DEFAULT_CONFIRM_KEYS`, unidentifiable
+        activation targets): actions it flags need ``confirm`` -- and with no
+        callback (every unattended robot or flow) they are **blocked** with a
+        :class:`~locum.errors.PolicyViolation` saying how to allow them
+        (``exempt=[...]`` for that target, a ``confirm`` callback, or an
+        explicit opt-out: ``policy=Policy.off()``).
+
+        A tripwire catches common mistakes; it does not authorize anything.
+        For money or data actions use :meth:`strict` with ``allow=[...]``.
+        """
+        policy = cls(**kw)
+        policy.preset = "default"
+        return policy
+
+    @staticmethod
+    def off() -> Any:
+        """The explicit opt-out for :class:`~locum.rpa.Robot` / flows: ``Robot(policy=Policy.off())``.
+
+        Actions are not gated at all (the 0.2 behaviour). ``policy=None`` means the same.
+        """
+        return POLICY_OFF
+
+    @classmethod
     def permissive(cls, **kw: Any) -> "Policy":
         """Everything allowed, no confirmations (trusted scripts, sandboxes, evals)."""
         kw.setdefault("confirm_patterns", ())
         kw.setdefault("confirm_keys", ())
-        return cls(**kw)
+        policy = cls(**kw)
+        policy.preset = "permissive"
+        return policy
 
     @classmethod
     def strict(cls, **kw: Any) -> "Policy":
@@ -904,7 +1077,9 @@ class Policy:
         kw.setdefault("deny_text_patterns", (r"\brm\s+-rf\b", r"\bformat\s+[a-z]:", CARD_NUMBER))
         kw.setdefault("max_actions", 200)
         kw.setdefault("max_actions_per_minute", 30)
-        return cls(**kw)
+        policy = cls(**kw)
+        policy.preset = "strict"
+        return policy
 
     # ------------------------------------------------------------------ helpers
     def is_read_only(self, tool_name: str) -> bool:
@@ -963,6 +1138,29 @@ class Policy:
                 continue
         return None
 
+    def exempt_rule_for(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Optional[AllowRule]:
+        """The first ``exempt`` rule that matches this action (it then skips the tripwire), or ``None``.
+
+        Rules in ``context["exempt_rules"]`` (a :class:`GuardedDesktop`'s own,
+        e.g. a flow document's ``exempt:``) are tried after the policy's.
+        """
+        for rule in self.exempt + tuple(context.get("exempt_rules") or ()):
+            try:
+                if rule.matches(tool_name, args, context):
+                    return rule
+            except Exception:  # a rule that cannot be evaluated exempts nothing
+                continue
+        return None
+
+    def _exempted(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> bool:
+        if not self.exempt and not context.get("exempt_rules"):
+            return False
+        rule = self.exempt_rule_for(tool_name, args, context)
+        if rule is None:
+            return False
+        context["exempted_by"] = str(rule)
+        return True
+
     def authorization_reason(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Optional[str]:
         """Allow-list mode: why this action needs confirmation (no rule authorizes it), or ``None``."""
         if self.allow is None or not self.is_consequential(tool_name, context):
@@ -987,6 +1185,8 @@ class Policy:
 
     def _tripwire_reason(self, tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Optional[str]:
         """The heuristic part: confirm keys, ``require_confirmation``, confirm patterns, unknown targets."""
+        if not context.get("require_confirmation") and self._exempted(tool_name, args, context):
+            return None
         if self._confirm_combos and context.get("keys"):
             for combo in _key_items(context["keys"]):
                 if any(combo == c for c in self._confirm_combos):
@@ -1014,10 +1214,11 @@ class Policy:
         # Every string argument of a non-desktop (integration) tool: ``erp_api(operation="pay")``.
         haystack.extend(_strings(context.get("arg_texts") or ()))
         for text in haystack:
-            for rx in self.confirm_patterns:
-                m = rx.search(text)
-                if m:
-                    return f"{m.group(0)!r} in {text[:120]!r}"
+            for variant in _text_variants(text):
+                for rx in self.confirm_patterns:
+                    m = rx.search(variant)
+                    if m:
+                        return f"{m.group(0)!r} in {text[:120]!r}"
         # In allow-list mode an unidentifiable target is judged by the allow rules instead
         # (no selector rule can match it; a window/app rule the user wrote may).
         if context.get("target_unknown") and self.unknown_target == "confirm" and self.allow is None:
@@ -1133,7 +1334,7 @@ class Policy:
                     )
 
         # Input that may activate a control nobody can identify (see ``unknown_target``).
-        if ctx.get("target_unknown") and self.unknown_target == "block" and (self.confirm_patterns or self.allow is not None):
+        if ctx.get("target_unknown") and self.unknown_target == "block" and (self.confirm_patterns or self.allow is not None)                 and not self._exempted(tool_name, args, ctx):
             raise PolicyViolation(
                 f"Action blocked: {UNKNOWN_TARGET_REASON}, so the confirmation rules cannot be applied "
                 "(Policy(unknown_target='block'))"
@@ -1193,9 +1394,11 @@ class Policy:
                 description = ctx.get("description") or f"{tool_name} {json.dumps(args, default=str)[:200]}"
                 confirm_cb = confirm if confirm is not None else self.confirm
                 if confirm_cb is None:
-                    raise PolicyViolation(
+                    exc = PolicyViolation(
                         f"Action {description!r} needs human confirmation ({reason}) but no confirm callback is configured"
                     )
+                    exc.needs_confirmation = reason  # type: ignore[attr-defined]
+                    raise exc
                 details = {"tool": tool_name, "args": args, "reason": reason}
                 details.update({k: v for k, v in ctx.items() if k not in ("desktop",)})
                 try:
@@ -1215,7 +1418,7 @@ class Policy:
     def __repr__(self) -> str:
         mode = "heuristic" if self.allow is None else f"allow-list({len(self.allow)} rules)"
         return (
-            f"<Policy mode={mode} dry_run={self.dry_run} allow_tools={self.allow_tools} deny={self.deny_tools} "
+            f"<Policy preset={self.preset or 'custom'} mode={mode} exempt={len(self.exempt)} dry_run={self.dry_run} allow_tools={self.allow_tools} deny={self.deny_tools} "
             f"actions={self.action_count}/{self.max_actions}>"
         )
 
@@ -1477,6 +1680,34 @@ class _GuardedProxy:
         return object.__getattribute__(self, "_g_target")
 
 
+def unattended_hint(ctx: Mapping[str, Any]) -> str:
+    """What to say when a guarded (RPA) action needs a confirmation nobody can give.
+
+    Robots and flows usually run unattended, so the tripwire blocks instead of
+    asking. The hint names the three ways to let the action run, with an
+    ``exempt`` rule for this very target when one can be derived.
+    """
+    rule = ""
+    node = ctx.get("target_node")
+    role = str(_safe_get(lambda: node.role, "") or "") if node is not None else ""
+    name = str(_safe_get(lambda: node.name, "") or "") if node is not None else ""
+    if role and name and '"' not in name and len(name) <= 80:
+        rule = f"'{role} \"{name}\"'"
+    elif ctx.get("keys") and ctx.get("target_window"):
+        combos = " ".join("+".join(sorted(c)) for c in _key_items(ctx["keys"]))
+        rule = f"{{'window': {str(ctx['target_window'])[:60]!r}, 'keys': {combos!r}}}"
+    elif ctx.get("keys"):
+        rule = "'keys=" + " ".join("+".join(sorted(c)) for c in _key_items(ctx["keys"])) + "'"
+    elif ctx.get("target_window"):
+        rule = f"'window={str(ctx['target_window'])[:60]}'"
+    exempt = f"Policy.default(exempt=[{rule or '<selector>'}])"
+    return (
+        ". Nobody is there to confirm an unattended run, so it is blocked. To let it run: exempt this target "
+        f"({exempt}), pass a confirm callback (confirm=...; `locum run --confirm` asks on the terminal), "
+        "or opt out explicitly (policy=Policy.off(); `locum run --no-policy`)"
+    )
+
+
 class GuardedDesktop(_GuardedProxy):
     """A :class:`~locum.desktop.Desktop` facade that checks a :class:`Policy` before every action.
 
@@ -1514,10 +1745,13 @@ class GuardedDesktop(_GuardedProxy):
         confirm: Confirmation callback for this guard (default: the policy's ``confirm``).
         audit: :class:`AuditLog` receiving one ``rpa_action`` event per checked
             action (default: a new in-memory log).
+        exempt: Extra tripwire exemptions for this guard only, on top of the
+            policy's own ``exempt`` (used for a flow document's ``exempt:``
+            rules; the policy object is not modified).
     """
 
     def __init__(self, desktop: Any, policy: Policy, *, confirm: Optional[ConfirmCallback] = None,
-                 audit: Optional[AuditLog] = None) -> None:
+                 audit: Optional[AuditLog] = None, exempt: Iterable[Any] = ()) -> None:
         if isinstance(desktop, GuardedDesktop):
             desktop = desktop.unwrapped
         if not isinstance(policy, Policy):
@@ -1526,6 +1760,9 @@ class GuardedDesktop(_GuardedProxy):
         object.__setattr__(self, "_g_policy", policy)
         object.__setattr__(self, "_g_confirm", confirm)
         object.__setattr__(self, "_g_audit", audit if audit is not None else AuditLog())
+        if isinstance(exempt, (str, dict, AllowRule)):
+            exempt = [exempt]
+        object.__setattr__(self, "_g_exempt", tuple(AllowRule.coerce(r) for r in exempt or ()))
 
     # ------------------------------------------------------------------ plumbing
     @property
@@ -1562,7 +1799,7 @@ class GuardedDesktop(_GuardedProxy):
                 error: Optional[str] = None) -> None:
         event: Dict[str, Any] = {"event": "rpa_action", "tool": tool, "args": args, "status": status,
                                  "description": description}
-        for key in ("allowed_by", "needs_confirmation"):
+        for key in ("allowed_by", "exempted_by", "needs_confirmation"):
             if ctx.get(key):
                 event[key] = ctx[key]
         if error is not None:
@@ -1579,6 +1816,9 @@ class GuardedDesktop(_GuardedProxy):
         ``log_args`` replaces ``args`` in the audit log (the policy still judges ``args``).
         """
         ctx.setdefault("description", description)
+        extra = object.__getattribute__(self, "_g_exempt")
+        if extra:
+            ctx["exempt_rules"] = extra
         clean = {k: v for k, v in args.items() if v is not None}
         shown = clean if log_args is None else {k: v for k, v in log_args.items() if v is not None}
         logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in shown.items()}
@@ -1586,11 +1826,17 @@ class GuardedDesktop(_GuardedProxy):
         try:
             policy.check(tool, clean, context=ctx, count=count, confirm=self.confirm)
         except PolicyViolation as exc:
-            msg = str(exc) if count else f"{exc} (the input before it in this call was already sent)"
+            msg = str(exc)
+            if getattr(exc, "needs_confirmation", None):
+                msg += unattended_hint(ctx)
+            if not count:
+                msg += " (the input before it in this call was already sent)"
             self._record(tool, logged, "blocked", description, ctx, error=msg)
-            if count:
+            if msg == str(exc):
                 raise
-            raise PolicyViolation(msg) from None
+            new = PolicyViolation(msg)
+            new.needs_confirmation = getattr(exc, "needs_confirmation", None)  # type: ignore[attr-defined]
+            raise new from None
         if policy.dry_run and not policy.is_read_only(tool):
             self._record(tool, logged, "dry_run", description, ctx)
             return False
@@ -2265,4 +2511,10 @@ __all__ = [
     "UNKNOWN_TARGET_MODES",
     "typed_text_activates",
     "console_confirm",
+    "CONFIRM_KEYWORDS",
+    "STRICT_KEYWORDS",
+    "DEFAULT_POLICY",
+    "POLICY_OFF",
+    "fold_text",
+    "unattended_hint",
 ]
