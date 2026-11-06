@@ -1146,8 +1146,29 @@ def cmd_a11y_audit(ctx: _Ctx) -> int:
         raise _UsageError("--min-target-size must be >= 0")
     if a.time_budget is not None and a.time_budget < 0:
         raise _UsageError("--time-budget must be >= 0")
-    report = audit(ctx.desktop, a.window, max_depth=a.max_depth, min_target_size=a.min_target_size,
-                   time_budget=a.time_budget or None, selectors=not a.no_selectors)
+    window = a.window
+    if getattr(a, "window_opt", None):
+        if window and window != a.window_opt:
+            raise _UsageError("give the window once: as WINDOW or as --window, not both")
+        window = a.window_opt
+    walk_kw: Dict[str, Any] = {}
+    if a.tab_walk:
+        if not window:
+            raise _UsageError("--tab-walk presses Tab, so it needs the target window: --window TITLE "
+                              "(it is never sent to whatever window has the focus)")
+        if a.max_tabs < 1:
+            raise _UsageError("--max-tabs must be >= 1")
+        policy = None
+        if a.policy:
+            from .llm.safety import console_confirm
+
+            interactive = bool(getattr(ctx.inp, "isatty", lambda: False)())
+            policy = _build_policy(a.policy, confirm=console_confirm if interactive else None)
+        walk_kw = {"tab_walk": True, "max_tabs": a.max_tabs, "reverse_check": a.reverse, "policy": policy}
+    elif a.reverse or a.policy:
+        raise _UsageError("--reverse and --policy only apply to --tab-walk")
+    report = audit(ctx.desktop, window, max_depth=a.max_depth, min_target_size=a.min_target_size,
+                   time_budget=a.time_budget or None, selectors=not a.no_selectors, **walk_kw)
     failed = report.failed(a.fail_on)
     if ctx.json:
         data = report.to_dict()
@@ -1416,6 +1437,11 @@ def build_parser() -> argparse.ArgumentParser:
         "sibling controls sharing a name (duplicate-name) and offscreen-flagged controls inside",
         "a visible parent (offscreen-visible). Rules are described in docs/A11Y.md.",
         "",
+        "--tab-walk (opt-in) additionally SENDS KEYS: it presses Tab (only Tab; Shift+Tab with",
+        "--reverse) in the --window, bound to it, records the focus order and reports focus traps,",
+        "focus leaving the window, invisible or unnamed focus stops, backwards jumps and controls",
+        "Tab never reaches. Do not use it on a window you are working in.",
+        "",
         "Exit code 1 when findings at or above --fail-on exist (default: error).",
     ))
     p.epilog = "\n".join((
@@ -1423,9 +1449,20 @@ def build_parser() -> argparse.ArgumentParser:
         "  locum a11y-audit Paint",
         "  locum a11y-audit \"Untitled - Notepad\" --fail-on warning --json",
         "  locum --backend mock a11y-audit \"Invoice Entry\"",
+        "  locum a11y-audit --window \"Invoice Entry\" --tab-walk --reverse --max-tabs 100",
     ))
     p.add_argument("window", nargs="?", metavar="WINDOW",
                    help="window title (exact, substring or glob, like --window elsewhere); default: every window")
+    p.add_argument("--window", dest="window_opt", metavar="TITLE",
+                   help="the window to audit (same as WINDOW); required by --tab-walk")
+    p.add_argument("--tab-walk", action="store_true",
+                   help="also press Tab in the window (sends keys!) and audit the keyboard focus order")
+    p.add_argument("--max-tabs", type=int, default=200, metavar="N",
+                   help="maximum Tab presses of --tab-walk (default 200)")
+    p.add_argument("--reverse", action="store_true",
+                   help="with --tab-walk: after a full cycle press Shift+Tab to check the reverse order")
+    p.add_argument("--policy", choices=("strict", "default", "permissive"), default=None,
+                   help="with --tab-walk: judge every key press against this safety policy preset")
     p.add_argument("--max-depth", type=int, default=32, metavar="N", help="maximum tree depth (default 32)")
     p.add_argument("--min-target-size", type=int, default=24, metavar="PX",
                    help="minimum click-target size in pixels for small-target (default 24; 0 disables)")

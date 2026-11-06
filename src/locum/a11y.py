@@ -26,6 +26,14 @@ offscreen-visible   info      control reported offscreen although its bounds
                               lie inside its (on-screen) parent and window
 ==================  ========  ==================================================
 
+Opt-in keyboard walk (``tab_walk=True`` / ``--tab-walk``): presses **Tab only**
+in one window, bound to it (:mod:`locum._target`) under the desktop input lock,
+records the focus order and adds the ``tab-*`` rules (``tab-trap``,
+``tab-escape``, ``tab-focus-lost``, ``tab-focus-invisible``,
+``tab-focus-unnamed``, ``tab-order-backwards``, ``tab-unreachable``,
+``tab-order-asymmetric``). It is the only part of the audit that sends input;
+see :func:`tab_walk`.
+
 Every finding carries the rule, severity, a one-line element description
 (:func:`locum.selectors.describe_node`), a selector that finds the element
 again (:func:`locum.selectors.selector_for`) and its bounds. See
@@ -52,7 +60,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from .backends.base import AccessibleNode
 from .types import Rect
 
-__all__ = ["audit", "AuditReport", "Finding", "RULES", "SEVERITIES", "DEFAULT_MIN_TARGET_SIZE"]
+__all__ = ["audit", "tab_walk", "AuditReport", "Finding", "TabStop", "TabWalk", "RULES", "TAB_RULES",
+           "SEVERITIES", "DEFAULT_MIN_TARGET_SIZE", "DEFAULT_MAX_TABS"]
 
 #: Severities, most severe first.
 SEVERITIES = ("error", "warning", "info")
@@ -71,7 +80,22 @@ RULES: Dict[str, Tuple[str, str]] = {
     "small-target": ("warning", "click target is smaller than the minimum size (WCAG 2.5.8)"),
     "duplicate-name": ("warning", "sibling controls of the same role share a name"),
     "offscreen-visible": ("info", "control is reported offscreen but lies inside its visible parent"),
+    # Keyboard walk (tab_walk=True / --tab-walk only).
+    "tab-trap": ("error", "Tab stops moving the focus, or loops among a subset of the controls"),
+    "tab-escape": ("error", "Tab moved the keyboard focus out of the window"),
+    "tab-focus-lost": ("warning", "after Tab no element has the keyboard focus"),
+    "tab-focus-invisible": ("warning", "Tab focuses an element that is not visible"),
+    "tab-focus-unnamed": ("warning", "Tab focuses an element without an accessible name"),
+    "tab-order-backwards": ("info", "Tab order jumps backwards against the reading order"),
+    "tab-unreachable": ("warning", "focusable control that Tab never reaches"),
+    "tab-order-asymmetric": ("warning", "Shift+Tab does not retrace the Tab order"),
 }
+
+#: Rules produced only by the keyboard walk.
+TAB_RULES = frozenset(r for r in RULES if r.startswith("tab-"))
+
+#: Default maximum number of Tab presses of a keyboard walk.
+DEFAULT_MAX_TABS = 200
 
 # Controls a user operates directly: they need a name (what a screen reader announces).
 _NAMED_ROLES = frozenset({
@@ -252,6 +276,8 @@ class AuditReport:
     truncated: bool = False
     notes: List[str] = field(default_factory=list)
     min_target_size: int = DEFAULT_MIN_TARGET_SIZE
+    #: The keyboard walk's result (``tab_walk=True`` only).
+    tab_walk: Optional["TabWalk"] = None
 
     def counts(self) -> Dict[str, int]:
         out = {s: 0 for s in SEVERITIES}
@@ -281,6 +307,7 @@ class AuditReport:
             "counts": self.counts(),
             "findings": [f.to_dict() for f in self.findings],
             "notes": list(self.notes),
+            **({"tab_walk": self.tab_walk.to_dict()} if self.tab_walk is not None else {}),
         }
 
     def summary(self) -> str:
@@ -302,6 +329,8 @@ class AuditReport:
                 lines.append(f"window {current!r}:" if current else "(no window):")
             lines.append(f"  {f.severity:<7} {f.rule:<17} {f.element}")
             lines.append(f"          {f.message}" + (f"  ->  {f.selector}" if f.selector else ""))
+        if self.tab_walk is not None:
+            lines.extend(self.tab_walk.format_lines())
         for note in self.notes:
             lines.append(f"note: {note}")
         lines.append(self.summary())
@@ -458,8 +487,21 @@ def audit(
     selectors: bool = True,
     rules: Optional[Iterable[str]] = None,
     clock: Callable[[], float] = time.monotonic,
+    tab_walk: bool = False,
+    max_tabs: int = DEFAULT_MAX_TABS,
+    reverse_check: bool = False,
+    policy: Any = None,
+    confirm: Any = None,
+    settle: float = 0.05,
 ) -> AuditReport:
     """Audit the accessibility of ``window`` (or of every window) without touching the UI.
+
+    With ``tab_walk=True`` the audit is no longer read-only: after the static
+    rules it runs :func:`tab_walk` on ``window`` (required; one window), which
+    presses Tab (and with ``reverse_check`` Shift+Tab) in it, and adds the
+    ``tab-*`` findings and the recorded focus order (:attr:`AuditReport.tab_walk`).
+    ``max_tabs``, ``reverse_check``, ``policy``, ``confirm`` and ``settle`` are
+    passed to :func:`tab_walk`.
 
     Args:
         desktop: A :class:`~locum.Desktop` (default: a new one).
@@ -489,6 +531,10 @@ def audit(
     unknown = enabled_rules - set(RULES)
     if unknown:
         raise ValueError(f"unknown rule(s): {', '.join(sorted(unknown))}; known: {', '.join(RULES)}")
+    if tab_walk:
+        _check_walk_window(window)
+        if int(max_tabs) < 1:
+            raise ValueError("max_tabs must be >= 1")
 
     t0 = clock()
     deadline = None if time_budget is None else t0 + max(0.0, float(time_budget))
@@ -516,10 +562,12 @@ def audit(
     def over_budget() -> bool:
         return deadline is not None and clock() > deadline
 
+    walked: Dict[int, List[Tuple[_Snap, int]]] = {}
     for root in targets:
         title = root.name
         report.windows.append(title)
         nodes: List[Tuple[_Snap, int]] = []
+        walked[id(root)] = nodes
         stack: List[Tuple[_Snap, int]] = [(root, 0)]
         while stack:
             if report.nodes >= max_nodes or over_budget():
@@ -546,6 +594,16 @@ def audit(
             ))
         if report.truncated:
             break
+    if tab_walk and targets:
+        root = targets[0]
+        snapshot = None if report.truncated else [n for n, _d in walked.get(id(root), [])]
+        walk = _run_tab_walk(desktop, window, max_tabs=int(max_tabs), reverse_check=reverse_check,
+                             policy=policy, confirm=confirm, settle=settle, selectors=selectors,
+                             sel_roots=sel_roots, prefix_cache=prefix_cache, snapshot=snapshot,
+                             rules=enabled_rules, title=root.name)
+        report.tab_walk = walk
+        report.findings.extend(walk.findings)
+        report.notes.extend(walk.notes)
     report.elapsed = clock() - t0
     return report
 
@@ -683,3 +741,449 @@ def _inside(inner: Rect, outer: Rect) -> bool:
 def _contains_or_contained(a: Rect, b: Rect) -> bool:
     """Nested targets (a split button's arrow inside the button) are one target, not neighbours."""
     return _inside(a, b) or _inside(b, a)
+
+
+# =========================================================================== keyboard walk
+#
+# The only part of the audit that sends input. Every key it sends is Tab (and
+# Shift+Tab with ``reverse_check``), bound to the audited window: the presses go
+# through ``desktop.press`` (a GuardedDesktop judges them against its policy) while
+# the desktop input lock is held and ``locum._target`` refuses any press once
+# another window is in the foreground.
+
+_EDIT_ROLES = frozenset({"edit", "document"})
+
+
+@dataclass
+class TabStop:
+    """One element the keyboard focus reached during :func:`tab_walk`."""
+
+    #: 1-based number of the press that focused it.
+    index: int
+    role: str
+    name: str
+    element: str
+    selector: Optional[str] = None
+    bounds: Optional[Rect] = None
+    visible: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "role": self.role,
+            "name": self.name,
+            "element": self.element,
+            "selector": self.selector,
+            "bounds": self.bounds.to_dict() if self.bounds is not None else None,
+            "visible": self.visible,
+        }
+
+
+@dataclass
+class TabWalk:
+    """Result of :func:`tab_walk`: the focus order and the ``tab-*`` findings."""
+
+    window: str = ""
+    #: Distinct elements in the order Tab reached them.
+    stops: List[TabStop] = field(default_factory=list)
+    #: Tab presses sent (forward walk).
+    presses: int = 0
+    #: Shift+Tab presses sent (``reverse_check``).
+    reverse_presses: int = 0
+    #: The focus came back to the first stop: the whole cycle was seen.
+    complete: bool = False
+    #: Why the walk ended: ``cycle``, ``max_tabs``, ``trap``, ``escape``, ``focus-lost``,
+    #: ``interrupted`` (another window took the focus), ``refused`` (the policy) or
+    #: ``dry-run`` (a dry-run policy: nothing was pressed).
+    stopped: str = ""
+    #: Shift+Tab retraced the whole cycle (``None``: not checked).
+    reverse_ok: Optional[bool] = None
+    #: The element focused before the walk has the focus again (``None``: nothing was focused).
+    restored_focus: Optional[bool] = None
+    findings: List[Finding] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "window": self.window,
+            "presses": self.presses,
+            "reverse_presses": self.reverse_presses,
+            "complete": self.complete,
+            "stopped": self.stopped,
+            "reverse_ok": self.reverse_ok,
+            "restored_focus": self.restored_focus,
+            "stops": [s.to_dict() for s in self.stops],
+        }
+
+    def format_lines(self) -> List[str]:
+        state = "cycle complete" if self.complete else f"stopped: {self.stopped or 'unknown'}"
+        n, p = len(self.stops), self.presses
+        lines = [f"tab order of {self.window!r} ({n} stop{'s' if n != 1 else ''}, "
+                 f"{p} Tab press{'es' if p != 1 else ''}, {state}):"]
+        for s in self.stops:
+            flag = "" if s.visible else "  (not visible)"
+            lines.append(f"  {s.index:>3}. {s.element}{flag}")
+        return lines
+
+
+def _check_walk_window(window: Any) -> None:
+    from .window import Window
+
+    if window is None or (isinstance(window, str) and not window.strip()):
+        raise ValueError("the keyboard walk (tab_walk) needs one target window: it presses Tab, which must "
+                         "never reach whatever window happens to have the focus")
+    if not isinstance(window, (str, Window)) and not hasattr(window, "activate"):
+        raise ValueError("the keyboard walk (tab_walk) needs a window title or a Window, not an element or node")
+
+
+def _snapshot(root: AccessibleNode, max_depth: int = 32, max_nodes: int = 20000) -> List[_Snap]:
+    out: List[_Snap] = []
+    stack: List[Tuple[_Snap, int]] = [(_Snap(root), 0)]
+    while stack and len(out) < max_nodes:
+        n, depth = stack.pop()
+        out.append(n)
+        if depth < max_depth:
+            stack.extend((k, depth + 1) for k in reversed(n.children()))
+    return out
+
+
+def tab_walk(
+    desktop: Any = None,
+    window: Any = None,
+    *,
+    max_tabs: int = DEFAULT_MAX_TABS,
+    reverse_check: bool = False,
+    policy: Any = None,
+    confirm: Any = None,
+    settle: float = 0.05,
+    selectors: bool = True,
+    rules: Optional[Iterable[str]] = None,
+) -> TabWalk:
+    """Walk ``window``'s keyboard focus order by pressing Tab (this **sends input**).
+
+    The window is activated and must then be in the foreground. Every press is
+    bound to it (:mod:`locum._target`, strict): if another window takes the
+    focus, the next press is not sent and the walk stops (``stopped="interrupted"``).
+    The whole walk holds the desktop input lock (:mod:`locum._inputlock`), so no
+    other locum worker interleaves input. Nothing but Tab is pressed -- and
+    Shift+Tab with ``reverse_check`` -- and the element focused before the walk
+    is focused again afterwards through the accessibility API (no key, no click).
+
+    The walk records the element focused after each press and stops when the
+    focus returns to the first stop (a complete cycle), after ``max_tabs``
+    presses, or at the first trap / escape / lost focus. Findings (``tab-*``
+    rules, see :data:`RULES`):
+
+    * ``tab-trap`` (error): Tab leaves the focus where it was (a field that takes
+      Tab as text: the walk stops right away), or loops among a subset of controls.
+    * ``tab-escape`` (error): the focus left the window.
+    * ``tab-focus-lost`` (warning): no element has the focus after a press.
+    * ``tab-focus-invisible`` / ``tab-focus-unnamed`` (warning): the focused
+      element is offscreen/invisible / has no accessible name.
+    * ``tab-order-backwards`` (info): the next stop lies before the previous
+      one in reading order (above it and not to its right, or left of it on the
+      same row) -- a heuristic.
+    * ``tab-unreachable`` (warning, complete cycle only): an enabled, visible,
+      focusable control (button, edit, checkbox...) that Tab never reached.
+    * ``tab-order-asymmetric`` (warning, ``reverse_check``): Shift+Tab does not
+      retrace the cycle backwards.
+
+    Args:
+        desktop: A :class:`~locum.Desktop` or a
+            :class:`~locum.llm.safety.GuardedDesktop` (its policy judges every press).
+        window: Title query or :class:`~locum.window.Window` (required).
+        max_tabs: Maximum Tab presses.
+        reverse_check: After a complete cycle, press Shift+Tab once per stop.
+        policy: A :class:`~locum.llm.safety.Policy`: the presses go through a
+            ``GuardedDesktop`` with it (``confirm``: its confirmation callback).
+        settle: Seconds to wait after each press before reading the focus.
+        selectors: Compute a selector for every stop.
+        rules: Only report these rule ids (default: every ``tab-*`` rule).
+    """
+    if desktop is None:
+        from .desktop import Desktop
+
+        desktop = Desktop()
+    _check_walk_window(window)
+    if int(max_tabs) < 1:
+        raise ValueError("max_tabs must be >= 1")
+    enabled = set(TAB_RULES) if rules is None else set(rules)
+    unknown = enabled - set(RULES)
+    if unknown:
+        raise ValueError(f"unknown rule(s): {', '.join(sorted(unknown))}; known: {', '.join(RULES)}")
+    return _run_tab_walk(desktop, window, max_tabs=int(max_tabs), reverse_check=reverse_check, policy=policy,
+                         confirm=confirm, settle=settle, selectors=selectors, sel_roots=None, prefix_cache=None,
+                         snapshot="auto", rules=enabled, title=None)
+
+
+def _same(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return False
+    if a is b:
+        return True
+    return bool(_safe(lambda: a.same_as(b), False))
+
+
+def _index_of(seen: Sequence[Any], node: Any) -> Optional[int]:
+    for i, s in enumerate(seen):
+        if _same(s, node):
+            return i
+    return None
+
+
+def _editable_value(node: Any) -> Optional[str]:
+    """The text of a (non-password) edit/document, to notice a Tab typed into it as text."""
+    if node is None:
+        return None
+    from ._nodeinfo import is_password
+
+    role = (_safe(lambda: node.role, "") or "").lower()
+    if role not in _EDIT_ROLES or _safe(lambda: is_password(node), True):
+        return None
+    v = _safe(lambda: node.value)
+    return v if isinstance(v, str) else None
+
+
+def _in_window(backend: Any, handle: Any, node: Any, root: Any) -> Optional[bool]:
+    """Whether keyboard focus is still in the window: the foreground window belongs to it
+    and (when the backend gives the focused node a parent chain) the node lies in its tree."""
+    from ._nodeinfo import ancestors
+
+    try:
+        fg = backend.foreground_handle()
+    except Exception:
+        return None
+    if fg is None:
+        return False  # no foreground window at all
+    if not (fg == handle or bool(_safe(lambda: backend.window_belongs_to(fg, handle), False))):
+        return False
+    if node is not None and root is not None and not _same(node, root):
+        chain = _safe(lambda: ancestors(node), []) or []
+        if chain and not any(_same(a, root) for a in chain):
+            # The chain may end at a pop-up the window owns (a menu): accept that.
+            top = _safe(lambda: chain[-1].handle)
+            if top is None or not (top == handle or _safe(lambda: backend.window_belongs_to(top, handle), False)):
+                return False
+    return True
+
+
+def _backwards(prev: Rect, cur: Rect, tol: int = 4) -> Optional[str]:
+    """How ``cur`` lies before ``prev`` in (left-to-right, top-to-bottom) reading order, if it does."""
+    if cur.bottom <= prev.top - tol and cur.left < prev.right - tol:
+        return "above"
+    overlap = min(cur.bottom, prev.bottom) - max(cur.top, prev.top)
+    if overlap > min(cur.height, prev.height) / 2 and cur.right <= prev.left - tol:
+        return "left of"
+    return None
+
+
+def _run_tab_walk(desktop: Any, window: Any, *, max_tabs: int, reverse_check: bool, policy: Any, confirm: Any,
+                  settle: float, selectors: bool, sel_roots: Optional[List[AccessibleNode]],
+                  prefix_cache: Optional[List[Any]], snapshot: Any, rules: set,
+                  title: Optional[str]) -> TabWalk:
+    from . import _inputlock, _target
+    from .errors import NotSupported, PolicyViolation, TargetLost
+
+    d = desktop
+    if policy is not None:
+        from .llm.safety import GuardedDesktop
+
+        d = GuardedDesktop(desktop, policy, confirm=confirm)
+    raw_desktop = getattr(d, "unwrapped", d)
+    backend = raw_desktop.backend
+    w = d.window(window, timeout=0) if isinstance(window, str) else window
+    w.activate()
+    rw = getattr(w, "unwrapped", w)
+    target = _target.for_window(rw, strict=True)
+    if target is None:
+        raise NotSupported("the keyboard walk needs a window handle to bind the Tab presses to; "
+                           "this backend gives none (nothing was sent)")
+    handle = target.handle
+    fg = _safe(backend.foreground_handle)
+    if fg is None or not (fg == handle or _safe(lambda: backend.window_belongs_to(fg, handle), False)):
+        raise TargetLost(f"could not bring {rw.title!r} to the foreground (another window keeps the focus); "
+                         "no Tab was sent")
+    root = _safe(lambda: rw.element.node)
+    walk = TabWalk(window=title if title is not None else (_safe(lambda: rw.title, "") or ""))
+    if snapshot == "auto":
+        snapshot = _snapshot(root) if root is not None else None
+    cache: List[Any] = prefix_cache if prefix_cache is not None else []
+    seen: List[Any] = []  # raw focused nodes, in stop order
+
+    def add(node: Any, rule: str, message: str, severity: Optional[str] = None) -> None:
+        if rule not in rules:
+            return
+        snap = node if isinstance(node, _Snap) else (_Snap(node) if node is not None else None)
+        if snap is None and root is not None:
+            snap = _Snap(root)
+        sel = _selector(snap, sel_roots, cache) if selectors and snap is not None else None
+        walk.findings.append(Finding(
+            rule=rule, severity=severity or RULES[rule][0], message=message,
+            element=_describe(snap) if snap is not None else "window", selector=sel,
+            bounds=snap.bounds if snap is not None else None, role=snap.role if snap is not None else "",
+            name=snap.name if snap is not None else "", window=walk.window,
+        ))
+
+    def pause() -> None:
+        if settle and settle > 0:
+            sleeper = getattr(raw_desktop, "sleep", None)
+            if callable(sleeper):
+                sleeper(settle)
+            else:  # pragma: no cover - every Desktop has sleep()
+                time.sleep(settle)
+
+    def label(node: Any) -> str:
+        return _describe(_Snap(node)) if node is not None else "nothing"
+
+    def press(key: str, n: int) -> bool:
+        try:
+            d.press(key)
+        except TargetLost as exc:
+            walk.stopped = "interrupted"
+            walk.notes.append(f"tab walk stopped before {key} press {n}: {exc}")
+            return False
+        except PolicyViolation as exc:
+            walk.stopped = "refused"
+            walk.notes.append(f"tab walk stopped: the policy refused {key} press {n}: {exc}")
+            return False
+        pause()
+        return True
+
+    if getattr(getattr(d, "policy", None), "dry_run", False):
+        walk.stopped = "dry-run"
+        walk.notes.append("the safety policy is in dry-run mode: no Tab was sent, so there is no focus order")
+        return walk
+    initial = _safe(backend.focused_element)
+    try:
+        with _inputlock.desktop_input(raw_desktop), _target.bind(target):
+            _forward(walk, seen, max_tabs, backend, handle, root, press, add, label, selectors, sel_roots, cache)
+            _backward_jumps(walk, seen, add)
+            if walk.complete and snapshot is not None:
+                for n in snapshot:
+                    if root is not None and n.same_as(root):
+                        continue
+                    if (n.role in _FOCUS_ROLES and _visible(n) and _enabled(n) and "focusable" in n.states
+                            and not _in_roving_container(n) and not _is_chrome(n)
+                            and _index_of(seen, n._raw) is None):
+                        add(n, "tab-unreachable", f"{n.role} is focusable but Tab never reaches it: "
+                                                  "keyboard-only users cannot get to it")
+            elif not walk.complete:
+                walk.notes.append("tab-unreachable not checked: the tab walk did not see a whole cycle")
+            if reverse_check and walk.complete and seen:
+                walk.reverse_ok = True
+                for k, want in enumerate(reversed(seen), 1):
+                    if not press("shift+tab", k):
+                        walk.reverse_ok = None
+                        break
+                    walk.reverse_presses += 1
+                    got = _safe(backend.focused_element)
+                    if not _same(got, want):
+                        walk.reverse_ok = False
+                        add(got if got is not None else want, "tab-order-asymmetric",
+                            f"Shift+Tab press {k} focused {label(got)}, expected {label(want)} (the Tab order "
+                            "backwards): the reverse order differs from the forward order")
+                        break
+            elif reverse_check:
+                walk.notes.append("reverse (Shift+Tab) check skipped: the tab walk did not see a whole cycle")
+    finally:
+        walk.restored_focus = _restore_focus(backend, initial)
+        if walk.restored_focus is False:
+            walk.notes.append(f"could not give the focus back to {label(initial)} (focused before the tab walk)")
+    return walk
+
+
+def _forward(walk: TabWalk, seen: List[Any], max_tabs: int, backend: Any, handle: Any, root: Any,
+             press: Callable[[str, int], bool], add: Callable[..., None], label: Callable[[Any], str],
+             selectors: bool, sel_roots: Optional[List[AccessibleNode]], cache: List[Any]) -> None:
+    """The forward Tab walk: fills ``walk.stops`` / ``seen`` and sets ``complete`` / ``stopped``."""
+    rb =_safe(lambda: root.bounds) if root is not None else None
+    for i in range(1, max_tabs + 1):
+        before = _safe(backend.focused_element)
+        before_value = _editable_value(before)
+        if not press("tab", i):
+            return
+        walk.presses += 1
+        node = _safe(backend.focused_element)
+        if _in_window(backend, handle, node, root) is False:
+            add(node, "tab-escape", f"Tab press {i} moved the keyboard focus out of {walk.window!r} "
+                                    f"(from {label(before)} to {label(node)}); the walk stopped")
+            walk.stopped = "escape"
+            return
+        if node is None:
+            add(before, "tab-focus-lost", f"after Tab press {i} (from {label(before)}) no element has the "
+                                          "keyboard focus; the walk stopped")
+            walk.stopped = "focus-lost"
+            return
+        if before is not None and _same(node, before):
+            after_value = _editable_value(node)
+            if before_value is not None and after_value is not None and after_value != before_value:
+                add(node, "tab-trap", f"{label(node)} takes Tab as text (its text changed): keyboard users "
+                                      "cannot Tab out of it; the walk stopped (the inserted Tab was not undone)")
+                walk.stopped = "trap"
+                return
+        idx = _index_of(seen, node)
+        if idx == 0:
+            walk.complete = True
+            walk.stopped = "cycle"
+            return
+        if idx is not None:
+            if idx == len(seen) - 1:
+                msg = f"Tab press {i} left the focus on {label(node)}: keyboard users are trapped there"
+            else:
+                msg = (f"Tab press {i} went back to stop {idx + 1} ({label(node)}) instead of the first stop: "
+                       f"the focus loops among stops {idx + 1}-{len(seen)}")
+            add(node, "tab-trap", msg + "; the walk stopped")
+            walk.stopped = "trap"
+            return
+        snap = _Snap(node)
+        vis = _visible(snap)
+        b = snap.bounds
+        if vis and b is not None and rb is not None and not rb.is_empty and b.intersect(rb) is None:
+            vis = False  # entirely outside its window
+        stop = TabStop(index=i, role=snap.role, name=snap.name, element=_describe(snap),
+                       selector=_selector(snap, sel_roots, cache) if selectors else None, bounds=b, visible=vis)
+        seen.append(node)
+        walk.stops.append(stop)
+        if not vis:
+            add(snap, "tab-focus-invisible", f"Tab press {i} focused {stop.element}, which is not visible: "
+                                             "sighted keyboard users lose track of the focus")
+        if not snap.name.strip() and snap.role not in ("window", "dialog"):
+            add(snap, "tab-focus-unnamed", f"Tab press {i} focused a {snap.role or 'element'} with no accessible "
+                                           "name: a screen reader announces only its role")
+    walk.stopped = "max_tabs"
+    walk.notes.append(f"the focus did not return to the first stop within {max_tabs} Tab presses: "
+                      "the tab walk is partial (raise max_tabs / --max-tabs)")
+
+
+def _backward_jumps(walk: TabWalk, seen: Sequence[Any], add: Callable[..., None]) -> None:
+    """``tab-order-backwards`` for the steps of the walk (and the closing step of a complete cycle).
+
+    The walk starts wherever the focus was, so one wrap-around -- the step to the
+    stop that comes first in reading order -- is part of every cycle and is not reported.
+    """
+    stops = walk.stops
+    shown = [i for i, s in enumerate(stops) if s.visible and s.bounds is not None]
+    if len(shown) < 2:
+        return
+    first = min(shown, key=lambda i: (stops[i].bounds.top, stops[i].bounds.left))  # type: ignore[union-attr]
+    edges = [(i, i + 1) for i in range(len(stops) - 1)]
+    if walk.complete and len(stops) > 1:
+        edges.append((len(stops) - 1, 0))
+    for a, b in edges:
+        prev, cur = stops[a], stops[b]
+        if b == first or not (prev.visible and cur.visible) or prev.bounds is None or cur.bounds is None:
+            continue
+        how = _backwards(prev.bounds, cur.bounds)
+        if how:
+            add(seen[b], "tab-order-backwards", f"Tab goes from {prev.element} to {cur.element}, which lies "
+                                                f"{how} it: the focus order may not follow the reading order")
+
+
+def _restore_focus(backend: Any, initial: Any) -> Optional[bool]:
+    """Focus ``initial`` again through the accessibility API (no key press, no click)."""
+    if initial is None:
+        return None
+    if _same(_safe(backend.focused_element), initial):
+        return True
+    _safe(lambda: initial.focus(), False)
+    return _same(_safe(backend.focused_element), initial)
