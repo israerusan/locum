@@ -1,0 +1,743 @@
+# locum
+locum.ActionTimeout exception(LocumError, TimeoutError)
+locum.AmbiguousElement exception(LocumError, LookupError)
+locum.BackendError exception(LocumError)
+locum.BackendUnavailable exception(BackendError)
+locum.Deadline class(timeout: 'Optional[float]', *, clock: 'Callable[[], float]' = <built-in function monotonic>, sleep: 'Callable[[float], Any]' = <built-in function sleep>)
+    .elapsed property
+    .end property
+    .expired property
+    .raise_if_expired(self, message: 'Optional[str]' = None) -> 'None'
+    .remaining property
+    .sleep(self, interval: 'float') -> 'float'
+locum.Desktop class(backend: 'Union[Backend, str, None]' = None, *, failsafe: 'Union[bool, FailSafe]' = True, pause: 'float' = 0.0, humanize: 'Union[bool, Humanize, None]' = False, default_timeout: 'float' = 10.0, typing_mode: 'str' = 'auto', sleep: 'Callable[[float], Any]' = <built-in function sleep>, clock: 'Callable[[], float]' = <built-in function monotonic>, poll_interval: 'float' = 0.1, clipboard_settle: 'float' = 0.5, clipboard_timeout: 'float' = 2.0, heal_selectors: 'Any' = False, input_lock_timeout: 'float' = 30.0, decimal_separator: 'Optional[str]' = None)
+    .active_window(self) -> 'Optional[Window]'
+    .capabilities property
+    .click(self, target: 'Any' = None, y: 'Optional[float]' = None, *, button: 'str' = 'left', clicks: 'int' = 1, interval: 'float' = 0.0, offset: 'Tuple[int, int]' = (0, 0), duration: 'Optional[float]' = None, humanize: 'Union[bool, Humanize, None]' = None, allow_offscreen: 'bool' = False) -> 'Point'
+    .click_image(self, image: 'Any', *, timeout: 'Optional[float]' = None, button: 'str' = 'left', clicks: 'int' = 1, offset: 'Tuple[int, int]' = (0, 0), **kw: 'Any') -> 'Match'
+    .click_text(self, text: 'str', *, timeout: 'Optional[float]' = None, button: 'str' = 'left', clicks: 'int' = 1, offset: 'Tuple[int, int]' = (0, 0), **kw: 'Any') -> 'Match'
+    .clipboard_get(self) -> 'str'
+    .clipboard_set(self, text: 'str') -> 'None'
+    .close(self) -> 'None'
+    .double_click(self, target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+    .drag(self, start: 'Any', end: 'Any', *, duration: 'float' = 0.5, button: 'str' = 'left', humanize: 'Union[bool, Humanize, None]' = None, hold: 'float' = 0.05, allow_offscreen: 'bool' = False) -> 'Point'
+    .element_at(self, x: 'Any', y: 'Optional[float]' = None) -> 'Optional[Element]'
+    .exists(self, selector: 'Any', *, timeout: 'float' = 0.0, root: 'Any' = None) -> 'bool'
+    .find(self, selector: 'Any', *, timeout: 'Optional[float]' = None, root: 'Any' = None, heal: 'Optional[bool]' = None, fingerprint: 'Any' = None) -> 'Element'
+    .find_all(self, selector: 'Any', *, root: 'Any' = None) -> 'List[Element]'
+    .find_text(self, text: 'str', *, region: 'Any' = None, timeout: 'float' = 0.0, **kw: 'Any') -> 'Optional[Match]'
+    .focused(self) -> 'Optional[Element]'
+    .has(self, capability: 'str') -> 'bool'
+    .hold(self, *keys: 'Any') -> 'Iterator[List[str]]'
+    .hotkey(self, *keys: 'Any', interval: 'float' = 0.0) -> 'None'
+    .input_lock_timeout property
+    .key_down(self, key: 'str') -> 'None'
+    .key_up(self, key: 'str') -> 'None'
+    .launch(self, command: 'Any', *, wait_window: 'Any' = None, timeout: 'Optional[float]' = None, new_window: 'bool' = True, **kw: 'Any') -> 'Any'
+    .locate(self, image: 'Any', *, region: 'Any' = None, confidence: 'float' = 0.9, grayscale: 'bool' = False, scales: 'Sequence[float]' = (1.0,), timeout: 'float' = 0.0) -> 'Optional[Match]'
+    .locate_all(self, image: 'Any', **kw: 'Any') -> 'List[Match]'
+    .middle_click(self, target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+    .monitors(self) -> 'List[Monitor]'
+    .mouse_down(self, button: 'str' = 'left') -> 'None'
+    .mouse_up(self, button: 'str' = 'left') -> 'None'
+    .move(self, target: 'Any', y: 'Optional[float]' = None, *, duration: 'Optional[float]' = None, humanize: 'Union[bool, Humanize, None]' = None, tween: 'Any' = 'ease_in_out_quad', offset: 'Tuple[int, int]' = (0, 0), allow_offscreen: 'bool' = False) -> 'Point'
+    .move_rel(self, dx: 'float', dy: 'float', **kw: 'Any') -> 'Point'
+    .on_screen(self, x: 'Any', y: 'Optional[float]' = None) -> 'bool'
+    .pause property
+    .pixel(self, x: 'Any', y: 'Optional[float]' = None) -> 'Tuple[int, int, int]'
+    .pixel_matches(self, x: 'int', y: 'int', color: 'Any', tolerance: 'int' = 0) -> 'bool'
+    .position(self) -> 'Point'
+    .press(self, *keys: 'Any', presses: 'int' = 1, interval: 'float' = 0.0) -> 'None'
+    .read_text(self, region: 'Any' = None, *, engine: 'Any' = None) -> 'str'
+    .resolve_point(self, target: 'Any' = None, y: 'Optional[float]' = None) -> 'Point'
+    .right_click(self, target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+    .roots(self) -> 'List[AccessibleNode]'
+    .screenshot(self, region: 'Any' = None, *, monitor: 'Optional[int]' = None, path: "Optional[Union[str, 'os.PathLike[str]']]" = None) -> "'Image'"
+    .scroll(self, dy: 'int' = 0, dx: 'int' = 0, *, at: 'Any' = None, allow_offscreen: 'bool' = False) -> 'None'
+    .size(self) -> 'Tuple[int, int]'
+    .sleep(self, seconds: 'float') -> 'None'
+    .tree(self, *, window: 'Any' = None, max_depth: 'int' = 8, interactive_only: 'bool' = False, max_nodes: 'int' = 2000) -> 'str'
+    .triple_click(self, target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+    .type(self, text: 'str', *, interval: 'float' = 0.0, mode: 'Optional[str]' = None, verify: 'bool' = True) -> 'None'
+    .virtual_rect(self) -> 'Rect'
+    .wait(self, selector: 'Any', *, state: 'Any' = 'visible', timeout: 'Optional[float]' = None, root: 'Any' = None, heal: 'Optional[bool]' = None, fingerprint: 'Any' = None) -> 'Any'
+    .wait_for_change(self, region: 'Any' = None, **kw: 'Any') -> 'bool'
+    .wait_image(self, image: 'Any', *, timeout: 'Optional[float]' = None, **kw: 'Any') -> 'Match'
+    .wait_until(self, predicate: 'Callable[[], Any]', timeout: 'Optional[float]' = None, interval: 'float' = 0.1, **kw: 'Any') -> 'Any'
+    .wait_until_stable(self, region: 'Any' = None, **kw: 'Any') -> 'bool'
+    .window(self, title: 'Any' = None, *, app: 'Any' = None, class_name: 'Any' = None, pid: 'Optional[int]' = None, timeout: 'Optional[float]' = None) -> 'Window'
+    .windows(self, title: 'Any' = None, *, app: 'Any' = None, class_name: 'Any' = None, pid: 'Optional[int]' = None) -> 'List[Window]'
+locum.DesktopBusy exception(LocumError)
+locum.Element class(node: 'AccessibleNode', desktop: "'Desktop'", selector: 'Optional[Any]' = None, *, scope: 'Any' = None, index: 'Optional[int]' = None)
+    .actions property
+    .automation_id property
+    .backend property
+    .bounds property
+    .center property
+    .check(self) -> "'Element'"
+    .children(self) -> "List['Element']"
+    .class_name property
+    .clear(self) -> "'Element'"
+    .click(self, button: 'str' = 'left', clicks: 'int' = 1, *, offset: 'Tuple[int, int]' = (0, 0), native: 'NativeMode' = 'auto') -> "'Element'"
+    .collapse(self) -> "'Element'"
+    .description property
+    .double_click(self, button: 'str' = 'left', *, offset: 'Tuple[int, int]' = (0, 0)) -> "'Element'"
+    .exists(self, selector: 'Any', timeout: 'float' = 0) -> 'bool'
+    .expand(self) -> "'Element'"
+    .find(self, selector: 'Any', timeout: 'Optional[float]' = None, *, heal: 'Optional[bool]' = None, fingerprint: 'Any' = None) -> "'Element'"
+    .find_all(self, selector: 'Any') -> "List['Element']"
+    .fingerprint(self) -> 'Any'
+    .focus(self) -> "'Element'"
+    .highlight(self, duration: 'float' = 1.0) -> "'Element'"
+    .hover(self, *, offset: 'Tuple[int, int]' = (0, 0)) -> "'Element'"
+    .index property
+    .invoke(self) -> "'Element'"
+    .is_checked property
+    .is_enabled property
+    .is_focused property
+    .is_selected property
+    .is_visible property
+    .name property
+    .node property
+    .parent property
+    .press(self, *keys: 'Any', require_focus: 'Optional[bool]' = None, **kw: 'Any') -> "'Element'"
+    .refresh(self, timeout: 'float' = 0.0) -> "'Element'"
+    .right_click(self, *, offset: 'Tuple[int, int]' = (0, 0)) -> "'Element'"
+    .role property
+    .screenshot(self) -> "'Image'"
+    .scroll(self, dy: 'int', dx: 'int' = 0) -> "'Element'"
+    .scroll_into_view(self) -> "'Element'"
+    .select(self) -> "'Element'"
+    .set_text(self, text: 'str', *, native: 'NativeMode' = 'auto', clear: 'bool' = True, verify: 'VerifyMode' = True, decimal: 'Optional[str]' = None, require_focus: 'Optional[bool]' = None, _typing_mode: 'Optional[str]' = None) -> "'Element'"
+    .states property
+    .text property
+    .to_dict(self) -> 'dict'
+    .toggle(self) -> "'Element'"
+    .type(self, text: 'str', *, verify: 'bool' = True, require_focus: 'Optional[bool]' = None, **kw: 'Any') -> "'Element'"
+    .uncheck(self) -> "'Element'"
+    .value property
+    .wait_until(self, state: 'Any' = 'visible', timeout: 'Optional[float]' = None, interval: 'Optional[float]' = None) -> "'Element'"
+    .window property
+locum.ElementNotFound exception(LocumError, LookupError)
+locum.FailSafe class(backend: 'Any', enabled: 'bool' = True, corners: 'Optional[List[PointLike]]' = None, margin: 'int' = 0)
+    .check(self, ignore: 'Optional[PointLike]' = None) -> 'None'
+    .corners property
+    .in_corner(self, point: 'PointLike') -> 'bool'
+    .refresh(self) -> 'None'
+locum.FailSafeTriggered exception(LocumError)
+locum.Humanize class(speed: 'float' = 1.0, jitter: 'float' = 1.0, overshoot: 'bool' = True, curvature: 'float' = 1.0, seed: 'Optional[int]' = None) -> None
+    .reseed(self, seed: 'Optional[int]' = None) -> "'Humanize'"
+    .rng property
+locum.ImageNotFound exception(LocumError, LookupError)
+locum.LocumError exception(Exception)
+locum.Match class(rect: 'Rect', confidence: 'float', text: 'str' = '', scale: 'float' = 1.0, extra: 'dict' = <factory>) -> None
+    .center property
+    .to_dict(self) -> 'dict'
+locum.Monitor class(index: 'int', rect: 'Rect', scale: 'float' = 1.0, is_primary: 'bool' = False, name: 'str' = '') -> None
+    .to_dict(self) -> 'dict'
+locum.MouseButton enum[LEFT, RIGHT, MIDDLE, X1, X2]
+locum.NotSupported exception(BackendError)
+locum.Point class(x: ForwardRef('int'), y: ForwardRef('int'))
+    .distance(self, other: "'PointLike'") -> 'float'
+    .offset(self, dx: 'int' = 0, dy: 'int' = 0) -> "'Point'"
+    .to_dict(self) -> 'dict'
+locum.PolicyViolation exception(LocumError, PermissionError)
+locum.Rect class(left: 'int', top: 'int', width: 'int', height: 'int') -> None
+    .area property
+    .as_ltrb(self) -> 'Tuple[int, int, int, int]'
+    .as_tuple(self) -> 'Tuple[int, int, int, int]'
+    .bottom property
+    .center property
+    .coerce(cls, value: "'RectLike'") -> "'Rect'"
+    .contains(self, point: 'PointLike') -> 'bool'
+    .from_ltrb(cls, left: 'int', top: 'int', right: 'int', bottom: 'int') -> "'Rect'"
+    .inflate(self, dx: 'int', dy: 'Optional[int]' = None) -> "'Rect'"
+    .intersect(self, other: "'Rect'") -> "Optional['Rect']"
+    .iou(self, other: "'Rect'") -> 'float'
+    .is_empty property
+    .offset(self, dx: 'int' = 0, dy: 'int' = 0) -> "'Rect'"
+    .right property
+    .to_dict(self) -> 'dict'
+    .union(self, other: "'Rect'") -> "'Rect'"
+locum.Selector class(branches: 'List[_Branch]', source: 'Any' = None)
+    .find_all(self, roots: 'Union[AccessibleNode, Sequence[AccessibleNode]]', *, max_depth: 'int' = 64, limit: 'Optional[int]' = None, include_roots: 'bool' = True) -> 'List[AccessibleNode]'
+    .find_first(self, roots: 'Union[AccessibleNode, Sequence[AccessibleNode]]', max_depth: 'int' = 64, *, include_roots: 'bool' = True) -> 'Optional[AccessibleNode]'
+    .is_positional property
+    .matches(self, node: 'AccessibleNode') -> 'bool'
+locum.SelectorSyntaxError exception(LocumError, ValueError)
+locum.TargetLost exception(LocumError)
+locum.VerificationUnavailable exception(ActionTimeout)
+locum.VerifyResult class(status: 'str', mode: 'Optional[str]', expected: 'str', actual: 'Optional[str]' = None, reason: 'str' = '') -> None
+    .to_dict(self) -> 'Dict[str, Any]'
+    .verified property
+locum.Window class(info: 'WindowInfo', desktop: "'Desktop'")
+    .activate(self) -> "'Window'"
+    .app property
+    .backend property
+    .center property
+    .class_name property
+    .close(self) -> "'Window'"
+    .element property
+    .exists property
+    .exists_element(self, selector: 'Any', timeout: 'float' = 0.0) -> 'bool'
+    .find(self, selector: 'Any', timeout: 'Optional[float]' = None) -> "'Element'"
+    .find_all(self, selector: 'Any') -> "List['Element']"
+    .handle property
+    .info property
+    .is_active property
+    .is_maximized property
+    .is_minimized property
+    .is_visible property
+    .maximize(self) -> "'Window'"
+    .minimize(self) -> "'Window'"
+    .move(self, x: 'int', y: 'int') -> "'Window'"
+    .pid property
+    .rect property
+    .refresh(self) -> "'Window'"
+    .resize(self, width: 'int', height: 'int') -> "'Window'"
+    .restore(self) -> "'Window'"
+    .screenshot(self) -> "'Image'"
+    .set_rect(self, rect: 'RectLike') -> "'Window'"
+    .title property
+    .to_dict(self) -> 'dict'
+    .wait_closed(self, timeout: 'Optional[float]' = 10) -> 'bool'
+locum.WindowInfo class(handle: 'Any', title: 'str', rect: 'Rect', app: 'str' = '', pid: 'Optional[int]' = None, is_active: 'bool' = False, is_minimized: 'bool' = False, is_maximized: 'bool' = False, is_visible: 'bool' = True, class_name: 'str' = '') -> None
+    .to_dict(self) -> 'dict'
+locum.WindowNotFound exception(LocumError, LookupError)
+locum.WorkflowError exception(LocumError)
+locum.__version__ str
+locum.abort def(reason: 'str' = '') -> 'None'
+locum.active_window def() -> "Optional['Window']"
+locum.click def(target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+locum.clipboard_get def() -> 'str'
+locum.clipboard_set def(text: 'str') -> 'None'
+locum.coerce_point def(value: 'Any') -> 'Point'
+locum.create_backend def(name: 'Optional[str]' = None, **kwargs) -> 'Backend'
+locum.desktop_input def(desktop: 'Any', timeout: 'Optional[float]' = None) -> "'contextlib.AbstractContextManager[None]'"
+locum.double_click def(target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+locum.drag def(start: 'Any', end: 'Any', **kw: 'Any') -> 'Point'
+locum.exists def(selector: 'Any', **kw: 'Any') -> 'bool'
+locum.find def(selector: 'Any', **kw: 'Any') -> "'Element'"
+locum.find_all def(selector: 'Any', **kw: 'Any') -> "List['Element']"
+locum.get_backend def() -> 'Backend'
+locum.get_desktop def() -> "'Desktop'"
+locum.hotkey def(*keys: 'Any', **kw: 'Any') -> 'None'
+locum.install_kill_hotkey def(combo: 'str' = 'ctrl+alt+shift+q') -> 'bool'
+locum.is_aborted def() -> 'bool'
+locum.launch def(command: 'Any', **kw: 'Any') -> 'Any'
+locum.locate def(image: 'Any', **kw: 'Any') -> 'Optional[Match]'
+locum.middle_click def(target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+locum.move def(target: 'Any', y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+locum.parse_selector def(selector: 'Union[str, Dict[str, Any], Selector]') -> 'Selector'
+locum.position def() -> 'Point'
+locum.press def(*keys: 'Any', **kw: 'Any') -> 'None'
+locum.register_backend def(name: 'str', factory: 'Union[str, Callable[[], Backend]]') -> 'None'
+locum.reset_abort def() -> 'None'
+locum.retry def(fn: 'Optional[Callable[..., T]]' = None, *, attempts: 'int' = 3, delay: 'float' = 0.5, backoff: 'float' = 2.0, max_delay: 'float' = 30.0, exceptions: 'ExceptionTypes' = (<class 'Exception'>,), on_retry: 'Optional[Callable[[int, BaseException, float], Any]]' = None, sleep: 'Callable[[float], Any]' = <built-in function sleep>) -> 'Any'
+locum.retry_call def(fn: 'Callable[..., T]', *args: 'Any', attempts: 'int' = 3, delay: 'float' = 0.5, backoff: 'float' = 2.0, max_delay: 'float' = 30.0, exceptions: 'ExceptionTypes' = (<class 'Exception'>,), on_retry: 'Optional[Callable[[int, BaseException, float], Any]]' = None, sleep: 'Callable[[float], Any]' = <built-in function sleep>, **kwargs: 'Any') -> 'T'
+locum.right_click def(target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+locum.screenshot def(region: 'Any' = None, **kw: 'Any') -> "'Image'"
+locum.scroll def(dy: 'int' = 0, dx: 'int' = 0, **kw: 'Any') -> 'None'
+locum.selector_for def(node: 'AccessibleNode', *, root: 'Optional[AccessibleNode]' = None, roots: 'Optional[Sequence[AccessibleNode]]' = None, prefix_cache: 'Optional[List[Any]]' = None) -> 'str'
+locum.set_backend def(backend: 'Union[Backend, str, None]') -> 'Optional[Backend]'
+locum.set_desktop def(desktop: "Optional['Desktop']") -> "Optional['Desktop']"
+locum.size def() -> 'tuple'
+locum.tree def(**kw: 'Any') -> 'str'
+locum.triple_click def(target: 'Any' = None, y: 'Optional[float]' = None, **kw: 'Any') -> 'Point'
+locum.try_desktop_input def(desktop: 'Any') -> 'Iterator[bool]'
+locum.type def(text: 'str', **kw: 'Any') -> 'None'
+locum.wait def(selector: 'Any', **kw: 'Any') -> "Optional['Element']"
+locum.window def(title: 'Any' = None, **kw: 'Any') -> "'Window'"
+locum.windows def(title: 'Any' = None, **kw: 'Any') -> "List['Window']"
+
+# locum.errors
+locum.errors.ActionTimeout exception(LocumError, TimeoutError)
+locum.errors.AmbiguousElement exception(LocumError, LookupError)
+locum.errors.BackendError exception(LocumError)
+locum.errors.BackendUnavailable exception(BackendError)
+locum.errors.DesktopBusy exception(LocumError)
+locum.errors.ElementNotFound exception(LocumError, LookupError)
+locum.errors.FATAL_ERRORS tuple
+locum.errors.FailSafeTriggered exception(LocumError)
+locum.errors.ImageNotFound exception(LocumError, LookupError)
+locum.errors.LocumError exception(Exception)
+locum.errors.NotSupported exception(BackendError)
+locum.errors.PermissionDenied exception(BackendError, PermissionError)
+locum.errors.PolicyViolation exception(LocumError, PermissionError)
+locum.errors.STOP_ERRORS tuple
+locum.errors.SelectorSyntaxError exception(LocumError, ValueError)
+locum.errors.TRANSIENT_ERRORS tuple
+locum.errors.TargetLost exception(LocumError)
+locum.errors.VerificationUnavailable exception(ActionTimeout)
+locum.errors.WindowNotFound exception(LocumError, LookupError)
+locum.errors.WorkflowError exception(LocumError)
+locum.errors.is_transient def(exc: 'BaseException') -> 'bool'
+
+# locum.selectors
+locum.selectors.INTERACTIVE_ROLES frozenset
+locum.selectors.ROLE_ALIASES dict
+locum.selectors.Selector class(branches: 'List[_Branch]', source: 'Any' = None)
+    .find_all(self, roots: 'Union[AccessibleNode, Sequence[AccessibleNode]]', *, max_depth: 'int' = 64, limit: 'Optional[int]' = None, include_roots: 'bool' = True) -> 'List[AccessibleNode]'
+    .find_first(self, roots: 'Union[AccessibleNode, Sequence[AccessibleNode]]', max_depth: 'int' = 64, *, include_roots: 'bool' = True) -> 'Optional[AccessibleNode]'
+    .is_positional property
+    .matches(self, node: 'AccessibleNode') -> 'bool'
+locum.selectors.UIPATH_ROLES dict
+locum.selectors.describe_node def(node: 'AccessibleNode', *, include_bounds: 'bool' = True) -> 'str'
+locum.selectors.parse def(selector: 'Union[str, Dict[str, Any], Selector]') -> 'Selector'
+locum.selectors.quote def(text: 'str') -> 'str'
+locum.selectors.selector_for def(node: 'AccessibleNode', *, root: 'Optional[AccessibleNode]' = None, roots: 'Optional[Sequence[AccessibleNode]]' = None, prefix_cache: 'Optional[List[Any]]' = None) -> 'str'
+locum.selectors.tree_text def(roots: 'Union[AccessibleNode, Sequence[AccessibleNode]]', *, max_depth: 'int' = 8, interactive_only: 'bool' = False, max_nodes: 'int' = 2000, include_bounds: 'bool' = True) -> 'str'
+
+# locum.rpa
+locum.rpa.BUSINESS_EXCEPTION str
+locum.rpa.BusinessException exception(LocumError)
+locum.rpa.FAILED str
+locum.rpa.FlowAssertionError exception(WorkflowError, AssertionError)
+locum.rpa.FlowRunner class(desktop: "'Desktop'", report: 'RunReport', variables: 'Optional[Dict[str, Any]]' = None, *, run_dir: 'Optional[pathlib.Path]' = None, screenshot_on_error: 'bool' = False, logger: 'Optional[logging.Logger]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None)
+    .log(self, message: 'str', level: 'str' = 'info', path: 'str' = '', **fields: 'Any') -> 'None'
+    .run_step(self, step: 'Mapping[str, Any]', path: 'str', depth: 'int', scope: '_Scope') -> 'StepResult'
+    .run_steps(self, steps: 'Sequence[Any]', path: 'str', depth: 'int', scope: '_Scope') -> 'None'
+locum.rpa.FlowStepError exception(WorkflowError)
+locum.rpa.IN_PROGRESS str
+locum.rpa.NEW str
+locum.rpa.QueueItem class(payload: 'Dict[str, Any]', id: 'str' = <factory>, reference: 'Optional[str]' = None, status: 'str' = 'new', priority: 'int' = 0, attempts: 'int' = 0, created_at: 'float' = <factory>, started_at: 'Optional[float]' = None, finished_at: 'Optional[float]' = None, error: 'Optional[str]' = None, error_type: 'Optional[str]' = None, traceback: 'Optional[str]' = None, output: 'Dict[str, Any]' = <factory>, history: 'List[Dict[str, Any]]' = <factory>, worker_id: 'Optional[str]' = None, worker_host: 'Optional[str]' = None, worker_pid: 'Optional[int]' = None, lease_id: 'Optional[str]' = None, lease_expires_at: 'Optional[float]' = None) -> None
+    .duration property
+    .from_dict(cls, d: 'Dict[str, Any]') -> "'QueueItem'"
+    .get(self, key: 'str', default: 'Any' = None) -> 'Any'
+    .is_final property
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.rpa.RecordedAction class(kind: 'str', time: 'float' = 0.0, x: 'Optional[int]' = None, y: 'Optional[int]' = None, selector: 'Optional[str]' = None, offset: 'Optional[Tuple[int, int]]' = None, element: 'Optional[Dict[str, Any]]' = None, button: 'str' = 'left', clicks: 'int' = 1, end_x: 'Optional[int]' = None, end_y: 'Optional[int]' = None, dx: 'int' = 0, dy: 'int' = 0, text: 'str' = '', keys: 'List[str]' = <factory>, presses: 'int' = 1, secret: 'bool' = False, mode: 'str' = '', secret_reason: 'str' = '', _last_time: 'float' = 0.0) -> None
+    .to_dict(self) -> 'Dict[str, Any]'
+    .to_flow_step(self) -> 'Dict[str, Any]'
+    .to_python(self, var: 'str' = 'd') -> 'str'
+locum.rpa.Recorder class(desktop: "Optional['Desktop']" = None, *, use_selectors: 'bool' = True, double_click_interval: 'float' = 0.5, double_click_distance: 'float' = 4.0, drag_threshold: 'float' = 6.0, clock: 'Callable[[], float]' = <built-in function monotonic>, trust_unknown_focus: 'bool' = False)
+    .actions property
+    .backend property
+    .clear(self) -> 'None'
+    .desktop property
+    .feed(self, event: 'Union[Sequence[Any], Mapping[str, Any]]') -> 'None'
+    .flush(self) -> 'None'
+    .is_recording property
+    .record_native(self, kind: 'str', element: 'Any', text: 'Optional[str]' = None) -> 'Optional[RecordedAction]'
+    .save(self, path: "Union[str, 'pathlib.Path']", *, name: 'Optional[str]' = None) -> 'str'
+    .source property
+    .start(self, source: 'str' = 'auto') -> "'Recorder'"
+    .stop(self) -> 'List[RecordedAction]'
+    .to_flow(self, name: 'str' = 'recorded') -> 'Dict[str, Any]'
+    .to_python(self, *, desktop_expr: 'str' = 'Desktop()', var: 'str' = 'd') -> 'str'
+locum.rpa.Robot class(desktop: "Optional['Desktop']" = None, name: 'str' = 'robot', run_dir: "Union[str, 'os.PathLike[str]']" = 'locum_runs', screenshot_on_error: 'bool' = True, logger: 'Optional[logging.Logger]' = None, *, save_reports: 'bool' = True, sleep: 'Optional[Callable[[float], Any]]' = None, clock: 'Callable[[], float]' = <built-in function monotonic>, policy: 'Any' = None, confirm: 'Optional[Callable[[str, Dict[str, Any]], bool]]' = None, audit: 'Any' = None)
+    .check_timeout(self) -> 'None'
+    .current_path property
+    .desktop property
+    .finish(self, *, save: 'Optional[bool]' = None) -> 'RunReport'
+    .log(self, message: 'str', level: 'str' = 'info', **fields: 'Any') -> 'Dict[str, Any]'
+    .run(self, *task_names: 'str', save: 'Optional[bool]' = None) -> 'RunReport'
+    .run_id property
+    .run_path property
+    .save_report(self, report: 'Optional[RunReport]' = None) -> 'Dict[str, str]'
+    .screenshot(self, name: 'str' = 'screenshot') -> 'Optional[str]'
+    .setup(self, fn: 'Callable[..., Any]') -> 'Callable[..., Any]'
+    .sleep(self, seconds: 'float') -> 'None'
+    .start(self, *, metadata: 'Optional[Dict[str, Any]]' = None) -> 'RunReport'
+    .step(self, name: 'str', retries: 'int' = 0, *, retry_delay: 'float' = 0.0, backoff: 'float' = 2.0, continue_on_error: 'bool' = False, screenshot: 'Optional[bool]' = None) -> 'Step'
+    .task(self, name: 'Union[str, Callable[..., Any], None]' = None, retries: 'int' = 0, retry_delay: 'float' = 1.0, timeout: 'Optional[float]' = None, continue_on_error: 'bool' = False, *, backoff: 'float' = 2.0) -> 'Any'
+    .teardown(self, fn: 'Callable[..., Any]') -> 'Callable[..., Any]'
+locum.rpa.RunReport class(name: 'str' = 'run', run_id: 'str' = '', started_at: 'float' = 0.0, finished_at: 'Optional[float]' = None, steps: 'List[StepResult]' = <factory>, logs: 'List[Dict[str, Any]]' = <factory>, run_dir: 'Optional[str]' = None, aborted: 'bool' = False, error: 'Optional[str]' = None, metadata: 'Dict[str, Any]' = <factory>, variables: 'Dict[str, Any]' = <factory>) -> None
+    .add(self, step: 'StepResult') -> 'StepResult'
+    .by_kind(self, kind: 'str') -> 'List[StepResult]'
+    .counts(self) -> 'Dict[str, int]'
+    .duration property
+    .failures property
+    .find(self, name_or_path: 'str') -> 'Optional[StepResult]'
+    .from_dict(cls, d: 'Dict[str, Any]') -> "'RunReport'"
+    .load_json(cls, path: 'PathLike') -> "'RunReport'"
+    .ok property
+    .save_html(self, path: 'PathLike', *, thumbnail_size: 'int' = 480) -> 'str'
+    .save_json(self, path: 'PathLike') -> 'str'
+    .summary(self) -> 'str'
+    .tasks property
+    .to_dict(self) -> 'Dict[str, Any]'
+    .to_html(self, *, thumbnail_size: 'int' = 480) -> 'str'
+    .to_json(self, indent: 'Optional[int]' = 2) -> 'str'
+locum.rpa.SUCCESS str
+locum.rpa.Step class(robot: "'Robot'", name: 'str', retries: 'int' = 0, *, retry_delay: 'float' = 0.0, backoff: 'float' = 2.0, continue_on_error: 'bool' = False, screenshot: 'Optional[bool]' = None)
+    .run(self, fn: 'Callable[..., Any]', *args: 'Any', **kwargs: 'Any') -> 'Any'
+locum.rpa.StepResult class(name: 'str', status: 'str' = 'passed', kind: 'str' = 'step', path: 'str' = '', depth: 'int' = 0, started_at: 'float' = 0.0, finished_at: 'Optional[float]' = None, duration: 'float' = 0.0, attempts: 'int' = 1, error: 'Optional[str]' = None, error_type: 'Optional[str]' = None, traceback: 'Optional[str]' = None, screenshot: 'Optional[str]' = None, handled: 'bool' = False, data: 'Dict[str, Any]' = <factory>) -> None
+    .failed property
+    .from_dict(cls, d: 'Dict[str, Any]') -> "'StepResult'"
+    .ok property
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.rpa.Task class(name: 'str', fn: 'Callable[..., Any]', retries: 'int' = 0, retry_delay: 'float' = 1.0, timeout: 'Optional[float]' = None, continue_on_error: 'bool' = False, backoff: 'float' = 2.0, pass_robot: 'bool' = False, description: 'str' = '') -> None
+locum.rpa.WorkQueue class(name: 'str' = 'queue', path: 'Optional[PathLike]' = None, *, autosave: 'bool' = True, unique_references: 'bool' = True, on_abandoned: 'str' = 'fail', worker_id: 'Optional[str]' = None, lease_duration: 'float' = 1800.0, lock_timeout: 'float' = 60.0, reclaim_dead_workers: 'bool' = True, allow_synced: 'bool' = False)
+    .add(self, payload: 'Dict[str, Any]', *, reference: 'Optional[str]' = None, priority: 'int' = 0) -> 'QueueItem'
+    .add_many(self, payloads: 'Iterable[Dict[str, Any]]', *, reference_field: 'Optional[str]' = None, reference_prefix: 'Optional[str]' = None, priority: 'int' = 0) -> 'List[QueueItem]'
+    .by_status(self, *statuses: 'str') -> 'List[QueueItem]'
+    .clear(self) -> 'None'
+    .complete(self, item: 'Union[QueueItem, str]', output: 'Optional[Dict[str, Any]]' = None) -> 'QueueItem'
+    .export(self, path: 'PathLike') -> 'str'
+    .export_csv(self, path: 'PathLike', *, encoding: 'str' = 'utf-8') -> 'str'
+    .fail(self, item: 'Union[QueueItem, str]', error: 'Union[BaseException, str]', *, business: 'Optional[bool]' = None) -> 'QueueItem'
+    .get(self, id_or_reference: 'str') -> 'Optional[QueueItem]'
+    .items property
+    .load(self, path: 'PathLike', **kw: 'Any') -> 'List[QueueItem]'
+    .load_csv(self, path: 'PathLike', *, delimiter: 'str' = ',', encoding: 'str' = 'utf-8-sig', reference_field: 'Optional[str]' = None, priority: 'int' = 0, skip_blank: 'bool' = True, strict: 'bool' = True) -> 'List[QueueItem]'
+    .load_json(self, path: 'PathLike', *, reference_field: 'Optional[str]' = None, key: 'Optional[str]' = None, priority: 'int' = 0) -> 'List[QueueItem]'
+    .load_xlsx(self, path: 'PathLike', *, sheet: 'Optional[str]' = None, reference_field: 'Optional[str]' = None, priority: 'int' = 0) -> 'List[QueueItem]'
+    .next(self) -> 'Optional[QueueItem]'
+    .open(cls, path: 'PathLike', name: 'Optional[str]' = None, **kw: 'Any') -> "'WorkQueue'"
+    .pending(self) -> 'List[QueueItem]'
+    .process(self, handler: 'Callable[[QueueItem], Any]', *, retries: 'int' = 1, retry_delay: 'float' = 0.0, backoff: 'float' = 2.0, limit: 'Optional[int]' = None, stop_on_failure: 'bool' = False, on_item: 'Optional[Callable[[QueueItem], Any]]' = None, sleep: 'Callable[[float], Any]' = <built-in function sleep>) -> 'Dict[str, Any]'
+    .refresh(self) -> "'WorkQueue'"
+    .release(self, item: 'Union[QueueItem, str]') -> 'QueueItem'
+    .remove(self, item: 'Union[QueueItem, str]') -> 'QueueItem'
+    .renew(self, item: 'Union[QueueItem, str]', duration: 'Optional[float]' = None) -> 'QueueItem'
+    .retry_items(self, statuses: 'Sequence[str]' = ('failed',), *, reset_attempts: 'bool' = True) -> 'List[QueueItem]'
+    .save(self, path: 'Optional[PathLike]' = None) -> 'str'
+    .source_reference(path: 'PathLike', payload: 'Any', occurrence: 'int' = 1) -> 'str'
+    .summary(self) -> 'Dict[str, Any]'
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.rpa.default_queue_dir def() -> 'pathlib.Path'
+locum.rpa.interpolate def(value: 'Any', variables: 'Mapping[str, Any]', *, path: 'str' = '') -> 'Any'
+locum.rpa.load_flow def(source: 'Union[PathLike, Mapping[str, Any], Sequence[Any]]') -> 'Tuple[Dict[str, Any], Optional[pathlib.Path]]'
+locum.rpa.run_flow def(path_or_dict: 'Union[PathLike, Mapping[str, Any], Sequence[Any]]', desktop: "Optional['Desktop']" = None, variables: 'Optional[Mapping[str, Any]]' = None, *, base_dir: 'Optional[PathLike]' = None, run_dir: 'Optional[PathLike]' = None, screenshot_on_error: 'Optional[bool]' = None, raise_on_error: 'bool' = False, logger: 'Optional[logging.Logger]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None) -> 'RunReport'
+locum.rpa.synced_location def(path: 'PathLike') -> 'str'
+locum.rpa.validate_flow def(doc: 'Mapping[str, Any]', *, prefix: 'str' = '') -> 'List[str]'
+
+# locum.llm
+locum.llm.Agent class(desktop: "Optional['Desktop']" = None, *, model: 'str' = 'claude-opus-5-5', client: 'Any' = None, mode: 'str' = 'tools', policy: 'Optional[Policy]' = None, audit: 'Optional[AuditLog]' = None, max_steps: 'int' = 50, system_prompt: 'Optional[str]' = None, on_step: 'Optional[Callable[[AgentStep], Any]]' = None, effort: 'str' = 'high', max_tokens: 'int' = 16000, initial_observation: 'bool' = True, toolkit: 'Optional[DesktopToolkit]' = None, computer: 'Optional[ComputerUseAdapter]' = None, extra_tools: 'Sequence[Any]' = (), create_kwargs: 'Optional[Dict[str, Any]]' = None, max_continuations: 'int' = 2)
+    .client property
+    .run(self, task: 'str') -> 'AgentResult'
+    .system(self) -> 'str'
+    .tools(self) -> 'List[Dict[str, Any]]'
+locum.llm.AgentResult class(success: 'bool', final_text: 'str', steps: 'List[AgentStep]' = <factory>, usage: 'Dict[str, int]' = <factory>, stop_reason: 'Optional[str]' = None, messages: 'List[Dict[str, Any]]' = <factory>) -> None
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.llm.AgentStep class(index: 'int', text: 'str' = '', tool_calls: 'List[Dict[str, Any]]' = <factory>, tool_results: 'List[ToolResult]' = <factory>, stop_reason: 'Optional[str]' = None, usage: 'Dict[str, int]' = <factory>, duration: 'float' = 0.0) -> None
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.llm.AuditLog class(path: "Optional[Union[str, 'os.PathLike[str]']]" = None, *, keep: 'Optional[int]' = 10000)
+    .read(self) -> 'List[Dict[str, Any]]'
+    .record(self, event: 'Dict[str, Any]') -> 'Dict[str, Any]'
+locum.llm.CARD_NUMBER _CardNumber
+locum.llm.ComputerUseAdapter class(desktop: "'Desktop'", *, max_long_edge: 'Union[int, str]' = 'auto', policy: 'Optional[Policy]' = None, audit: 'Optional[AuditLog]' = None, monitor: 'Optional[int]' = 0, zoom: 'bool' = True, max_visual_tokens: 'int' = 4784, screenshot_after_action: 'bool' = False)
+    .capture(self) -> "'Image'"
+    .execute(self, name: 'str', input: 'Optional[Dict[str, Any]]' = None) -> 'ToolResult'
+    .image_size(self) -> 'Tuple[int, int]'
+    .is_computer_block(block: 'Any') -> 'bool'
+    .make_result(block: 'Any', result: 'ToolResult') -> 'Dict[str, Any]'
+    .not_executed(block: 'Any') -> 'Dict[str, Any]'
+    .release_all(self) -> 'List[str]'
+    .run_batch(self, tool_use_blocks: 'Iterable[Any]') -> 'List[Dict[str, Any]]'
+    .screen_region(self) -> 'Rect'
+    .to_image(self, x: 'float', y: 'float') -> 'Point'
+    .to_screen(self, x: 'float', y: 'float') -> 'Point'
+    .tool_definition(self) -> 'Dict[str, Any]'
+locum.llm.DEFAULT_CONFIRM tuple
+locum.llm.DEFAULT_CONFIRM_KEYS tuple
+locum.llm.DesktopToolkit class(desktop: "'Desktop'", policy: 'Optional[Policy]' = None, audit: 'Optional[AuditLog]' = None, observe_kwargs: 'Optional[Dict[str, Any]]' = None, *, find_timeout: 'float' = 5.0, feedback: 'bool' = True, launch_kwargs: 'Optional[Dict[str, Any]]' = None)
+    .call(self, name: 'str', args: 'Optional[Dict[str, Any]]' = None) -> 'ToolResult'
+    .names(self) -> 'List[str]'
+    .to_anthropic(self) -> 'List[Dict[str, Any]]'
+    .to_mcp(self) -> 'List[Dict[str, Any]]'
+    .to_openai(self) -> 'List[Dict[str, Any]]'
+    .tool_browser_click(self, element: 'Optional[int]' = None, selector: 'Optional[str]' = None, tab: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_browser_launch(self, browser: 'str' = 'edge', url: 'Optional[str]' = None, headless: 'bool' = False) -> 'ToolResult'
+    .tool_browser_navigate(self, url: 'str', tab: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_browser_observe(self, tab: 'Optional[str]' = None, max_elements: 'int' = 150, include_text: 'bool' = True, include_screenshot: 'bool' = False) -> 'ToolResult'
+    .tool_browser_pages(self) -> 'ToolResult'
+    .tool_browser_read(self, selector: 'Optional[str]' = None, tab: 'Optional[str]' = None, max_chars: 'int' = 8000) -> 'ToolResult'
+    .tool_browser_type(self, text: 'str', element: 'Optional[int]' = None, selector: 'Optional[str]' = None, clear: 'bool' = False, submit: 'bool' = False, tab: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_click(self, element_id: 'Optional[int]' = None, x: 'Optional[float]' = None, y: 'Optional[float]' = None, selector: 'Optional[str]' = None, text: 'Optional[str]' = None, button: 'str' = 'left', clicks: 'int' = 1) -> 'ToolResult'
+    .tool_double_click(self, element_id: 'Optional[int]' = None, x: 'Optional[float]' = None, y: 'Optional[float]' = None, selector: 'Optional[str]' = None, text: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_drag(self, start_element_id: 'Optional[int]' = None, start_x: 'Optional[float]' = None, start_y: 'Optional[float]' = None, end_element_id: 'Optional[int]' = None, end_x: 'Optional[float]' = None, end_y: 'Optional[float]' = None, duration: 'float' = 0.5) -> 'ToolResult'
+    .tool_find_elements(self, selector: 'Optional[str]' = None, text: 'Optional[str]' = None, role: 'Optional[str]' = None, limit: 'int' = 20) -> 'ToolResult'
+    .tool_focus_window(self, title: 'str') -> 'ToolResult'
+    .tool_hotkey(self, combo: 'str') -> 'ToolResult'
+    .tool_launch_app(self, command: 'str', wait_window: 'Optional[str]' = None, timeout: 'float' = 15.0) -> 'ToolResult'
+    .tool_list_windows(self) -> 'ToolResult'
+    .tool_move_mouse(self, element_id: 'Optional[int]' = None, x: 'Optional[float]' = None, y: 'Optional[float]' = None, selector: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_observe(self, window: 'Optional[str]' = None, include_screenshot: 'bool' = True, changes_only: 'bool' = False) -> 'ToolResult'
+    .tool_press_keys(self, keys: 'List[str]', presses: 'int' = 1) -> 'ToolResult'
+    .tool_read_clipboard(self) -> 'ToolResult'
+    .tool_read_text(self, element_id: 'Optional[int]' = None, x: 'Optional[float]' = None, y: 'Optional[float]' = None, width: 'Optional[float]' = None, height: 'Optional[float]' = None) -> 'ToolResult'
+    .tool_right_click(self, element_id: 'Optional[int]' = None, x: 'Optional[float]' = None, y: 'Optional[float]' = None, selector: 'Optional[str]' = None, text: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_screenshot(self, annotated: 'bool' = False) -> 'ToolResult'
+    .tool_scroll(self, direction: 'str' = 'down', amount: 'int' = 3, element_id: 'Optional[int]' = None, x: 'Optional[float]' = None, y: 'Optional[float]' = None, selector: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_set_value(self, value: 'str', element_id: 'Optional[int]' = None, selector: 'Optional[str]' = None) -> 'ToolResult'
+    .tool_type_text(self, text: 'str', element_id: 'Optional[int]' = None, selector: 'Optional[str]' = None, clear: 'bool' = False, press_enter: 'bool' = False) -> 'ToolResult'
+    .tool_wait(self, seconds: 'float' = 1.0) -> 'ToolResult'
+    .tool_wait_for(self, selector: 'Optional[str]' = None, text: 'Optional[str]' = None, state: 'str' = 'visible', timeout: 'float' = 10.0) -> 'ToolResult'
+    .tool_write_clipboard(self, text: 'str') -> 'ToolResult'
+locum.llm.LLMClient class(*args, **kwargs)
+locum.llm.MCPServer class(desktop: 'Any' = None, policy: 'Optional[Policy]' = None, audit: 'Optional[AuditLog]' = None, *, toolkit: 'Optional[DesktopToolkit]' = None, name: 'str' = 'locum', call_timeout: 'Optional[float]' = 60.0, progress_interval: 'float' = 2.0)
+    .handle_line(self, line: 'str') -> 'Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]'
+    .handle_message(self, message: 'Any') -> 'Optional[Dict[str, Any]]'
+    .serve(self, stdin: 'Optional[TextIO]' = None, stdout: 'Optional[TextIO]' = None) -> 'None'
+    .toolkit property
+locum.llm.Observation class(screenshot: "Optional['Image']", elements: 'List[ObservedElement]', windows: 'List[WindowInfo]', active_window: 'Optional[WindowInfo]', cursor: 'Point', screen_size: 'Tuple[int, int]', scale: 'float', annotated: "Optional['Image']", region: 'Rect' = <factory>, notes: 'List[str]' = <factory>) -> None
+    .add_element(self, node: 'AccessibleNode', *, selector: 'str' = '') -> 'ObservedElement'
+    .describe_element(self, el: 'ObservedElement') -> 'str'
+    .element(self, id: 'int') -> 'ObservedElement'
+    .image_base64(self, annotated: 'bool' = True) -> 'str'
+    .image_size property
+    .next_id(self) -> 'int'
+    .rect_to_image(self, rect: 'Rect') -> 'Rect'
+    .text(self, max_elements: 'int' = 300) -> 'str'
+    .to_dict(self) -> 'Dict[str, Any]'
+    .to_image(self, x: 'float', y: 'float') -> 'Point'
+    .to_screen(self, x: 'float', y: 'float') -> 'Point'
+locum.llm.ObservedElement class(id: 'int', role: 'str', name: 'str', value: 'Optional[str]', bounds: 'Rect', states: 'frozenset', selector: 'str', node: 'AccessibleNode', window_title: 'str' = '', app: 'str' = '', _selector_source: 'Optional[Callable[[], str]]' = None) -> None
+    .center property
+    .occluded property
+    .selector_ready property
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.llm.Policy class(allow_tools: 'Optional[Iterable[str]]' = None, deny_tools: 'Iterable[str]' = (), allowed_apps: 'Optional[Iterable[str]]' = None, blocked_apps: 'Iterable[str]' = (), deny_text_patterns: 'Iterable[Union[str, Pattern]]' = (), confirm_patterns: 'Iterable[Union[str, Pattern]]' = <tuple>, confirm: 'Optional[ConfirmCallback]' = None, dry_run: 'bool' = False, max_actions: 'Optional[int]' = None, max_actions_per_minute: 'Optional[int]' = None, region: 'Optional[Any]' = None, *, unknown_target: 'str' = 'confirm', confirm_keys: 'Iterable[Union[str, Sequence[str]]]' = ('ctrl+enter', 'cmd+enter', 'ctrl+s', 'cmd+s'), read_only_tools: 'Iterable[str]' = <frozenset>, clock: 'Callable[[], float]' = <built-in function monotonic>, allow: 'Optional[Iterable[Any]]' = None, launch_options: 'Iterable[str]' = ())
+    .allow_list_mode property
+    .allow_rule_for(self, tool_name: 'str', args: 'Dict[str, Any]', context: 'Dict[str, Any]') -> 'Optional[AllowRule]'
+    .authorization_reason(self, tool_name: 'str', args: 'Dict[str, Any]', context: 'Dict[str, Any]') -> 'Optional[str]'
+    .check(self, tool_name: 'str', args: 'Optional[Dict[str, Any]]' = None, *, context: 'Optional[Dict[str, Any]]' = None, count: 'bool' = True, confirm: 'Optional[ConfirmCallback]' = None) -> 'None'
+    .confirmation_reason(self, tool_name: 'str', args: 'Dict[str, Any]', context: 'Dict[str, Any]') -> 'Optional[str]'
+    .is_consequential(self, tool_name: 'str', context: 'Optional[Dict[str, Any]]' = None) -> 'bool'
+    .is_read_only(self, tool_name: 'str') -> 'bool'
+    .permissive(cls, **kw: 'Any') -> "'Policy'"
+    .reset(self) -> 'None'
+    .strict(cls, **kw: 'Any') -> "'Policy'"
+    .tool_allowed(self, tool_name: 'str') -> 'bool'
+locum.llm.ScriptedClient class(responses: 'Iterable[Any]')
+    .create(self, **kwargs: 'Any') -> 'Any'
+    .remaining property
+locum.llm.ToolRegistry class() -> 'None'
+    .add(self, spec: 'ToolSpec') -> 'ToolSpec'
+    .call(self, name: 'str', args: 'Optional[Dict[str, Any]]' = None) -> 'ToolResult'
+    .get(self, name: 'str') -> 'Optional[ToolSpec]'
+    .names(self) -> 'List[str]'
+    .register(self, fn: 'Optional[Callable[..., Any]]' = None, *, name: 'Optional[str]' = None, description: 'Optional[str]' = None, parameters: 'Optional[Dict[str, Any]]' = None, read_only: 'bool' = False) -> 'Any'
+    .remove(self, name: 'str') -> 'None'
+    .specs(self) -> 'List[ToolSpec]'
+    .to_anthropic(self) -> 'List[Dict[str, Any]]'
+    .to_mcp(self) -> 'List[Dict[str, Any]]'
+    .to_openai(self) -> 'List[Dict[str, Any]]'
+locum.llm.ToolResult class(text: 'str' = '', image_base64: 'Optional[str]' = None, is_error: 'bool' = False, data: 'Any' = None) -> None
+    .error(cls, text: 'str', **kw: 'Any') -> "'ToolResult'"
+    .ok(cls, text: 'str' = 'OK', **kw: 'Any') -> "'ToolResult'"
+    .to_anthropic(self, tool_use_id: 'str') -> 'Dict[str, Any]'
+    .to_anthropic_content(self) -> 'List[Dict[str, Any]]'
+    .to_mcp_content(self) -> 'List[Dict[str, Any]]'
+    .to_openai_content(self) -> 'str'
+locum.llm.ToolSpec class(name: 'str', description: 'str', parameters: 'Dict[str, Any]', fn: 'Callable[..., Any]', read_only: 'bool' = False, confirm: 'bool' = False) -> None
+    .from_function(cls, fn: 'Callable[..., Any]', *, name: 'Optional[str]' = None, description: 'Optional[str]' = None, parameters: 'Optional[Dict[str, Any]]' = None, read_only: 'bool' = False, confirm: 'bool' = False) -> "'ToolSpec'"
+    .to_anthropic(self) -> 'Dict[str, Any]'
+    .to_mcp(self) -> 'Dict[str, Any]'
+    .to_openai(self) -> 'Dict[str, Any]'
+locum.llm.computer_block def(action: 'str', input: 'Optional[Dict[str, Any]]' = None, *, id: 'Optional[str]' = None) -> 'Dict[str, Any]'
+locum.llm.console_confirm def(description: 'str', details: 'Dict[str, Any]') -> 'bool'
+locum.llm.fit_image_size def(width: 'int', height: 'int', max_long_edge: 'Optional[int]' = 2576, max_visual_tokens: 'Optional[int]' = 4784, patch: 'int' = 28) -> 'Tuple[int, int]'
+locum.llm.map_key def(name: 'str') -> 'str'
+locum.llm.observe def(desktop: "'Desktop'", *, screenshot: 'bool' = True, annotate: 'bool' = True, max_long_edge: 'int' = 1568, interactive_only: 'bool' = True, window: 'Any' = None, max_elements: 'int' = 300, max_visual_tokens: 'Optional[int]' = 4784, selectors: 'bool' = True, max_depth: 'int' = 32, time_budget: 'Optional[float]' = None, reuse: 'Optional[Observation]' = None, prune_documents: 'Optional[Sequence[int]]' = None) -> 'Observation'
+locum.llm.parse_key_combo def(combo: 'str') -> 'List[str]'
+locum.llm.scripted_response def(*blocks: 'Any', stop_reason: 'Optional[str]' = None, usage: 'Optional[Dict[str, int]]' = None, stop_details: 'Optional[Dict[str, Any]]' = None) -> 'Dict[str, Any]'
+locum.llm.serve def(desktop: 'Any' = None, policy: 'Optional[Policy]' = None, stdin: 'Optional[TextIO]' = None, stdout: 'Optional[TextIO]' = None, *, audit: 'Optional[AuditLog]' = None) -> 'None'
+locum.llm.text_block def(text: 'str') -> 'Dict[str, Any]'
+locum.llm.thinking_block def(thinking: 'str' = '', signature: 'str' = 'sig') -> 'Dict[str, Any]'
+locum.llm.tool_use_block def(name: 'str', input: 'Optional[Dict[str, Any]]' = None, *, id: 'Optional[str]' = None, toolset_name: 'Optional[str]' = None) -> 'Dict[str, Any]'
+
+# locum.browser
+locum.browser.BROWSERS tuple
+locum.browser.Browser class(host: 'str', port: 'int', *, process: 'Any' = None, name: 'str' = '', profile: 'Optional[pathlib.Path]' = None) -> 'None'
+    .alive property
+    .app property
+    .attach(cls, port: 'Optional[int]' = None, host: 'str' = '127.0.0.1', *, allow_any: 'bool' = False) -> "'Browser'"
+    .close(self, *, quit: 'bool' = False) -> 'None'
+    .launch(cls, browser: 'str' = 'edge', *, url: 'Optional[str]' = None, profile_dir: 'Optional[str]' = None, headless: 'bool' = False, timeout: 'float' = 30.0, extra_args: 'Sequence[str]' = ()) -> "'Browser'"
+    .new_page(self, url: 'str' = 'about:blank') -> 'Page'
+    .page(self, match: 'Optional[str]' = None, timeout: 'float' = 5.0) -> 'Page'
+    .pages(self) -> 'List[PageInfo]'
+    .pid property
+locum.browser.CDPError exception(LocumError)
+locum.browser.Page class(info: 'PageInfo', browser: "'Browser'") -> 'None'
+    .call_js(self, fn_source: 'str', *args: 'Any', timeout: 'float' = 30.0) -> 'Any'
+    .click(self, target: 'Any') -> 'Dict[str, Any]'
+    .close(self) -> 'None'
+    .enter_target(self, target: 'Any' = None) -> 'Optional[Dict[str, Any]]'
+    .evaluate(self, expression: 'str', *, await_promise: 'bool' = True, timeout: 'float' = 30.0) -> 'Any'
+    .focused_is_password(self) -> 'bool'
+    .navigate(self, url: 'str', *, timeout: 'float' = 30.0) -> 'None'
+    .resolve(self, target: 'Any', *, scroll: 'bool' = True) -> 'Dict[str, Any]'
+    .screenshot_png(self) -> 'bytes'
+    .snapshot(self, max_elements: 'int' = 200) -> 'Dict[str, Any]'
+    .text(self, css: 'Optional[str]' = None, max_chars: 'int' = 20000) -> 'str'
+    .title property
+    .type(self, text: 'str', target: 'Any' = None, *, clear: 'bool' = False, submit: 'bool' = False) -> 'Optional[Dict[str, Any]]'
+    .url property
+    .wait_for(self, css: 'str', timeout: 'float' = 10.0) -> 'None'
+    .wait_ready(self, timeout: 'float' = 30.0) -> 'None'
+locum.browser.PageInfo class(id: 'str', title: 'str', url: 'str', ws_url: 'str') -> None
+locum.browser.discover_ports def(allow_any: 'bool' = False) -> 'List[int]'
+locum.browser.find_executable def(browser: 'str') -> 'Optional[str]'
+locum.browser.managed_profile_dir def(browser: 'str') -> 'pathlib.Path'
+
+# locum.trace
+locum.trace.DESKTOP_METHODS tuple
+locum.trace.ELEMENT_METHODS tuple
+locum.trace.MASK str
+locum.trace.TraceStep class(index: 'int', method: 'str', args: 'Dict[str, str]' = <factory>, started_at: 'float' = 0.0, duration: 'float' = 0.0, status: 'str' = 'passed', target: 'Dict[str, Any]' = <factory>, result: 'Optional[str]' = None, error: 'Optional[Dict[str, str]]' = None, annotations: 'List[Dict[str, Any]]' = <factory>, screenshot: 'Optional[str]' = None, screenshot_before: 'Optional[str]' = None, screen: 'Optional[List[int]]' = None, screenshot_error: 'Optional[str]' = None) -> None
+    .failed property
+    .title property
+    .to_dict(self, *, screenshots: 'bool' = True) -> 'Dict[str, Any]'
+locum.trace.Tracer class(desktop: 'Any', *, screenshots: 'Union[bool, str]' = True, before: 'bool' = False, max_width: 'int' = 1280, quality: 'int' = 80, redact: 'Sequence[str]' = (), log_level: 'int' = 20, title: 'Optional[str]' = None)
+    .active property
+    .capture_final(self) -> 'Optional[str]'
+    .failed property
+    .save(self, path: 'PathLike') -> 'str'
+    .save_html(self, path: 'PathLike') -> 'str'
+    .save_json(self, path: 'PathLike', *, screenshots: 'bool' = True) -> 'str'
+    .start(self) -> "'Tracer'"
+    .stop(self) -> "'Tracer'"
+    .to_dict(self, *, screenshots: 'bool' = True) -> 'Dict[str, Any]'
+    .to_html(self) -> 'str'
+    .to_json(self, *, indent: 'Optional[int]' = 2, screenshots: 'bool' = True) -> 'str'
+locum.trace.WINDOW_METHODS tuple
+locum.trace.trace def(desktop: 'Any', path: 'PathLike', **kw: 'Any') -> 'Iterator[Tracer]'
+
+# locum.heal
+locum.heal.DEFAULT_MARGIN float
+locum.heal.DEFAULT_THRESHOLD float
+locum.heal.Fingerprint class(role: 'str' = '', name: 'str' = '', automation_id: 'str' = '', class_name: 'str' = '', bounds: 'Optional[Rect]' = None, window: 'str' = '', app: 'str' = '') -> None
+    .coerce(cls, value: 'Any') -> "Optional['Fingerprint']"
+    .from_dict(cls, data: 'Mapping[str, Any]') -> "'Fingerprint'"
+    .from_element(cls, element: 'Any') -> "'Fingerprint'"
+    .from_node(cls, node: 'AccessibleNode', *, window: 'Optional[str]' = None) -> "'Fingerprint'"
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.heal.HealInfo class(old_selector: 'str', new_selector: 'str', score: 'float', runner_up: 'Optional[float]', changes: 'List[str]', old: 'Fingerprint', new: 'Fingerprint') -> None
+    .diff property
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.heal.HealOptions class(threshold: 'float' = 0.7, margin: 'float' = 0.1, max_nodes: 'int' = 20000, allow_partial: 'bool' = False) -> None
+locum.heal.HealOutcome class(node: 'Optional[AccessibleNode]' = None, info: 'Optional[HealInfo]' = None, reason: 'str' = '', candidates: 'List[Tuple[float, str]]' = <factory>, truncated: 'bool' = False) -> None
+locum.heal.heal def(selector: 'Any', roots: 'Union[AccessibleNode, Sequence[AccessibleNode]]', *, fingerprint: 'Any' = None, options: 'Optional[HealOptions]' = None, include_roots: 'bool' = True, selector_text: 'Optional[str]' = None, selector_root: 'Optional[AccessibleNode]' = None, selector_roots: 'Optional[Sequence[AccessibleNode]]' = None, max_depth: 'int' = 64, log: 'bool' = True) -> 'HealOutcome'
+locum.heal.is_suppressed def() -> 'bool'
+locum.heal.log_heal def(info: 'HealInfo') -> 'None'
+locum.heal.logger Logger
+locum.heal.name_similarity def(a: 'str', b: 'str', *, partial: 'bool' = False) -> 'float'
+locum.heal.suppressed def() -> 'Iterator[None]'
+
+# locum.a11y
+locum.a11y.AuditReport class(findings: 'List[Finding]' = <factory>, windows: 'List[str]' = <factory>, nodes: 'int' = 0, elapsed: 'float' = 0.0, truncated: 'bool' = False, notes: 'List[str]' = <factory>, min_target_size: 'int' = 24) -> None
+    .at_least(self, severity: 'str') -> 'List[Finding]'
+    .counts(self) -> 'Dict[str, int]'
+    .failed(self, fail_on: 'str' = 'error') -> 'bool'
+    .format_text(self) -> 'str'
+    .summary(self) -> 'str'
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.a11y.DEFAULT_MIN_TARGET_SIZE int
+locum.a11y.Finding class(rule: 'str', severity: 'str', message: 'str', element: 'str', selector: 'Optional[str]' = None, bounds: 'Optional[Rect]' = None, role: 'str' = '', name: 'str' = '', window: 'str' = '') -> None
+    .to_dict(self) -> 'Dict[str, Any]'
+locum.a11y.RULES dict
+locum.a11y.SEVERITIES tuple
+locum.a11y.audit def(desktop: 'Any' = None, window: 'Any' = None, *, max_depth: 'int' = 32, time_budget: 'Optional[float]' = 30.0, min_target_size: 'int' = 24, max_nodes: 'int' = 20000, selectors: 'bool' = True, rules: 'Optional[Iterable[str]]' = None, clock: 'Callable[[], float]' = <built-in function monotonic>) -> 'AuditReport'
+
+# locum.compat.pyautogui
+locum.compat.pyautogui.Box class(left, top, width, height)
+locum.compat.pyautogui.DARWIN_CATCH_UP_TIME float
+locum.compat.pyautogui.FAILSAFE bool
+locum.compat.pyautogui.FAILSAFE_POINTS list
+locum.compat.pyautogui.FailSafeException exception(LocumError)
+locum.compat.pyautogui.ImageNotFoundException exception(LocumError, LookupError)
+locum.compat.pyautogui.KEYBOARD_KEYS list
+locum.compat.pyautogui.KEY_NAMES list
+locum.compat.pyautogui.LEFT str
+locum.compat.pyautogui.LOG_SCREENSHOTS bool
+locum.compat.pyautogui.MIDDLE str
+locum.compat.pyautogui.MINIMUM_DURATION float
+locum.compat.pyautogui.MINIMUM_SLEEP float
+locum.compat.pyautogui.PAUSE float
+locum.compat.pyautogui.PRIMARY str
+locum.compat.pyautogui.Point class(x, y)
+locum.compat.pyautogui.PyAutoGUIException exception(Exception)
+locum.compat.pyautogui.QWERTY str
+locum.compat.pyautogui.QWERTZ str
+locum.compat.pyautogui.RIGHT str
+locum.compat.pyautogui.SECONDARY str
+locum.compat.pyautogui.Size class(width, height)
+locum.compat.pyautogui.USE_IMAGE_NOT_FOUND_EXCEPTION bool
+locum.compat.pyautogui.center def(coords: 'Sequence[int]') -> 'Point'
+locum.compat.pyautogui.click def(x: 'Any' = None, y: 'Any' = None, clicks: 'int' = 1, interval: 'float' = 0.0, button: 'str' = 'primary', duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.countdown def(seconds: 'int') -> 'None'
+locum.compat.pyautogui.doubleClick def(x: 'Any' = None, y: 'Any' = None, interval: 'float' = 0.0, button: 'str' = 'left', duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.drag def(xOffset: 'Any' = 0, yOffset: 'Any' = 0, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, button: 'str' = 'primary', logScreenshot: 'Any' = None, _pause: 'bool' = True, mouseDownUp: 'bool' = True) -> 'None'
+locum.compat.pyautogui.dragRel def(xOffset: 'Any' = 0, yOffset: 'Any' = 0, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, button: 'str' = 'primary', logScreenshot: 'Any' = None, _pause: 'bool' = True, mouseDownUp: 'bool' = True) -> 'None'
+locum.compat.pyautogui.dragTo def(x: 'Any' = None, y: 'Any' = None, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, button: 'str' = 'primary', logScreenshot: 'Any' = None, _pause: 'bool' = True, mouseDownUp: 'bool' = True) -> 'None'
+locum.compat.pyautogui.easeInBack def(n: 'float', s: 'float' = 1.70158) -> 'float'
+locum.compat.pyautogui.easeInBounce def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInCirc def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInCubic def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInElastic def(n: 'float', amplitude: 'float' = 1, period: 'float' = 0.3) -> 'float'
+locum.compat.pyautogui.easeInExpo def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutBack def(n: 'float', s: 'float' = 1.70158) -> 'float'
+locum.compat.pyautogui.easeInOutBounce def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutCirc def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutCubic def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutElastic def(n: 'float', amplitude: 'float' = 1, period: 'float' = 0.5) -> 'float'
+locum.compat.pyautogui.easeInOutExpo def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutQuad def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutQuart def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutQuint def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInOutSine def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInQuad def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInQuart def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInQuint def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeInSine def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutBack def(n: 'float', s: 'float' = 1.70158) -> 'float'
+locum.compat.pyautogui.easeOutBounce def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutCirc def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutCubic def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutElastic def(n: 'float', amplitude: 'float' = 1, period: 'float' = 0.3) -> 'float'
+locum.compat.pyautogui.easeOutExpo def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutQuad def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutQuart def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutQuint def(n: 'float') -> 'float'
+locum.compat.pyautogui.easeOutSine def(n: 'float') -> 'float'
+locum.compat.pyautogui.failSafeCheck def() -> 'None'
+locum.compat.pyautogui.getActiveWindow def() -> 'Optional[Win]'
+locum.compat.pyautogui.getActiveWindowTitle def() -> 'Optional[str]'
+locum.compat.pyautogui.getAllTitles def() -> 'List[str]'
+locum.compat.pyautogui.getAllWindows def() -> 'List[Win]'
+locum.compat.pyautogui.getPointOnLine def(x1: 'float', y1: 'float', x2: 'float', y2: 'float', n: 'float') -> 'tuple'
+locum.compat.pyautogui.getWindowsAt def(x: 'int', y: 'int') -> 'List[Win]'
+locum.compat.pyautogui.getWindowsWithTitle def(title: 'str') -> 'List[Win]'
+locum.compat.pyautogui.get_desktop def() -> 'Any'
+locum.compat.pyautogui.hold def(keys: 'Union[str, Sequence[str]]', logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'Iterator[None]'
+locum.compat.pyautogui.hotkey def(*args: 'Any', **kwargs: 'Any') -> 'None'
+locum.compat.pyautogui.hscroll def(clicks: 'float', x: 'Any' = None, y: 'Any' = None, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.isShiftCharacter def(character: 'str') -> 'bool'
+locum.compat.pyautogui.isValidKey def(key: 'str') -> 'bool'
+locum.compat.pyautogui.keyDown def(key: 'str', logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.keyUp def(key: 'str', logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.leftClick def(x: 'Any' = None, y: 'Any' = None, interval: 'float' = 0.0, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.linear def(n: 'float') -> 'float'
+locum.compat.pyautogui.locate def(needleImage: 'Any', haystackImage: 'Any', **kwargs: 'Any') -> 'Optional[Box]'
+locum.compat.pyautogui.locateAll def(needleImage: 'Any', haystackImage: 'Any', **kwargs: 'Any') -> 'Generator[Box, None, None]'
+locum.compat.pyautogui.locateAllOnScreen def(image: 'Any', **kwargs: 'Any') -> 'Generator[Box, None, None]'
+locum.compat.pyautogui.locateCenterOnScreen def(image: 'Any', *, minSearchTime: 'float' = 0, **kwargs: 'Any') -> 'Optional[Point]'
+locum.compat.pyautogui.locateOnScreen def(image: 'Any', minSearchTime: 'float' = 0, **kwargs: 'Any') -> 'Optional[Box]'
+locum.compat.pyautogui.locateOnWindow def(image: 'Any', title: 'str', **kwargs: 'Any') -> 'Optional[Box]'
+locum.compat.pyautogui.middleClick def(x: 'Any' = None, y: 'Any' = None, interval: 'float' = 0.0, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.mouseDown def(x: 'Any' = None, y: 'Any' = None, button: 'str' = 'primary', duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.mouseUp def(x: 'Any' = None, y: 'Any' = None, button: 'str' = 'primary', duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.move def(xOffset: 'Any' = None, yOffset: 'Any' = None, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'bool' = False, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.moveRel def(xOffset: 'Any' = None, yOffset: 'Any' = None, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'bool' = False, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.moveTo def(x: 'Any' = None, y: 'Any' = None, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'bool' = False, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.onScreen def(x: 'Any', y: 'Any' = None) -> 'bool'
+locum.compat.pyautogui.pixel def(x: 'Any', y: 'Any' = None) -> 'tuple'
+locum.compat.pyautogui.pixelMatchesColor def(x: 'int', y: 'int', expectedRGBColor: 'Sequence[int]', tolerance: 'int' = 0) -> 'bool'
+locum.compat.pyautogui.position def(x: 'Optional[float]' = None, y: 'Optional[float]' = None) -> 'Point'
+locum.compat.pyautogui.press def(keys: 'Union[str, Sequence[str]]', presses: 'int' = 1, interval: 'float' = 0.0, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.resolution def() -> 'Size'
+locum.compat.pyautogui.rightClick def(x: 'Any' = None, y: 'Any' = None, interval: 'float' = 0.0, duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.screenshot def(imageFilename: 'Optional[str]' = None, region: 'Optional[Sequence[int]]' = None, allScreens: 'bool' = False) -> 'Any'
+locum.compat.pyautogui.scroll def(clicks: 'float', x: 'Any' = None, y: 'Any' = None, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.set_desktop def(desktop: 'Any') -> 'Any'
+locum.compat.pyautogui.size def() -> 'Size'
+locum.compat.pyautogui.sleep def(seconds: 'float') -> 'None'
+locum.compat.pyautogui.tripleClick def(x: 'Any' = None, y: 'Any' = None, interval: 'float' = 0.0, button: 'str' = 'left', duration: 'float' = 0.0, tween: 'Callable[[float], float]' = <function linear>, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.typewrite def(message: 'Union[str, Sequence[str]]', interval: 'float' = 0.0, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.useImageNotFoundException def(value: 'Optional[bool]' = None) -> 'None'
+locum.compat.pyautogui.vscroll def(clicks: 'float', x: 'Any' = None, y: 'Any' = None, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'
+locum.compat.pyautogui.write def(message: 'Union[str, Sequence[str]]', interval: 'float' = 0.0, logScreenshot: 'Any' = None, _pause: 'bool' = True) -> 'None'

@@ -162,6 +162,15 @@ jobs:
             .venv/bin/python -m locum.selftest --yes --strict --retries 2 --out selftest-report
           '
 
+      - name: PROBE atspi
+        if: always()
+        run: |
+          dbus-run-session -- bash -c '
+            Xvfb :98 -screen 0 1280x800x24 -nolisten tcp &
+            export DISPLAY=:98; sleep 1; openbox & /usr/libexec/at-spi-bus-launcher --launch-immediately &
+            export GTK_MODULES=gail:atk-bridge NO_AT_BRIDGE=0; sleep 2
+            .venv/bin/python probe_atspi.py'
+
       - name: Upload self-test report
         if: always()
         uses: actions/upload-artifact@v4
