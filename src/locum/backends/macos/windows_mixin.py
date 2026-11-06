@@ -415,6 +415,8 @@ class _WindowsMixin:
         ax.set_point(win, "AXPosition", x, y)  # size changes can be constrained by the screen edge
         if not ok:
             raise BackendError(f"The application refused to move/resize window {handle!r}")
+        # an explicit placement leaves the maximized state: 'normal' must not undo it
+        self._restore_rects.pop(handle, None)
 
     def set_window_state(self, handle: Any, state: str) -> None:
         ax = self._require_ax()

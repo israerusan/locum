@@ -212,14 +212,46 @@ def _json_type_schema(tp: Any) -> Tuple[Dict[str, Any], bool]:
     return {}, False
 
 
+def _param_hints(fn: Callable[..., Any], sig: Optional[inspect.Signature] = None) -> Dict[str, Any]:
+    """Resolved type hints of ``fn``'s parameters.
+
+    If the hints cannot all be resolved at once (e.g. a return type imported only
+    under ``TYPE_CHECKING``), each parameter is resolved on its own so one bad
+    annotation does not drop the types of all the others.
+    """
+    try:
+        return typing.get_type_hints(fn)
+    except Exception:
+        pass
+    sig = sig if sig is not None else _signature(fn)
+    globalns = getattr(inspect.unwrap(fn), "__globals__", None)
+    if not isinstance(globalns, dict):
+        globalns = getattr(getattr(inspect.unwrap(fn), "__call__", None), "__globals__", None)
+    hints: Dict[str, Any] = {}
+    for pname, param in sig.parameters.items():
+        ann = param.annotation
+        if ann is inspect.Parameter.empty:
+            continue
+        if not isinstance(ann, str):
+            hints[pname] = ann
+            continue
+
+        def _stub() -> None:  # pragma: no cover - never called
+            pass
+
+        _stub.__annotations__ = {pname: ann}
+        try:
+            hints[pname] = typing.get_type_hints(_stub, globalns=dict(globalns or {}))[pname]
+        except Exception:
+            continue
+    return hints
+
+
 def schema_from_function(fn: Callable[..., Any]) -> Tuple[str, Dict[str, Any]]:
     """``(description, JSON schema)`` for ``fn``'s parameters (type hints + docstring)."""
     description, arg_docs = parse_docstring(inspect.getdoc(fn))
     sig = inspect.signature(fn)
-    try:
-        hints = typing.get_type_hints(fn)
-    except Exception:
-        hints = {}
+    hints = _param_hints(fn, sig)
     props: Dict[str, Any] = {}
     required: List[str] = []
     for pname, param in sig.parameters.items():
@@ -297,8 +329,11 @@ def _coerce(value: Any, schema: Dict[str, Any]) -> Any:
 
 def _type_ok(value: Any, schema: Dict[str, Any]) -> bool:
     t = schema.get("type")
-    if value is None or not t:
+    if value is None:
         return True
+    if not t:
+        # No type (an Enum, or a Literal of floats/bools/mixed values): still check membership.
+        return "enum" not in schema or value in schema["enum"]
     checks = {
         "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
         "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
@@ -474,6 +509,16 @@ class ToolRegistry:
                 expected = schema.get("enum") or schema.get("type")
                 return ToolResult.error(f"Argument {k!r} of {name} must be {expected}, got {v!r}")
             call_args[k] = cv
+        enums = _enum_params(spec.fn) if call_args else {}
+        for k, cls in enums.items():
+            v = call_args.get(k)
+            if v is not None and not isinstance(v, cls):
+                try:
+                    call_args[k] = cls(v)  # the function gets Color.RED, not the raw "red"
+                except (ValueError, TypeError):
+                    return ToolResult.error(
+                        f"Argument {k!r} of {name} must be one of {[m.value for m in cls]}, got {v!r}"
+                    )
         try:
             return _to_result(spec.fn(**call_args))
         except FailSafeTriggered:
@@ -496,6 +541,24 @@ class ToolRegistry:
 
     def __repr__(self) -> str:
         return f"<ToolRegistry {self.names()}>"
+
+
+def _enum_params(fn: Callable[..., Any]) -> Dict[str, Any]:
+    """``{parameter: Enum class}`` for ``fn``'s ``Enum`` (or ``Optional[Enum]``) parameters."""
+    try:
+        hints = _param_hints(fn)
+    except Exception:
+        return {}
+    out: Dict[str, Any] = {}
+    for pname, tp in hints.items():
+        if pname == "return":
+            continue
+        if typing.get_origin(tp) in _UNION_TYPES:
+            non_none = [a for a in typing.get_args(tp) if a is not _NONE_TYPE]
+            tp = non_none[0] if len(non_none) == 1 else None
+        if isinstance(tp, type) and issubclass(tp, enum.Enum):
+            out[pname] = tp
+    return out
 
 
 def _signature(fn: Callable[..., Any]) -> inspect.Signature:
@@ -869,7 +932,15 @@ class DesktopToolkit:
 
     def _ensure_observation(self) -> Observation:
         if self.last_observation is None:
-            self.last_observation = self._mapping()
+            obs = self._mapping()
+            # Elements added later (find_elements / wait_for before any observe) must get
+            # selectors proven unique across every window, not just their own one.
+            try:
+                obs._roots = list(self.desktop.backend.accessibility_roots()) or None
+            except Exception:
+                obs._roots = None
+            obs._prefix_cache = []
+            self.last_observation = obs
         return self.last_observation
 
     def _screen_point(self, x: Any, y: Any) -> Point:
@@ -1386,6 +1457,20 @@ class DesktopToolkit:
         description = f"type {shown!r}{where}" + (" (replacing its content)" if clear else "") + (" and press Enter" if press_enter else "")
         args = {"text": text, "element_id": element_id, "selector": selector, "clear": clear, "press_enter": press_enter}
 
+        def now_secret() -> None:
+            # Text after a Tab may land in a password field: from then on the call is secret.
+            nonlocal secret, shown
+            if secret:
+                return
+            try:
+                node = self.desktop.backend.focused_element()
+                pw = node is not None and is_password(node)
+            except Exception:
+                pw = False
+            if pw:
+                secret, shown = True, _REDACTED
+                self._redact("text")
+
         def run() -> str:
             # Text after a Tab/newline may land in another control: each such piece
             # (and the final Enter) is checked against the element focused by then.
@@ -1405,11 +1490,13 @@ class DesktopToolkit:
                 if pieces:
                     self.desktop.type(pieces[0])
             for piece in pieces[1:]:
+                now_secret()
                 self._recheck_focus("type_text", args, True, f"type {_REDACTED if secret else piece!r} (part of {shown!r})",
                                     enter=_has_newline(piece), activating=typed_text_activates(piece))
                 self.desktop.type(piece)
             if press_enter:
                 if keys_in_text:
+                    now_secret()
                     self._recheck_focus("type_text", args, True, f"press Enter after typing {shown!r}", enter=True)
                 self.desktop.press("enter")
             value = ""

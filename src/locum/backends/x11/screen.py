@@ -64,7 +64,7 @@ class _ScreenMixin:
             if not raw:
                 w, h = self._screen_size()
                 raw = [(Rect(0, 0, w, h), True, f"screen{self._d.get_default_screen()}")]
-        raw.sort(key=lambda m: (not m[1], m[0].top, m[0].left))
+        raw.sort(key=lambda m: (not m[1], m[0].left, m[0].top))
         return [Monitor(i, rect, scale, i == 0, name) for i, (rect, _, name) in enumerate(raw)]
 
     def _randr_monitors(self) -> List[Tuple[Rect, bool, str]]:

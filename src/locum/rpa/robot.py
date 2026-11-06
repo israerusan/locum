@@ -928,16 +928,22 @@ class Robot:
             report.aborted = True
             report.error = report.error or f"{type(exc).__name__}: {_exc_text(exc)}"
             self.finish(save=save)
+            if isinstance(exc, FailSafeTriggered):  # like a fail-safe in a task: aborted, returned
+                return report
             raise
         return self.finish(save=save)
 
     def _run_teardown(self) -> None:
+        pending: Optional[BaseException] = None
         for hook in self._teardown:
             hook_name = f"teardown:{getattr(hook, '__name__', 'teardown')}"
             try:
                 self._run_callable(hook_name, "teardown", self._caller(hook))
-            except (FailSafeTriggered, KeyboardInterrupt):  # still run the other hooks
-                continue
+            except (FailSafeTriggered, KeyboardInterrupt) as exc:  # still run the other hooks...
+                if pending is None:
+                    pending = exc
+        if pending is not None:  # ...then let the interrupt / fail-safe abort the run
+            raise pending
 
     def _caller(self, fn: Callable[..., Any], pass_robot: Optional[bool] = None) -> Callable[[], Any]:
         want = _wants_argument(fn) if pass_robot is None else pass_robot

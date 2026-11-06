@@ -910,6 +910,21 @@ def _pair_arrays(a: ImageSource, b: ImageSource) -> Optional[Tuple[np.ndarray, n
     return _rgb_array(ia).astype(np.int16), _rgb_array(ib).astype(np.int16)
 
 
+def _tile_axis(n: int, t: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Half-overlapping windows of ``t`` along an axis of length ``n``.
+
+    Returns ``(bounds, first, last)``: the strip boundaries (``0 .. n``) and,
+    for each window, the indices into ``bounds`` of its start and (clipped) end.
+    Windows are exactly ``t`` long (odd ``t`` included), stride ``t // 2``.
+    """
+    s = max(1, t // 2)
+    g = max(1, -(-(n - t) // s) + 1)
+    starts = np.arange(g, dtype=np.int64) * s
+    ends = np.minimum(starts + t, n)
+    bounds = np.unique(np.concatenate((starts, ends)))
+    return bounds, np.searchsorted(bounds, starts), np.searchsorted(bounds, ends)
+
+
 def _max_tile_mean(m: np.ndarray, tile: int) -> float:
     """Largest mean of ``m`` (2-D) over ``tile`` x ``tile`` windows on a half-overlapping grid.
 
@@ -919,16 +934,12 @@ def _max_tile_mean(m: np.ndarray, tile: int) -> float:
     """
     h, w = m.shape
     th, tw = min(int(tile), h), min(int(tile), w)
-    ch, cw = max(1, th // 2), max(1, tw // 2)  # cells: two per window side
-    ph, pw = -h % ch, -w % cw
-    if ph or pw:
-        m = np.pad(m, ((0, ph), (0, pw)))
-    cells = m.reshape(m.shape[0] // ch, ch, m.shape[1] // cw, cw).sum(axis=(1, 3), dtype=np.float64)
-    ny, nx = (th + ch - 1) // ch, (tw + cw - 1) // cw  # cells per window (1 or 2, 3 if odd)
+    by, y0, y1 = _tile_axis(h, th)
+    bx, x0, x1 = _tile_axis(w, tw)
+    # sum the strips between window boundaries, then each window is a block of strips
+    cells = np.add.reduceat(np.add.reduceat(m, by[:-1], axis=0, dtype=np.int64), bx[:-1], axis=1, dtype=np.int64)
     ii = _integral(cells)
-    gy, gx = max(1, cells.shape[0] - ny + 1), max(1, cells.shape[1] - nx + 1)
-    ny, nx = min(ny, cells.shape[0]), min(nx, cells.shape[1])
-    sums = ii[ny : ny + gy, nx : nx + gx] - ii[:gy, nx : nx + gx] - ii[ny : ny + gy, :gx] + ii[:gy, :gx]
+    sums = ii[np.ix_(y1, x1)] - ii[np.ix_(y0, x1)] - ii[np.ix_(y1, x0)] + ii[np.ix_(y0, x0)]
     return float(sums.max() / (th * tw))
 
 

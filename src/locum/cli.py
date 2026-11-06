@@ -432,7 +432,7 @@ def _unescape(text: str) -> str:
 
     def sub(m: "re.Match[str]") -> str:
         tok = m.group(1)
-        if tok[0] == "u":
+        if len(tok) == 5 and tok[0] == "u":  # a full \uXXXX; a lone \u is kept as-is
             return chr(int(tok[1:], 16))
         return _ESCAPES.get(tok, "\\" + tok)
 

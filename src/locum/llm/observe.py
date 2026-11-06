@@ -214,6 +214,10 @@ class Observation:
     scale: float
     annotated: Optional["Image"]
     region: Rect = field(default_factory=lambda: Rect(0, 0, 0, 0))
+    # Desktop roots and prefix cache from observe(): selectors built later (add_element,
+    # refresh) are proven unique among all windows, not only inside their own.
+    _roots: Optional[List[AccessibleNode]] = field(default=None, init=False, repr=False, compare=False)
+    _prefix_cache: Optional[List[Any]] = field(default=None, init=False, repr=False, compare=False)
 
     # ----------------------------------------------------------------- mapping
     @property
@@ -275,7 +279,7 @@ class Observation:
         (a calculator display still reading "0" after the result came in)."""
         for el in self.elements:
             if _same(el.node, node):
-                _refresh(el, node)
+                _refresh(el, node, self._roots, self._prefix_cache)
                 return el
         b = _safe(lambda: node.bounds)
         next_id = max((e.id for e in self.elements), default=0) + 1
@@ -288,7 +292,8 @@ class Observation:
             states=frozenset(_safe(lambda: node.states, frozenset()) or ()),
             selector=selector or LAZY_SELECTOR,
             node=node,
-            _selector_source=None if selector else (lambda n=node: _selector(n)),
+            _selector_source=None if selector else (
+                lambda n=node, r=self._roots, c=self._prefix_cache: _selector(n, r, c)),
         )
         self.elements.append(entry)
         return entry
@@ -391,7 +396,9 @@ def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
         return False
 
 
-def _refresh(el: ObservedElement, node: AccessibleNode) -> None:
+def _refresh(el: ObservedElement, node: AccessibleNode,
+             roots: Optional[Sequence[AccessibleNode]] = None,
+             prefix_cache: Optional[List[Any]] = None) -> None:
     """Update ``el``'s description fields from the live ``node`` (id unchanged).
 
     A field that can no longer be read keeps its old value. When the name changes, a
@@ -403,12 +410,15 @@ def _refresh(el: ObservedElement, node: AccessibleNode) -> None:
     name = _safe(lambda: node.name, missing)
     if name is not missing:
         name = name or ""
-        if name != el.name and el.selector_ready:
+        # An empty selector without a source was asked for (observe(selectors=False)): keep it.
+        if name != el.name and el.selector_ready and (el.selector or el._selector_source is not None):
             del el.__dict__["selector"]
             if el._selector_source is None:
-                el._selector_source = lambda n=node: _selector(n)
+                el._selector_source = lambda n=node, r=roots, c=prefix_cache: _selector(n, r, c)
         el.name = name
-    el.value = _node_value(node)
+    raw = _safe(lambda: node.value, missing)
+    if raw is not missing:
+        el.value = "***" if raw not in (None, "") and is_password(node) else raw
     b = _safe(lambda: node.bounds)
     if b is not None:
         el.bounds = b
@@ -509,6 +519,8 @@ def observe(
         roots: List[AccessibleNode] = list(backend.accessibility_roots())
     except NotSupported:
         roots = []
+    # Selectors are always proven unique among *all* windows, even when only one is observed.
+    all_roots: Optional[List[AccessibleNode]] = list(roots) or None
     if target_window is not None:
         try:
             roots = [target_window.element.node]
@@ -566,8 +578,7 @@ def observe(
                     node=node,
                     window_title=win_title,
                     app=app,
-                    _selector_source=(lambda n=node, r=(roots if target_window is None else None):
-                                      _selector(n, r, prefix_cache))
+                    _selector_source=(lambda n=node, r=all_roots: _selector(n, r, prefix_cache))
                     if selectors else None,
                 )
             )
@@ -575,9 +586,10 @@ def observe(
     # ---------------------------------------------------------------- screenshot
     shot = None
     annotated_img = None
-    tw, th = fit_image_size(region.width, region.height, max_long_edge, max_visual_tokens)
-    scale = tw / float(region.width) if (screenshot and region.width) else 1.0
+    scale = 1.0
     if screenshot:
+        tw, th = fit_image_size(region.width, region.height, max_long_edge, max_visual_tokens)
+        scale = tw / float(region.width) if region.width else 1.0
         raw = desktop.screenshot(region)
         if raw.size != (tw, th):
             from PIL import Image as _PILImage
@@ -591,7 +603,7 @@ def observe(
 
             boxes = [(el.bounds, str(el.id)) for el in elements if not el.occluded]
             annotated_img = _annotate(shot, boxes, color=None, offset=(region.left, region.top), scale=scale) if boxes else shot.copy()
-    return Observation(
+    obs = Observation(
         screenshot=shot,
         elements=elements,
         windows=all_windows,
@@ -602,6 +614,9 @@ def observe(
         annotated=annotated_img,
         region=region,
     )
+    obs._roots = all_roots
+    obs._prefix_cache = prefix_cache
+    return obs
 
 
 __all__ = [

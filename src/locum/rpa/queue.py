@@ -1488,7 +1488,11 @@ class WorkQueue:
         return str(target)
 
     def export_csv(self, path: PathLike, *, encoding: str = "utf-8") -> str:
-        """Write a flat CSV report: id, reference, status, attempts, error, payload and output fields."""
+        """Write a flat CSV report: id, reference, status, attempts, error, payload and output fields.
+
+        Output fields are ``output.<k>`` columns; a payload field whose name is already a
+        column (``status``, ``id``, ``error``...) is written as ``payload.<k>``.
+        """
         with self._lock:
             items = list(self._items)
         payload_keys: List[str] = []
@@ -1505,7 +1509,12 @@ class WorkQueue:
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "w", encoding=encoding, newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(base + payload_keys + output_keys)
+            # A payload field named like a fixed column (status, id, error...) or an output.*
+            # column is written as payload.<k>: duplicate headers make DictReader / pandas
+            # read the payload value in place of the queue's own column.
+            taken = set(base) | set(output_keys)
+            payload_headers = [f"payload.{k}" if str(k) in taken else k for k in payload_keys]
+            w.writerow(base + payload_headers + output_keys)
             for it in items:
                 row = [it.id, it.reference or "", it.status, it.attempts, it.error_type or "", it.error or ""]
                 row += [_cell(it.payload.get(k, "")) for k in payload_keys]

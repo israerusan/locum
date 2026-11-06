@@ -284,14 +284,19 @@ class Keyboard:
         self._check()
         if mode == "auto" and self.backend.has(CAP_UNICODE_TYPING):
             units = self._units(text, "unicode", interval)
+            # Probe with the first text unit; leading Enter/Tab taps go first and are
+            # the same in both modes, so a fallback must not repeat them.
+            k = next((i for i, u in enumerate(units) if u[0] == "text"), len(units))
+            if k:
+                self._run_units(units[:k], interval, first=True)
             try:
-                self._run_units(units[:1], interval, first=True)
+                self._run_units(units[k : k + 1], interval, first=not k)
             except NotSupported:
                 # Backend advertised unicode typing but cannot do it right now: fall back.
-                units = self._units(text, "fallback", interval)
-                self._run_units(units, interval, first=True)
+                units = self._units(text, "fallback", interval)[k:]
+                self._run_units(units, interval, first=not k)
             else:
-                self._run_units(units[1:], interval, first=False)
+                self._run_units(units[k + 1 :], interval, first=False)
         else:
             self._run_units(self._units(text, "fallback" if mode == "auto" else mode, interval), interval, first=True)
         self._pause()

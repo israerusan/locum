@@ -7,6 +7,7 @@ user spelling variations like ``"Ctrl"``, ``"control"``, ``"⌘"`` or ``"Return"
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any, Iterable, List, Sequence, Union
 
@@ -89,7 +90,14 @@ def normalize_key(key: str) -> str:
         return _ALIASES[key]
     if len(key) == 1:
         return key
-    k = key.strip().lower().replace("-", "_").replace(" ", "")
+    ks = key.strip().lower()
+    if any(c.isspace() for c in ks):  # "Num Add" / "Browser Back": a space separates words like "_"
+        ku = re.sub(r"\s+", "_", ks).replace("-", "_")
+        if ku in KEYS:
+            return ku
+        if ku in _ALIASES:
+            return _ALIASES[ku]
+    k = ks.replace("-", "_").replace(" ", "")
     if k.startswith("_") or k.endswith("_"):
         # "shift-" / "ctrl_" are not key names; never silently drop the dash
         raise ValueError(f"Unknown key name: {key!r}")

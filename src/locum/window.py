@@ -98,12 +98,18 @@ def _desktop_clock(desktop: Any) -> Callable[[], float]:
 
 
 def _desktop_interval(desktop: Any, default: float = 0.1) -> float:
-    """The desktop's ``poll_interval`` (seconds between polls)."""
+    """The desktop's ``poll_interval`` (seconds between polls).
+
+    ``poll_interval=0`` maps to a short positive pause: a zero interval would
+    busy-spin the wait (and never advance an injected test clock).
+    """
     try:
         v = float(getattr(desktop, "poll_interval", default))
     except (TypeError, ValueError):
         return default
-    return v if v >= 0 else default
+    if v == 0:
+        return 0.05
+    return v if v > 0 else default
 
 
 def _default_timeout(desktop: Any, timeout: Optional[float]) -> float:
@@ -263,16 +269,20 @@ class Window:
         return self._after()
 
     def move(self, x: int, y: int) -> "Window":
-        r = self.rect
+        r = self._after().rect  # current size, not the (possibly stale) snapshot's
         return self.set_rect(Rect(int(x), int(y), r.width, r.height))
 
     def resize(self, width: int, height: int) -> "Window":
-        r = self.rect
+        r = self._after().rect  # current position, not the (possibly stale) snapshot's
         return self.set_rect(Rect(r.left, r.top, int(width), int(height)))
 
     def screenshot(self) -> "Image":
-        """Capture the window's rectangle (clipped to the virtual screen)."""
-        self._after()
+        """Capture the window's rectangle (clipped to the virtual screen).
+
+        Raises :class:`WindowNotFound` if the window no longer exists (rather
+        than capturing whatever is now under its old rectangle).
+        """
+        self.refresh()
         if self.is_minimized:
             raise NotSupported(f"Window {self.title!r} is minimized; restore it before taking a screenshot")
         r = self.rect
@@ -288,7 +298,9 @@ class Window:
     def wait_closed(self, timeout: Optional[float] = 10) -> bool:
         """Wait until the window disappears. Returns True; raises :class:`ActionTimeout` otherwise."""
         wait_until(
-            lambda: not self.exists,
+            # _lookup (not the error-swallowing ``exists``) so transient backend
+            # errors are retried and fatal ones propagate instead of reading as "closed".
+            lambda: self._lookup() is None,
             _default_timeout(self.desktop, timeout),
             _desktop_interval(self.desktop),
             message=f"Window {self.title!r} still open after {timeout}s",

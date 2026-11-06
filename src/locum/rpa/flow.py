@@ -37,7 +37,8 @@ Step types (shorthand scalar form -> the key in brackets):
   ``drag`` {start, end, duration, button}, ``scroll`` [dy] {dy, dx, at}
 * keyboard: ``type`` [text] {text, into, interval, mode}, ``press`` [keys]
   {keys, presses, interval}, ``hotkey`` [keys] (``"ctrl+s"`` or a list)
-* elements: ``set_text`` {target, text, native, clear}, ``invoke``/``toggle``/
+* elements: ``set_text`` {target, text, native, clear} (an ``"x,y"`` target clicks
+  there, selects all and types), ``invoke``/``toggle``/
   ``select``/``expand``/``collapse``/``check``/``uncheck`` [target] (native
   accessibility action with click/keyboard fallback), ``wait`` [target]
   {target, state, timeout}, ``wait_gone`` [target], ``assert_exists`` [target]
@@ -608,6 +609,8 @@ def _validate_control(kind: str, value: Any, where: str, problems: List[str]) ->
             problems.append(f"{where}.on_error: must be 'stop' or 'continue'")
         if "as" in value and not (isinstance(value["as"], str) and value["as"].isidentifier()):
             problems.append(f"{where}.as: must be a variable name")
+        elif value.get("as") == "loop":
+            problems.append(f"{where}.as: 'loop' is reserved for the loop state; choose another name")
     elif kind == "try":
         if "steps" not in value:
             problems.append(f"{where}: missing 'steps' list")
@@ -620,6 +623,8 @@ def _validate_control(kind: str, value: Any, where: str, problems: List[str]) ->
             problems.append(f"{where}.times: must be an integer (or a ${{variable}})")
         if "steps" not in value:
             problems.append(f"{where}: missing 'steps' list")
+        if value.get("as") == "loop":
+            problems.append(f"{where}.as: 'loop' is reserved for the loop state; choose another name")
     for key in _NESTED_KEYS[kind]:
         if key in value and value[key] is not None:
             _validate_steps(value[key], f"{where}.{key}", problems)
@@ -881,6 +886,15 @@ class FlowRunner:
             d.hotkey(*keys)
             return None
         if kind == "set_text":
+            pt = self._point(args["target"])
+            if pt is not None:
+                # A point target (what the recorder writes for a field it found no selector for):
+                # the same typing path as Element.set_text's fallback -- click, select all, type.
+                d.click(pt)
+                if _bool_arg(args.get("clear", True), "set_text.clear"):
+                    d.hotkey("mod+a")
+                d.type(_to_text(args.get("text")))
+                return None
             el = self._element(args["target"], self._timeout(args, step, scope))
             native = args.get("native", "auto")
             el.set_text(_to_text(args.get("text")), native=native, clear=_bool_arg(args.get("clear", True), "set_text.clear"))
@@ -1128,6 +1142,8 @@ class FlowRunner:
 
     def _loop(self, items: List[Any], name: Optional[str], steps: List[Any], path: str, depth: int, scope: _Scope,
               label: str, *, on_error: str) -> None:
+        if name == "loop":
+            raise WorkflowError(f"{label}.as: 'loop' is reserved for the loop state; choose another name")
         sentinel = object()
         saved_item = self.vars.get(name, sentinel) if name else sentinel
         saved_loop = self.vars.get("loop", sentinel)
@@ -1302,6 +1318,8 @@ class FlowRunner:
             retries = int(interpolate(step.get("retries", defaults.get("retries", 0)), self.vars, path=path) or 0)
             delay = float(interpolate(step.get("retry_delay", defaults.get("retry_delay", 0.5)), self.vars, path=path) or 0)
             continue_on_error = _truthy(interpolate(step.get("continue_on_error", defaults.get("continue_on_error", False)), self.vars, path=path))
+        except WorkflowError as exc:  # an unresolvable ${...}: fail the step like any other error
+            raise self._fail(result, kind, path, exc, t0) from None
         except (TypeError, ValueError) as exc:
             raise self._fail(result, kind, path, WorkflowError(f"invalid retries/retry_delay: {exc}"), t0) from None
         attempts = max(0, retries) + 1

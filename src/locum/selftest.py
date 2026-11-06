@@ -83,10 +83,18 @@ class SelfTest:
             status, detail = "SKIP", str(exc)
         except _Warn as exc:
             status, detail = "WARN", str(exc)
+        except KeyboardInterrupt:
+            # Recorded so the report shows where the run stopped; then the run is aborted.
+            self.checks.append(Check(name, "FAIL", "aborted: KeyboardInterrupt", time.monotonic() - t0))
+            self.log(f"  FAIL  {name}: aborted (KeyboardInterrupt)")
+            raise
         except Exception as exc:  # noqa: BLE001 - we report every failure
             from .errors import FailSafeTriggered
 
             if isinstance(exc, FailSafeTriggered):
+                detail = f"aborted: {type(exc).__name__}: {exc}"
+                self.checks.append(Check(name, "FAIL", detail, time.monotonic() - t0))
+                self.log(f"  FAIL  {name}: {detail}")
                 raise
             status = "FAIL"
             detail = f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=6)}"
@@ -583,16 +591,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     with d:
         print(f"backend: {d.backend.name}")
         st = SelfTest(d, out)
+        aborted: Optional[BaseException] = None
         try:
             st.run()
-        except Exception as exc:  # fail-safe / Ctrl+C: the report is still written
+        except (Exception, KeyboardInterrupt) as exc:  # fail-safe / Ctrl+C: the report is still written
+            aborted = exc
             print(f"stopped: {type(exc).__name__}: {exc}")
     fails = sum(1 for c in st.checks if c.status == "FAIL")
     warns = sum(1 for c in st.checks if c.status == "WARN")
     print(f"\nreport: {os.path.join(out, 'report.txt')}")
-    result = "ALL PASSED" if fails == 0 else f"{fails} FAILED"
+    if aborted is not None:  # the remaining checks never ran: never report success
+        result = f"ABORTED ({type(aborted).__name__}; remaining checks did not run)"
+    else:
+        result = "ALL PASSED" if fails == 0 else f"{fails} FAILED"
     print("RESULT:", result + (f" ({warns} warning{'s' if warns != 1 else ''})" if warns else ""))
-    return 0 if fails == 0 else 2
+    return 0 if fails == 0 and aborted is None else 2
 
 
 if __name__ == "__main__":  # pragma: no cover

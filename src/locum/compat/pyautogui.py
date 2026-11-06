@@ -45,6 +45,7 @@ import contextlib
 import functools
 import inspect
 import math
+import numbers
 import pathlib
 import threading
 import time
@@ -487,7 +488,7 @@ def _xy(x: Any = None, y: Any = None) -> Point:
                 c = center(x)
                 return Point(int(c.x), int(c.y))
             raise PyAutoGUIException(f"The x argument must be a 2- or 4-item sequence, got {len(x)} items")
-        if not isinstance(x, (int, float)):
+        if not isinstance(x, numbers.Real):  # numpy scalars / Fraction too, like int(firstArg)
             from ..types import coerce_point
 
             p = coerce_point(x)

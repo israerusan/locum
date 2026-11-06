@@ -705,6 +705,8 @@ class MockBackend(Backend):
         w = self._win(handle)
         w.rect = Rect.coerce(rect)
         w.root.rect = Rect(0, 0, w.rect.width, w.rect.height)
+        # an explicit placement leaves the maximized state (like the real backends)
+        w.maximized, w._restore_rect = False, None
 
     def set_window_state(self, handle: Any, state: str) -> None:
         self._log("window_state", handle, state)
@@ -714,16 +716,21 @@ class MockBackend(Backend):
             if self._active is w:
                 self._activate_next(exclude=w)
         elif state == "maximized":
-            if not w.maximized:  # maximizing twice must not forget the normal-state rect
-                w._restore_rect = w.rect
-            w.maximized, w.minimized = True, False
-            self.move_window(handle, self._monitors[0].rect)
+            # maximizing twice must not forget the normal-state rect
+            restore = w._restore_rect if w.maximized else w.rect
+            # maximize onto the window's own monitor (largest overlap, primary on a tie)
+            mon = max(
+                self._monitors,
+                key=lambda m: ((m.rect.intersect(w.rect) or Rect(0, 0, 0, 0)).area, m.is_primary),
+            )
+            self.move_window(handle, mon.rect)
+            w.maximized, w.minimized, w._restore_rect = True, False, restore
             self._raise(w)
         elif state == "normal":
             w.minimized = False
             if w.maximized and w._restore_rect is not None:
                 self.move_window(handle, w._restore_rect)
-            w.maximized = False
+            w.maximized, w._restore_rect = False, None
             self._raise(w)
         else:
             raise ValueError(f"Unknown window state {state!r}")

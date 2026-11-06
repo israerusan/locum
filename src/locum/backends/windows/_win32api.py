@@ -351,6 +351,7 @@ class _Win32:
             (u, "SetThreadDpiAwarenessContext", HANDLE, [HANDLE]),
             (u, "SetProcessDPIAware", BOOL, []),
             (u, "AllowSetForegroundWindow", BOOL, [DWORD]),
+            (u, "ToUnicodeEx", INT, [UINT, UINT, P(BYTE), LPWSTR, INT, UINT, HKL]),
             (shcore, "GetDpiForMonitor", HRESULT, [HMONITOR, INT, P(UINT), P(UINT)]),
             (shcore, "SetProcessDpiAwareness", HRESULT, [INT]),
             (dwmapi, "DwmGetWindowAttribute", HRESULT, [HWND, DWORD, LPVOID, DWORD]),

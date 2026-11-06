@@ -302,12 +302,18 @@ def _desktop_clock(desktop: Any) -> Callable[[], float]:
 
 
 def _desktop_interval(desktop: Any, default: float = 0.1) -> float:
-    """The desktop's ``poll_interval`` (seconds between polls)."""
+    """The desktop's ``poll_interval`` (seconds between polls).
+
+    ``poll_interval=0`` maps to a short positive pause: a zero interval would
+    busy-spin the wait (and never advance an injected test clock).
+    """
     try:
         v = float(getattr(desktop, "poll_interval", default))
     except (TypeError, ValueError):
         return default
-    return v if v >= 0 else default
+    if v == 0:
+        return 0.05
+    return v if v > 0 else default
 
 
 #: Errors that mean "searching again cannot help" (no accessibility API, invalid
@@ -751,6 +757,7 @@ class Element:
 
     def _mouse_click(self, point: Point, button: str, clicks: int) -> None:
         self.desktop.mouse.click(point, button=button, clicks=clicks)
+        self._last_click_point = point  # what Desktop.click reports as the clicked point
 
     # --------------------------------------------------------------- actions
     def click(self, button: str = "left", clicks: int = 1, *, offset: Tuple[int, int] = (0, 0), native: NativeMode = "auto") -> "Element":
@@ -775,6 +782,7 @@ class Element:
         did nothing.
         """
         mode = _native_mode(native)
+        self._last_click_point: Optional[Point] = None  # stays None for a native invoke
         self._guard()
         self._wait_enabled()
         simple = str(button).lower() == "left" and int(clicks) == 1 and tuple(offset) == (0, 0)

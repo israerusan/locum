@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import shutil
 from typing import Any, Optional, Tuple
 
@@ -43,6 +44,14 @@ def shell_launch_target(command: str) -> Optional[Tuple[str, str]]:
             return None
         file, params = cmd[1:end], cmd[end + 1:].strip()
     else:
+        # Like CreateProcess with an unquoted path: try each whitespace-delimited
+        # prefix ("C:\Program", "C:\Program Files\app.exe", ...) as the program.
+        for m in re.finditer(r"\s+", cmd):
+            prefix = cmd[:m.start()]
+            if os.path.isfile(prefix) or os.path.isfile(prefix + ".exe"):
+                if not os.path.isfile(prefix) or prefix.lower().endswith(_PROGRAM_EXTS):
+                    return None
+                return prefix, cmd[m.end():]
         parts = cmd.split(None, 1)
         file, params = parts[0], (parts[1] if len(parts) > 1 else "")
     if not file:
@@ -77,17 +86,21 @@ class ShellProcess:
             self.returncode = 0  # no process of our own: the shell (or a running instance) handled it
 
     def poll(self) -> Optional[int]:
-        return self.wait(0)
+        return self._wait(0)
 
     def wait(self, timeout: Optional[float] = None) -> Optional[int]:
+        code = self._wait(0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000)))
+        if code is None:  # timed out (Popen.wait raises for any finite timeout, 0 included)
+            import subprocess
+
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return code
+
+    def _wait(self, ms: int) -> Optional[int]:
+        """Wait up to ``ms`` milliseconds; the exit code, or None if still running."""
         if self.returncode is not None or self._handle is None:
             return self.returncode
-        ms = 0xFFFFFFFF if timeout is None else max(0, int(timeout * 1000))
         if int(self._api.WaitForSingleObject(self._handle, ms)) != WAIT_OBJECT_0:
-            if timeout:
-                import subprocess
-
-                raise subprocess.TimeoutExpired(self.args, timeout)
             return None
         code = DWORD(0)
         if self._api.GetExitCodeProcess(self._handle, ctypes.byref(code)) and code.value != STILL_ACTIVE:

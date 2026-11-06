@@ -165,40 +165,49 @@ class Desktop:
             self.backend = backend
             self._owns_backend = False
 
-        if default_timeout is None or not math.isfinite(float(default_timeout)) or float(default_timeout) < 0:
-            raise ValueError(f"default_timeout must be a finite number >= 0, got {default_timeout!r}")
-        mode = (typing_mode or "auto").lower()
-        if mode not in TYPING_MODES:
-            raise ValueError(f"typing_mode must be one of {', '.join(TYPING_MODES)}, got {typing_mode!r}")
-        if float(poll_interval) < 0:
-            raise ValueError("poll_interval must be >= 0")
+        try:
+            if default_timeout is None or not math.isfinite(float(default_timeout)) or float(default_timeout) < 0:
+                raise ValueError(f"default_timeout must be a finite number >= 0, got {default_timeout!r}")
+            mode = (typing_mode or "auto").lower()
+            if mode not in TYPING_MODES:
+                raise ValueError(f"typing_mode must be one of {', '.join(TYPING_MODES)}, got {typing_mode!r}")
+            if float(poll_interval) < 0:
+                raise ValueError("poll_interval must be >= 0")
 
-        self.default_timeout = float(default_timeout)
-        self.typing_mode = mode
-        self.poll_interval = float(poll_interval)
-        self._sleep_fn = sleep
-        self._clock = clock
-        self._closed = False
+            self.default_timeout = float(default_timeout)
+            self.typing_mode = mode
+            self.poll_interval = float(poll_interval)
+            self._sleep_fn = sleep
+            self._clock = clock
+            self._closed = False
 
-        if humanize is True:
-            self.humanize: Optional[Humanize] = Humanize()
-        elif humanize is False or humanize is None:
-            self.humanize = None
-        elif isinstance(humanize, Humanize):
-            self.humanize = humanize
-        else:
-            raise TypeError(f"humanize must be a bool or a Humanize, not {type(humanize).__name__}")
+            if humanize is True:
+                self.humanize: Optional[Humanize] = Humanize()
+            elif humanize is False or humanize is None:
+                self.humanize = None
+            elif isinstance(humanize, Humanize):
+                self.humanize = humanize
+            else:
+                raise TypeError(f"humanize must be a bool or a Humanize, not {type(humanize).__name__}")
 
-        if isinstance(failsafe, FailSafe):
-            self.failsafe = failsafe
-        else:
-            self.failsafe = FailSafe(self.backend, enabled=bool(failsafe))
+            if isinstance(failsafe, FailSafe):
+                self.failsafe = failsafe
+            else:
+                self.failsafe = FailSafe(self.backend, enabled=bool(failsafe))
 
-        self._pause = max(0.0, float(pause))
-        self.mouse = Mouse(self.backend, self.failsafe, self._pause, self.humanize, sleep=sleep, clock=clock)
-        self.keyboard = Keyboard(self.backend, self.failsafe, self._pause, sleep=sleep,
-                                 clipboard_settle=clipboard_settle, clipboard_timeout=clipboard_timeout)
-        self.screen = Screen(self.backend, sleep=sleep, clock=clock)
+            self._pause = max(0.0, float(pause))
+            self.mouse = Mouse(self.backend, self.failsafe, self._pause, self.humanize, sleep=sleep, clock=clock)
+            self.keyboard = Keyboard(self.backend, self.failsafe, self._pause, sleep=sleep,
+                                     clipboard_settle=clipboard_settle, clipboard_timeout=clipboard_timeout)
+            self.screen = Screen(self.backend, sleep=sleep, clock=clock)
+        except BaseException:
+            # A bad option must not leak the backend this constructor created (and owns).
+            if self._owns_backend:
+                try:
+                    self.backend.close()
+                except Exception:
+                    pass
+            raise
 
     # ================================================================ plumbing
     @property
@@ -285,7 +294,8 @@ class Desktop:
                 return None
 
         try:
-            return _wait_until(guarded, timeout, self.poll_interval, message=message, ignore_exceptions=False,
+            # poll_interval=0 would busy-spin (and never advance an injected clock).
+            return _wait_until(guarded, timeout, self.poll_interval or 0.05, message=message, ignore_exceptions=False,
                                sleep=self.sleep, clock=self._clock)
         except ActionTimeout:
             if last:
@@ -504,6 +514,9 @@ class Desktop:
             if el is not None:
                 if duration is None and not interval and humanize is None:
                     el.click(button, clicks, offset=(dx, dy), native="auto")
+                    clicked = getattr(el, "_last_click_point", None)
+                    if clicked is not None:
+                        return clicked  # the visible-part center, for a partly off-screen element
                     b = el.bounds
                     return b.center.offset(dx, dy) if b is not None else self.position()
                 # Same hit-test as Element.click: never click whatever covers the element.
@@ -1118,6 +1131,8 @@ class Desktop:
         that just showed its existing window), the best pre-existing match is
         returned. ``new_window=False`` accepts any matching window at once.
         """
+        if wait_window is not None:
+            self._timeout(timeout)  # reject a bad timeout before starting anything
         before: Optional[List[Any]] = None
         if wait_window is not None and new_window:
             try:

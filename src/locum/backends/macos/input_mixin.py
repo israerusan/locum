@@ -75,6 +75,9 @@ class _InputMixin:
     #: ``(x, y, posted_at, from_x, from_y)``: the last posted point and where the
     #: cursor read before it was posted (``from`` is None when it could not be read).
     _last_posted: Optional[Tuple[float, float, float, Optional[float], Optional[float]]] = None
+    #: Earlier points of the same burst of posts that may still be queued: while the
+    #: WindowServer catches up, the cursor can read any of them (not just ``from``).
+    _posted_path: Tuple[Tuple[float, float], ...] = ()
 
     # ----------------------------------------------------------------------- mouse
     def _read_cursor(self) -> Tuple[float, float]:
@@ -86,8 +89,9 @@ class _InputMixin:
         """Where the cursor is, bridging the WindowServer's lag after a posted event.
 
         The posted point is trusted only while Quartz still reports the position the
-        cursor had *before* that event (the event has not been applied yet). If the
-        cursor reads anywhere else -- the user, a remote-desktop client or another tool
+        cursor had *before* that event (the event has not been applied yet), or one of
+        the earlier points posted in the same burst (only some queued moves have been
+        applied so far). If the cursor reads anywhere else -- the user, a remote-desktop client or another tool
         moved it -- that real position wins and the cached point is dropped, so a click
         never goes to a stale spot.
         """
@@ -95,11 +99,15 @@ class _InputMixin:
         last = self._last_posted
         if last is not None:
             x, y, at, fx, fy = last
-            pending = (fx is not None and abs(actual[0] - fx) < 0.5 and abs(actual[1] - fy) < 0.5
-                       and not (abs(actual[0] - x) < 0.5 and abs(actual[1] - y) < 0.5))
+            def near(px: Optional[float], py: Optional[float]) -> bool:
+                return px is not None and py is not None and abs(actual[0] - px) < 0.5 and abs(actual[1] - py) < 0.5
+
+            pending = ((near(fx, fy) or any(near(px, py) for px, py in self._posted_path))
+                       and not near(x, y))
             if pending and time.monotonic() - at < self.CURSOR_SETTLE:
                 return (x, y)
             self._last_posted = None  # applied, overtaken by a real move, or too old
+            self._posted_path = ()
         return actual
 
     def _current_flags(self) -> int:
@@ -128,6 +136,15 @@ class _InputMixin:
             before = (None, None)
         # (While earlier events are still pending, Quartz still reads the original origin.)
         q.CGEventPost(kCGHIDEventTap, ev)
+        prev = self._last_posted
+        if prev is not None and time.monotonic() - prev[2] < self.CURSOR_SETTLE:
+            # the previous post may still be queued: the cursor can read it (or the
+            # points before it) until the WindowServer reaches this one
+            self._posted_path = (*self._posted_path, (prev[0], prev[1]))[-64:]
+            if prev[3] is not None and prev[4] is not None:
+                self._posted_path = (*self._posted_path, (prev[3], prev[4]))[-64:]
+        else:
+            self._posted_path = ()
         self._last_posted = (float(pt[0]), float(pt[1]), time.monotonic(), before[0], before[1])
 
     def mouse_position(self) -> Point:

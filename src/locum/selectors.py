@@ -1390,7 +1390,12 @@ def _dict_compound(d: Dict[str, Any]) -> _Compound:
             comp.conds.append(_HasCond(parse(val)))
             continue
         if key in ("not",):
-            comp.conds.append(_NotCond(parse(val)))
+            inner = parse(val)
+            if inner.is_positional:
+                raise SelectorSyntaxError(
+                    'Positional pseudo-classes (:nth/:first/:last) are not allowed inside "not"'
+                )
+            comp.conds.append(_NotCond(inner))
             continue
         if key in ("states", "state"):
             names = [val] if isinstance(val, str) else list(val)

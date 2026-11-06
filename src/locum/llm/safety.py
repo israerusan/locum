@@ -1083,6 +1083,9 @@ class Policy:
             )
 
         # Rate limits.
+        # The slot is reserved atomically with the limit test (and given back below if the
+        # action is not allowed after all), so concurrent checks cannot overrun the budget.
+        stamp: Optional[float] = None
         if count:
             with self._lock:
                 now = self._clock()
@@ -1093,7 +1096,25 @@ class Policy:
                         self._recent.popleft()
                     if len(self._recent) >= self.max_actions_per_minute:
                         raise PolicyViolation(f"Rate limit exceeded ({self.max_actions_per_minute} actions per minute)")
+                self.action_count += 1
+                if self.max_actions_per_minute is not None:
+                    stamp = now
+                    self._recent.append(now)
+        try:
+            self._confirm_step(tool_name, args, ctx, confirm)
+        except BaseException:
+            if count:
+                with self._lock:
+                    self.action_count = max(0, self.action_count - 1)
+                    if stamp is not None:
+                        try:
+                            self._recent.remove(stamp)
+                        except ValueError:
+                            pass
+            raise
 
+    def _confirm_step(self, tool_name: str, args: Dict[str, Any], ctx: Dict[str, Any], confirm: Any) -> None:
+        """The human-confirmation part of :meth:`check` (raises if declined)."""
         # Human confirmation.
         reason = self.confirmation_reason(tool_name, args, ctx)
         if reason is not None:
@@ -1115,13 +1136,6 @@ class Policy:
                 self.confirmations.append((description, approved))
                 if not approved:
                     raise PolicyViolation(f"Action {description!r} was declined by the user")
-
-        if not count:
-            return
-        with self._lock:
-            self.action_count += 1
-            if self.max_actions_per_minute is not None:
-                self._recent.append(self._clock())
 
     def reset(self) -> None:
         """Reset action counters (e.g. between agent runs)."""
@@ -1548,7 +1562,7 @@ class GuardedDesktop(_GuardedProxy):
             ctx["target_unknown"] = True
         return ctx
 
-    def _element_ctx(self, el: Any, *, activates: bool) -> Dict[str, Any]:
+    def _element_ctx(self, el: Any, *, activates: bool, offset: Any = (0, 0)) -> Dict[str, Any]:
         from .._nodeinfo import ancestors, node_app, owning_window, target_label  # noqa: PLC0415
 
         backend = self._raw.backend
@@ -1565,12 +1579,15 @@ class GuardedDesktop(_GuardedProxy):
         w = _safe_get(lambda: owning_window(backend, node))
         if w is not None and w.title:
             ctx["target_window"] = w.title
-        point = _safe_get(lambda: el._click_point((0, 0), require=False))
+        # Judge the point the mouse really presses: the centre, or centre+offset.
+        off = (int(offset[0]), int(offset[1])) if offset is not None else (0, 0)
+        point = _safe_get(lambda: el._click_point(off, require=False))
         if point is not None:
             ctx["point"] = point
         identified = bool(target_identity(node, point, backend))
         if activates and point is not None:
-            # The mouse lands at the centre, which may be a child control ("Pay now" in a toolbar).
+            # The mouse lands at the centre (or offset point), which may be a child control
+            # ("Pay now" in a toolbar).
             hit = _safe_get(lambda: backend.element_at(point.x, point.y))
             if hit is not None and not _safe_get(lambda: hit.same_as(node), False) and \
                     any(_safe_get(lambda: a.same_as(node), False) for a in ancestors(hit)):
@@ -1651,7 +1668,7 @@ class GuardedDesktop(_GuardedProxy):
         el, point = self._resolve(target, y, offset)
         btn = str(getattr(button, "value", button)).lower()
         if el is not None:
-            ctx = self._element_ctx(el, activates=btn == "left")
+            ctx = self._element_ctx(el, activates=btn == "left", offset=offset)
             what = ctx.get("target") or getattr(el, "selector", None) or el.role
         else:
             assert point is not None
@@ -1700,7 +1717,7 @@ class GuardedDesktop(_GuardedProxy):
     def move(self, target: Any, y: Optional[float] = None, **kw: Any) -> Any:
         kw = {k: _unwrap(v) for k, v in kw.items()}
         el, point = self._resolve(target, y, kw.get("offset", (0, 0)))
-        ctx = self._element_ctx(el, activates=False) if el is not None else self._point_ctx(point, activates=False)  # type: ignore[arg-type]
+        ctx = self._element_ctx(el, activates=False, offset=kw.get("offset", (0, 0)) or (0, 0)) if el is not None             else self._point_ctx(point, activates=False)  # type: ignore[arg-type]
         if not self._gate("move_mouse", {}, ctx, f"move the mouse to {ctx.get('target') or point}"):
             return point
         if el is not None:
@@ -1980,10 +1997,10 @@ class GuardedElement(_GuardedProxy):
     """An :class:`~locum.element.Element` whose actions are checked by its :class:`GuardedDesktop`'s policy."""
 
     def _act(self, tool: str, args: Dict[str, Any], description: str, *, activates: bool,
-             extra: Optional[Dict[str, Any]] = None) -> bool:
+             extra: Optional[Dict[str, Any]] = None, offset: Any = (0, 0)) -> bool:
         guard: GuardedDesktop = object.__getattribute__(self, "_g_guard")
         el = self.unwrapped
-        ctx = guard._element_ctx(el, activates=activates)
+        ctx = guard._element_ctx(el, activates=activates, offset=_unwrap(offset) or (0, 0))
         if extra:
             ctx.update(extra)
         from .._nodeinfo import is_password  # noqa: PLC0415
@@ -1993,22 +2010,24 @@ class GuardedElement(_GuardedProxy):
 
     def click(self, button: str = "left", clicks: int = 1, **kw: Any) -> "GuardedElement":
         btn = str(getattr(button, "value", button)).lower()
-        if self._act(_click_tool(btn, clicks), {"button": btn, "clicks": clicks}, "click", activates=btn == "left"):
+        if self._act(_click_tool(btn, clicks), {"button": btn, "clicks": clicks}, "click", activates=btn == "left",
+                     offset=kw.get("offset", (0, 0))):
             self.unwrapped.click(button, clicks, **kw)
         return self
 
     def double_click(self, button: str = "left", **kw: Any) -> "GuardedElement":
-        if self._act("double_click", {"button": str(button)}, "double-click", activates=str(button).lower() == "left"):
+        if self._act("double_click", {"button": str(button)}, "double-click", activates=str(button).lower() == "left",
+                     offset=kw.get("offset", (0, 0))):
             self.unwrapped.double_click(button, **kw)
         return self
 
     def right_click(self, **kw: Any) -> "GuardedElement":
-        if self._act("right_click", {}, "right-click", activates=False):
+        if self._act("right_click", {}, "right-click", activates=False, offset=kw.get("offset", (0, 0))):
             self.unwrapped.right_click(**kw)
         return self
 
     def hover(self, **kw: Any) -> "GuardedElement":
-        if self._act("move_mouse", {}, "hover over", activates=False):
+        if self._act("move_mouse", {}, "hover over", activates=False, offset=kw.get("offset", (0, 0))):
             self.unwrapped.hover(**kw)
         return self
 

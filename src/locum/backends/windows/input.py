@@ -208,7 +208,7 @@ class _InputMixin:
                 scanned = decode_vk_scan(self._api.VkKeyScanExW(ch, hkl))
             except Exception:
                 scanned = None
-            if scanned is not None and self._is_dead_key(scanned[0], hkl):
+            if scanned is not None and self._is_dead_key(scanned[0], hkl, scanned[1]):
                 scanned = None  # the key would start a composition instead of typing ``ch``
             if scanned is not None:
                 vk, state = scanned
@@ -230,13 +230,33 @@ class _InputMixin:
         release = [key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP) for unit in units]
         return press, release
 
-    def _is_dead_key(self, vk: int, hkl: Any) -> bool:
-        """Whether ``vk`` is a dead (diacritic) key on layout ``hkl`` (circumflex and
-        grave on German/French, quote/tilde on US-International). Such characters are
+    def _is_dead_key(self, vk: int, hkl: Any, state: int = 0) -> bool:
+        """Whether ``vk`` pressed with shift state ``state`` (VkKeyScan bits) is a dead
+        (diacritic) key on layout ``hkl`` (circumflex and grave on German/French,
+        quote/tilde and Shift+6 on US-International). Such characters are
         typed as Unicode packets instead (unless Ctrl/Alt/Win is held, where the
         key itself is wanted for a shortcut)."""
         if any(self._modifier_held(m) for m in ("ctrl", "alt", "cmd")):
             return False
+        to_unicode = getattr(self._api, "ToUnicodeEx", None)
+        if state & 0x07 and to_unicode is not None:
+            # MAPVK_VK_TO_CHAR only reports the *unshifted* character, so a dead
+            # shifted/AltGr position is asked for with that exact key state.
+            keys = (ctypes.c_ubyte * 256)()
+            for bit, vks in ((0x01, (0x10, 0xA0)), (0x02, (0x11, 0xA2)), (0x04, (0x12, 0xA4))):
+                if state & bit:
+                    for k in vks:
+                        keys[k] = 0x80
+            buf = ctypes.create_unicode_buffer(8)
+            try:
+                scan = self._scan(vk)[0]
+                # flag 0x4: leave the kernel keyboard state alone (Windows 10 1607+)
+                n = int(to_unicode(vk, scan, keys, buf, len(buf), 0x4, hkl))
+                if n < 0:  # older Windows keeps the dead key pending: flush it
+                    to_unicode(vk, scan, keys, buf, len(buf), 0x4, hkl)
+                return n < 0
+            except Exception:
+                pass
         try:
             # MAPVK_VK_TO_CHAR sets the top bit for dead keys.
             return bool(int(self._api.MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, hkl)) & 0x80000000)

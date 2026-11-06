@@ -109,12 +109,15 @@ def owning_window(
     title = _safe(lambda: top.name, "") or ""
     bounds = _safe(lambda: top.bounds)
     pool = [w for w in wins if pid and w.pid == pid]
+    # A known pid never matches another process's window; windows whose pid is
+    # unknown stay candidates (a backend may not report window pids).
+    candidates = pool or [w for w in wins if not (pid and w.pid and w.pid != pid)]
     if title:
-        for w in pool or wins:
+        for w in candidates:
             if w.title == title:
                 return w
     if bounds is not None:
-        best = max(pool or wins, key=lambda w: _iou(w.rect, bounds), default=None)
+        best = max(candidates, key=lambda w: _iou(w.rect, bounds), default=None)
         if best is not None and _iou(best.rect, bounds) > 0.5:
             return best
     if len(pool) == 1:
