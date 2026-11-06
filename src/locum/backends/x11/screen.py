@@ -180,8 +180,18 @@ class _ScreenMixin:
 
     # ============================================================ window capture
     def _has_composite(self) -> bool:
+        """Whether window capture can work: the Composite extension *and* a running
+        compositing manager (owner of ``_NET_WM_CM_S<screen>``). The extension alone
+        is not enough, because without a manager windows are not redirected and have
+        no off-screen pixmap. Xvfb has the extension, and the real-desktop CI job
+        found the capability claimed while every capture failed."""
         try:
-            return bool(self._d.has_extension("Composite"))
+            if not self._d.has_extension("Composite"):
+                return False
+            screen_no = int(getattr(self._d, "get_default_screen", lambda: 0)() or 0)
+            atom = self._d.intern_atom(f"_NET_WM_CM_S{screen_no}")
+            owner = self._d.get_selection_owner(atom)
+            return int(getattr(owner, "id", owner) or 0) != 0
         except Exception:
             return False
 

@@ -51,7 +51,9 @@ def test_processes_drain_one_file_exactly_once(tmp_path):
 
     items = _final_items(path)
     assert len(items) == 200
-    assert {it["status"] for it in items} == {SUCCESS}
+    not_ok = [(it.get("reference"), it["status"], it.get("error"), it.get("history")) for it in items
+              if it["status"] != SUCCESS]
+    assert not not_ok, f"items not finished as success: {not_ok}"
     assert {it["attempts"] for it in items} == {1}
     for it in items:  # the worker that finished it is the one that ran it
         assert it["output"]["by"] == it["worker_id"]

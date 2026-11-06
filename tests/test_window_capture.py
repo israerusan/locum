@@ -665,7 +665,7 @@ class FakeXWin:
         return Pix()
 
 
-def _x11_backend(composite=True):
+def _x11_backend(composite=True, cm=True):
     from locum.backends.x11 import X11Backend
 
     be = object.__new__(X11Backend)
@@ -679,6 +679,9 @@ def _x11_backend(composite=True):
     be._root.translate_coords = lambda win, x, y: SimpleNamespace(x=win.geom.left + x, y=win.geom.top + y)
     be._d = SimpleNamespace(
         has_extension=lambda name: composite and name == "Composite",
+        get_default_screen=lambda: 0,
+        intern_atom=lambda name: 77 if name == "_NET_WM_CM_S0" else 0,
+        get_selection_owner=lambda atom: SimpleNamespace(id=0x500 if (atom == 77 and cm) else 0),
         display=SimpleNamespace(info=SimpleNamespace(pixmap_formats=[SimpleNamespace(depth=24, bits_per_pixel=32)],
                                                      image_byte_order=0)),
     )
@@ -725,3 +728,11 @@ def test_x11_capture_window_not_supported_cases():
     be2, _, _ = _x11_backend(composite=False)
     with pytest.raises(NotSupported, match="Composite"):
         _x11_capture(be2)
+
+
+def test_x11_window_capture_needs_a_running_compositing_manager_not_just_the_extension():
+    # Xvfb has the Composite extension but, without a compositing manager, no window
+    # pixmaps: claiming the capability there made every capture fail (real-desktop CI).
+    assert _x11_backend()[0]._has_composite() is True
+    assert _x11_backend(cm=False)[0]._has_composite() is False
+    assert _x11_backend(composite=False)[0]._has_composite() is False

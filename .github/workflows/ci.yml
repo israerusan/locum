@@ -140,7 +140,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             xvfb xauth openbox dbus-x11 at-spi2-core libatk-adaptor \
             python3-venv python3-gi gir1.2-atspi-2.0 mousepad xclip x11-utils \
-            x11-xserver-utils x11-apps
+            x11-xserver-utils x11-apps xcompmgr
 
       # PyGObject (gi) comes from the distro: a venv that sees the system site-packages.
       - name: Install locum
@@ -160,6 +160,9 @@ jobs:
             # root and one ordinary X window for the screenshot and window-list checks.
             xsetroot -mod 16 16 -fg grey45 -bg grey25
             xclock -geometry 160x160+1100+20 &
+            # A compositing manager, as on a real desktop: window capture reads the
+            # window's own composited pixmap (covered and off-screen parts included).
+            xcompmgr -n &
             /usr/libexec/at-spi-bus-launcher --launch-immediately &
             export GTK_MODULES=gail:atk-bridge NO_AT_BRIDGE=0
             gsettings set org.gnome.desktop.interface toolkit-accessibility true || true
