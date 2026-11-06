@@ -433,12 +433,20 @@ class Browser:
                 out.append(PageInfo(t["id"], t.get("title", ""), t.get("url", ""), t["webSocketDebuggerUrl"]))
         return out
 
-    def page(self, match: Optional[str] = None) -> Page:
-        """The tab whose title or URL contains ``match`` (default: the most recently used tab)."""
-        pages = self.pages()
-        if match:
-            m = match.lower()
-            pages = [p for p in pages if m in p.title.lower() or m in p.url.lower()]
+    def page(self, match: Optional[str] = None, timeout: float = 5.0) -> Page:
+        """The tab whose title or URL contains ``match`` (default: the most recently used tab).
+
+        Waits up to ``timeout`` seconds for such a tab: a page that is still loading
+        has no title yet."""
+        end = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            pages = self.pages()
+            if match:
+                m = match.lower()
+                pages = [p for p in pages if m in p.title.lower() or m in p.url.lower()]
+            if pages or time.monotonic() >= end:
+                break
+            time.sleep(0.1)
         if not pages:
             raise ElementNotFound(f"no browser tab matches {match!r}" if match else "the browser has no open tab")
         info = pages[0]

@@ -266,7 +266,7 @@ def test_real_headless_browser_end_to_end(tmp_path):
     except (CDPError, OSError) as exc:
         pytest.skip(f"{name} could not start headless here: {exc}")
     try:
-        p = b.page("Form test")
+        p = b.page("Form test", timeout=30)
         p.wait_ready()
         els = {e["name"]: e["id"] for e in p.snapshot()["elements"]}
         p.type("Ada", els["User"])
