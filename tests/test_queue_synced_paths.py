@@ -33,6 +33,7 @@ def test_sync_client_folder_names_are_refused(tmp_path, folder):
         WorkQueue("q", path=path)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="UNC paths exist on Windows only (on POSIX a backslash is a file name character)")
 def test_unc_path_is_refused():
     assert "network share" in synced_location(r"\\fileserver\finance\q.json")
     assert "network share" in synced_location("//fileserver/finance/q.json")

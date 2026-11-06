@@ -386,7 +386,7 @@ def synced_location(path: PathLike) -> str:
     network locations (UNC paths, mapped network drives).
     """
     p = os.path.abspath(os.path.expanduser(str(path)))
-    if p.startswith("\\\\") or p.startswith("//"):
+    if os.name == "nt" and (p.startswith("\\\\") or p.startswith("//")):  # UNC exists on Windows only
         return "a network share (UNC path)"
     for var in _SYNC_ENV_VARS:
         root = os.environ.get(var)
