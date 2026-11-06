@@ -30,7 +30,14 @@ Semantics follow PyAutoGUI 0.9.5x:
   nothing is found while :data:`USE_IMAGE_NOT_FOUND_EXCEPTION` is true (the
   default since PyAutoGUI 0.9.41); set it to ``False`` to get ``None``;
 * unknown key names are silently ignored by :func:`press`/:func:`keyDown`/
-  :func:`keyUp`/:func:`hotkey`, exactly like PyAutoGUI (use :func:`isValidKey`).
+  :func:`keyUp`/:func:`hotkey`, exactly like PyAutoGUI (use :func:`isValidKey`);
+* :data:`LOG_SCREENSHOTS` (or ``logScreenshot=True`` on one call) saves a
+  screenshot before every click, drag, scroll, key and ``write`` call to the
+  current directory as ``2026-11-06_14-3-7-123_click_left,1,100,200.png``,
+  keeping the newest :data:`LOG_SCREENSHOTS_LIMIT` (default 10) files.
+  ``moveTo``/``moveRel`` log only with ``logScreenshot=True``, as in PyAutoGUI.
+  The arguments are part of the file name -- ``write`` puts the typed text
+  there -- so leave it off around passwords.
 
 Improvements that come for free: template matching is grayscale/color
 normalized cross-correlation with alpha masks and multi-monitor support, typing
@@ -42,11 +49,15 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import datetime as _dt
 import functools
 import inspect
+import logging
 import math
 import numbers
+import os
 import pathlib
+import re
 import threading
 import time
 from typing import Any, Callable, Generator, Iterator, List, Optional, Sequence, Union
@@ -58,7 +69,8 @@ from ..types import Match, Rect
 __all__ = [
     # settings
     "FAILSAFE", "FAILSAFE_POINTS", "PAUSE", "MINIMUM_DURATION", "MINIMUM_SLEEP", "DARWIN_CATCH_UP_TIME",
-    "USE_IMAGE_NOT_FOUND_EXCEPTION", "LOG_SCREENSHOTS", "KEYBOARD_KEYS", "KEY_NAMES",
+    "USE_IMAGE_NOT_FOUND_EXCEPTION", "LOG_SCREENSHOTS", "LOG_SCREENSHOTS_LIMIT", "G_LOG_SCREENSHOTS_FILENAMES",
+    "KEYBOARD_KEYS", "KEY_NAMES",
     "LEFT", "MIDDLE", "RIGHT", "PRIMARY", "SECONDARY", "QWERTY", "QWERTZ",
     # exceptions & types
     "PyAutoGUIException", "FailSafeException", "ImageNotFoundException", "Point", "Size", "Box",
@@ -97,8 +109,14 @@ MINIMUM_DURATION = 0.1
 MINIMUM_SLEEP = 0.05
 #: Accepted for compatibility (unused).
 DARWIN_CATCH_UP_TIME = 0.01
-#: Accepted for compatibility (screenshot logging is not implemented).
+#: Save a screenshot before every click, drag, scroll, key press and ``write`` (PyAutoGUI's
+#: debugging aid): ``YYYY-MM-DD_H-M-S-mmm_<function>_<args>.png`` in the current directory.
+#: A function's ``logScreenshot=True``/``False`` argument overrides it for that call.
 LOG_SCREENSHOTS = False
+#: Keep at most this many logged screenshots, deleting the oldest (``None`` = keep all).
+LOG_SCREENSHOTS_LIMIT: Optional[int] = 10
+#: File names of the logged screenshots still on disk, oldest first.
+G_LOG_SCREENSHOTS_FILENAMES: List[str] = []
 #: Raise :class:`ImageNotFoundException` instead of returning ``None`` from the locate functions.
 USE_IMAGE_NOT_FOUND_EXCEPTION = True
 
@@ -169,6 +187,49 @@ def _d() -> Any:
 def failSafeCheck() -> None:
     """Raise :class:`FailSafeException` if :data:`FAILSAFE` is on and the cursor is on a fail-safe point."""
     _d().failsafe.check()
+
+
+_BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_log_lock = threading.Lock()
+
+
+def _logScreenshot(logScreenshot: Any, funcName: str, funcArgs: str, folder: str = ".") -> Optional[str]:
+    """PyAutoGUI's ``_logScreenshot``: save a screenshot named after the call, before it acts.
+
+    Taken when ``logScreenshot`` is true, or when it is ``None`` and :data:`LOG_SCREENSHOTS`
+    is on. The oldest file is deleted once :data:`LOG_SCREENSHOTS_LIMIT` are kept.
+    Returns the path written (``None``: no screenshot).
+    """
+    if logScreenshot is False or (logScreenshot is None and not LOG_SCREENSHOTS):
+        return None
+    funcArgs = str(funcArgs)
+    if len(funcArgs) > 128:  # keep the file name under the 255-character limit
+        funcArgs = funcArgs[:128] + "..."
+    now = _dt.datetime.now()
+    filename = "%s-%s-%s_%s-%s-%s-%s_%s_%s.png" % (
+        now.year, str(now.month).rjust(2, "0"), str(now.day).rjust(2, "0"),
+        now.hour, now.minute, now.second, str(now.microsecond)[:3], funcName, funcArgs,
+    )
+    # PyAutoGUI writes the arguments verbatim; characters no file system accepts are replaced.
+    filename = _BAD_FILENAME_CHARS.sub("_", filename)
+    with _log_lock:
+        limit = LOG_SCREENSHOTS_LIMIT
+        while limit is not None and G_LOG_SCREENSHOTS_FILENAMES and len(G_LOG_SCREENSHOTS_FILENAMES) >= int(limit):
+            oldest = G_LOG_SCREENSHOTS_FILENAMES.pop(0)
+            try:
+                os.unlink(os.path.join(folder, oldest))
+            except FileNotFoundError:
+                pass
+        if limit is not None and int(limit) <= 0:
+            return None
+        path = os.path.join(folder, filename)
+        try:
+            screenshot(path)
+        except OSError as exc:  # a debugging aid must not fail the action (path too long, disk full...)
+            logging.getLogger("locum.compat.pyautogui").warning("LOG_SCREENSHOTS: could not save %s: %s", path, exc)
+            return None
+        G_LOG_SCREENSHOTS_FILENAMES.append(filename)
+    return path
 
 
 def _api(pausing: bool = True) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -697,7 +758,9 @@ def center(coords: Sequence[int]) -> Point:
 def moveTo(x: Any = None, y: Any = None, duration: float = 0.0, tween: Callable[[float], float] = linear,
            logScreenshot: bool = False, _pause: bool = True) -> None:
     """Move the cursor to ``(x, y)`` (``None`` keeps that coordinate) over ``duration`` seconds."""
-    _move_to(x, y, duration, tween)
+    p = _xy(x, y)
+    _logScreenshot(logScreenshot, "moveTo", "%s,%s" % (p.x, p.y))
+    _move_to(p, None, duration, tween)
 
 
 @_api()
@@ -706,6 +769,7 @@ def moveRel(xOffset: Any = None, yOffset: Any = None, duration: float = 0.0, twe
     """Move the cursor relative to its current position."""
     if xOffset is not None and yOffset is None and isinstance(xOffset, (tuple, list)):
         xOffset, yOffset = xOffset[0], xOffset[1]
+    _logScreenshot(logScreenshot, "moveRel", "%s,%s" % (xOffset, yOffset))
     cur = _d().mouse.position()
     _move_to(cur.x + int(xOffset or 0), cur.y + int(yOffset or 0), duration, tween)
 
@@ -727,7 +791,9 @@ def _drag_to(x: Any, y: Any, duration: Any, tween: Any, button: Any, mouseDownUp
 def dragTo(x: Any = None, y: Any = None, duration: float = 0.0, tween: Callable[[float], float] = linear,
            button: str = PRIMARY, logScreenshot: Any = None, _pause: bool = True, mouseDownUp: bool = True) -> None:
     """Press ``button``, move to ``(x, y)`` over ``duration`` seconds and release (``mouseDownUp=False``: just move)."""
-    _drag_to(x, y, duration, tween, button, mouseDownUp)
+    p = _xy(x, y)
+    _logScreenshot(logScreenshot, "dragTo", "%s,%s" % (p.x, p.y))
+    _drag_to(p, None, duration, tween, button, mouseDownUp)
 
 
 @_api()
@@ -736,6 +802,7 @@ def dragRel(xOffset: Any = 0, yOffset: Any = 0, duration: float = 0.0, tween: Ca
     """Drag relative to the current position."""
     if isinstance(xOffset, (tuple, list)):
         xOffset, yOffset = xOffset[0], xOffset[1]
+    _logScreenshot(logScreenshot, "dragRel", "%s,%s" % (xOffset, yOffset))
     cur = _d().mouse.position()
     _drag_to(cur.x + int(xOffset or 0), cur.y + int(yOffset or 0), duration, tween, button, mouseDownUp)
 
@@ -743,9 +810,13 @@ def dragRel(xOffset: Any = 0, yOffset: Any = 0, duration: float = 0.0, tween: Ca
 drag = dragRel
 
 
-def _click(x: Any, y: Any, clicks: int, interval: float, button: Any, duration: float, tween: Any) -> None:
+def _click(x: Any, y: Any, clicks: int, interval: float, button: Any, duration: float, tween: Any,
+           logScreenshot: Any = None) -> None:
     btn = _button(button)
-    _move_to(x, y, duration, tween)
+    p = _xy(x, y)
+    shown = {"primary": LEFT, "secondary": RIGHT}.get(btn, btn)  # PyAutoGUI logs the normalized name
+    _logScreenshot(logScreenshot, "click", "%s,%s,%s,%s" % (shown, clicks, p.x, p.y))
+    _move_to(p, None, duration, tween)
     _d().mouse.click(None, button=btn, clicks=int(clicks), interval=float(interval or 0.0), humanize=False)
 
 
@@ -754,42 +825,42 @@ def click(x: Any = None, y: Any = None, clicks: int = 1, interval: float = 0.0, 
           duration: float = 0.0, tween: Callable[[float], float] = linear, logScreenshot: Any = None,
           _pause: bool = True) -> None:
     """Move to ``(x, y)`` (if given) and click ``clicks`` times, ``interval`` seconds apart."""
-    _click(x, y, clicks, interval, button, duration, tween)
+    _click(x, y, clicks, interval, button, duration, tween, logScreenshot)
 
 
 @_api()
 def leftClick(x: Any = None, y: Any = None, interval: float = 0.0, duration: float = 0.0,
               tween: Callable[[float], float] = linear, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Left click."""
-    _click(x, y, 1, interval, LEFT, duration, tween)
+    _click(x, y, 1, interval, LEFT, duration, tween, logScreenshot)
 
 
 @_api()
 def rightClick(x: Any = None, y: Any = None, interval: float = 0.0, duration: float = 0.0,
                tween: Callable[[float], float] = linear, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Right click."""
-    _click(x, y, 1, interval, RIGHT, duration, tween)
+    _click(x, y, 1, interval, RIGHT, duration, tween, logScreenshot)
 
 
 @_api()
 def middleClick(x: Any = None, y: Any = None, interval: float = 0.0, duration: float = 0.0,
                 tween: Callable[[float], float] = linear, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Middle click."""
-    _click(x, y, 1, interval, MIDDLE, duration, tween)
+    _click(x, y, 1, interval, MIDDLE, duration, tween, logScreenshot)
 
 
 @_api()
 def doubleClick(x: Any = None, y: Any = None, interval: float = 0.0, button: str = LEFT, duration: float = 0.0,
                 tween: Callable[[float], float] = linear, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Double click."""
-    _click(x, y, 2, interval, button, duration, tween)
+    _click(x, y, 2, interval, button, duration, tween, logScreenshot)
 
 
 @_api()
 def tripleClick(x: Any = None, y: Any = None, interval: float = 0.0, button: str = LEFT, duration: float = 0.0,
                 tween: Callable[[float], float] = linear, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Triple click."""
-    _click(x, y, 3, interval, button, duration, tween)
+    _click(x, y, 3, interval, button, duration, tween, logScreenshot)
 
 
 @_api()
@@ -797,6 +868,7 @@ def mouseDown(x: Any = None, y: Any = None, button: str = PRIMARY, duration: flo
               tween: Callable[[float], float] = linear, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Move to ``(x, y)`` (if given) and press ``button``."""
     btn = _button(button)
+    _logScreenshot(logScreenshot, "mouseDown", "%s,%s" % (x, y))
     if x is not None or y is not None:
         _move_to(x, y, duration, tween)
     _d().mouse.down(btn)
@@ -807,12 +879,14 @@ def mouseUp(x: Any = None, y: Any = None, button: str = PRIMARY, duration: float
             tween: Callable[[float], float] = linear, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Move to ``(x, y)`` (if given) and release ``button``."""
     btn = _button(button)
+    _logScreenshot(logScreenshot, "mouseUp", "%s,%s" % (x, y))
     if x is not None or y is not None:
         _move_to(x, y, duration, tween)
     _d().mouse.up(btn)
 
 
-def _scroll(clicks: Any, x: Any, y: Any, horizontal: bool) -> None:
+def _scroll(clicks: Any, x: Any, y: Any, horizontal: bool, logScreenshot: Any = None, name: str = "scroll") -> None:
+    _logScreenshot(logScreenshot, name, "%s,%s,%s" % (clicks, x, y))
     if x is not None or y is not None:
         _move_to(x, y, 0.0, linear)
     n = int(clicks)
@@ -825,19 +899,19 @@ def _scroll(clicks: Any, x: Any, y: Any, horizontal: bool) -> None:
 @_api()
 def scroll(clicks: float, x: Any = None, y: Any = None, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Scroll the wheel ``clicks`` notches (positive = up), optionally at ``(x, y)``."""
-    _scroll(clicks, x, y, horizontal=False)
+    _scroll(clicks, x, y, horizontal=False, logScreenshot=logScreenshot, name="scroll")
 
 
 @_api()
 def vscroll(clicks: float, x: Any = None, y: Any = None, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Vertical scroll (same as :func:`scroll`)."""
-    _scroll(clicks, x, y, horizontal=False)
+    _scroll(clicks, x, y, horizontal=False, logScreenshot=logScreenshot, name="vscroll")
 
 
 @_api()
 def hscroll(clicks: float, x: Any = None, y: Any = None, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Horizontal scroll (positive = right)."""
-    _scroll(clicks, x, y, horizontal=True)
+    _scroll(clicks, x, y, horizontal=True, logScreenshot=logScreenshot, name="hscroll")
 
 
 # =============================================================== keyboard
@@ -846,6 +920,7 @@ def keyDown(key: str, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Press and hold ``key`` (unknown names are ignored)."""
     k = _key(key)
     if k is not None:
+        _logScreenshot(logScreenshot, "keyDown", key)
         _d().keyboard.down(k)
 
 
@@ -854,6 +929,7 @@ def keyUp(key: str, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Release ``key`` (unknown names are ignored)."""
     k = _key(key)
     if k is not None:
+        _logScreenshot(logScreenshot, "keyUp", key)
         _d().keyboard.up(k)
 
 
@@ -864,6 +940,7 @@ def press(keys: Union[str, Sequence[str]], presses: int = 1, interval: float = 0
     names = _keys(keys)
     if not names or int(presses) <= 0:
         return
+    _logScreenshot(logScreenshot, "press", keys if isinstance(keys, str) else ",".join(map(str, keys)))
     d = _d()
     for i in range(int(presses)):
         for j, k in enumerate(names):
@@ -876,11 +953,11 @@ def hotkey(*args: Any, **kwargs: Any) -> None:
     """Press keys in order and release them in reverse: ``hotkey("ctrl", "shift", "esc")``.
 
     Keyword arguments: ``interval`` (seconds between presses), ``logScreenshot``
-    (ignored), ``_pause``. Keys are always released, even if pressing one fails.
+    (see :data:`LOG_SCREENSHOTS`), ``_pause``. Keys are always released, even if pressing one fails.
     """
     failSafeCheck()
     pause = kwargs.pop("_pause", True)
-    kwargs.pop("logScreenshot", None)
+    log_shot = kwargs.pop("logScreenshot", None)
     interval = float(kwargs.pop("interval", 0.0) or 0.0)
     if kwargs:
         raise TypeError(f"hotkey() got unexpected keyword arguments: {', '.join(sorted(kwargs))}")
@@ -892,6 +969,7 @@ def hotkey(*args: Any, **kwargs: Any) -> None:
             flat.append(a)
     names = _keys(flat)
     if names:
+        _logScreenshot(log_shot, "hotkey", ",".join(map(str, flat)))
         _d().keyboard.hotkey(names, interval=interval)
     if pause and PAUSE:
         _SLEEP(PAUSE)
@@ -916,6 +994,8 @@ def hold(keys: Union[str, Sequence[str]], logScreenshot: Any = None, _pause: boo
 def write(message: Union[str, Sequence[str]], interval: float = 0.0, logScreenshot: Any = None, _pause: bool = True) -> None:
     """Type ``message``: a string (``\\n`` = Enter) or a list of key names pressed in turn."""
     d = _d()
+    if message:
+        _logScreenshot(logScreenshot, "write", message if isinstance(message, str) else ",".join(map(str, message)))
     if isinstance(message, str):
         if message:
             d.keyboard.type(message, interval=float(interval or 0.0), mode=d.typing_mode)
