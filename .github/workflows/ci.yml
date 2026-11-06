@@ -161,7 +161,7 @@ jobs:
             xsetroot -mod 16 16 -fg grey45 -bg grey25
             xclock -geometry 160x160+1100+20 &
             # A compositing manager, as on a real desktop: window capture reads the
-            # window's own composited pixmap (covered and off-screen parts included).
+            # composited pixmap of the window itself (covered and off-screen parts included).
             xcompmgr -n &
             /usr/libexec/at-spi-bus-launcher --launch-immediately &
             export GTK_MODULES=gail:atk-bridge NO_AT_BRIDGE=0
