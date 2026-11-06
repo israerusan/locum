@@ -15,6 +15,12 @@ polling slowly as a fallback for apps that raise no events), and ``observe``
 asks which processes changed since its previous snapshot to reuse the elements
 of windows that did not.
 
+The recorded pid is the *sending element's* process, which is not always the
+owner of the top-level window: a Store/UWP app's window (Calculator, Settings)
+belongs to ApplicationFrameHost.exe while its content and events come from the
+app. ``observe`` therefore maps each window to every process it hosts
+(``WindowsBackend.window_content_pids``) before deciding a window is unchanged.
+
 Set ``LOCUM_UIA_EVENTS=0`` to turn it off.
 """
 

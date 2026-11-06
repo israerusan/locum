@@ -41,7 +41,9 @@ def manual_recorder(be, **kw):
 
 def test_typing_coalesces_with_shift_and_backspace():
     be, w = build_scene()
-    rec = manual_recorder(be)
+    # Nothing has the focus in this scene: without trust_unknown_focus the text would be
+    # recorded as a secret (fail closed, see test_secrets_review_fixes.py).
+    rec = manual_recorder(be, trust_unknown_focus=True)
     w.find("Name").window  # noqa: B018 - scene sanity
     for ev in [("key_down", "h"), ("key_up", "h"), ("key_down", "shift"), ("key_down", "i"), ("key_down", "1"),
                ("key_up", "shift"), ("key_down", "x"), ("key_down", "backspace"), ("key_down", "space"),
@@ -54,7 +56,7 @@ def test_typing_coalesces_with_shift_and_backspace():
 
 def test_hotkeys_presses_and_lone_modifiers():
     be, _ = build_scene()
-    rec = manual_recorder(be)
+    rec = manual_recorder(be, trust_unknown_focus=True)  # no focused field in this scene
     seq = [
         ("key_down", "a"),
         ("key_down", "ctrl"), ("key_down", "shift"), ("key_down", "S"), ("key_up", "S"), ("key_up", "shift"), ("key_up", "ctrl"),
@@ -332,7 +334,7 @@ def test_empty_recording_outputs():
 def test_context_manager_and_pending_text_in_outputs():
     be, _ = build_scene()
     d = Desktop(be, sleep=lambda s: None, default_timeout=0)
-    rec = Recorder(d)
+    rec = Recorder(d, trust_unknown_focus=True)  # no focused field in this scene
     rec.start(source="manual")
     with rec:
         rec.feed(("type", "abc"))

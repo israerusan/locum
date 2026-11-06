@@ -4,11 +4,13 @@ A browser tab's accessibility tree can hold thousands of nodes (the live session
 that prompted this saw ~2,400 for one Edge window); the page's own DOM is far
 cheaper to query and act on. Two ways to get a DevTools connection:
 
-* :meth:`Browser.attach` -- to a browser that already exposes one: started with
-  ``--remote-debugging-port`` (Chrome 136+ only honours it with a non-default
-  ``--user-data-dir``), found through its ``DevToolsActivePort`` file, an
-  explicit port, or ``$LOCUM_CDP_PORT``. Your everyday browser profile normally
-  has no port open, and locum never opens one there.
+* :meth:`Browser.attach` -- to a browser that already exposes one: an explicit
+  port, ``$LOCUM_CDP_PORT``, or a browser running with a locum-managed profile.
+  The everyday profiles' ``DevToolsActivePort`` and port 9222 are only tried with
+  ``attach(allow_any=True)`` / ``$LOCUM_CDP_ATTACH_ANY=1`` (whatever answers
+  there may be your signed-in browser or another program). Endpoints must answer
+  like Chromium DevTools and use local WebSockets only. Your everyday browser
+  profile normally has no port open, and locum never opens one there.
 * :meth:`Browser.launch` -- start Edge/Chrome with a separate, locum-managed
   profile (``~/.locum/browser/<name>``) and a debugging port. Sign-ins made in
   that profile stay there; ``headless=True`` runs it without a window.
@@ -110,21 +112,50 @@ def _active_port_file(profile: pathlib.Path) -> Optional[int]:
         return None
 
 
-def discover_ports() -> List[int]:
-    """Candidate DevTools ports: ``$LOCUM_CDP_PORT``, ``DevToolsActivePort`` files of the
-    usual profiles and of locum-managed ones, then 9222."""
+#: The conventional ``--remote-debugging-port``; only tried when attaching to any browser is allowed.
+_DEFAULT_PORT = 9222
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def attach_any_allowed() -> bool:
+    """``$LOCUM_CDP_ATTACH_ANY`` is set to ``1`` / ``true`` / ``yes``."""
+    return os.environ.get("LOCUM_CDP_ATTACH_ANY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def discover_ports(allow_any: bool = False) -> List[int]:
+    """Candidate DevTools ports, in order: ``$LOCUM_CDP_PORT``, then the ``DevToolsActivePort``
+    files of locum-managed profiles (:func:`managed_profile_dir`).
+
+    Only with ``allow_any`` (or ``$LOCUM_CDP_ATTACH_ANY=1``) also the ``DevToolsActivePort``
+    files of the browsers' default (everyday) profiles and port 9222 -- whatever answers
+    there may be your signed-in profile or another program, so it is never picked silently.
+    """
+    allow_any = allow_any or attach_any_allowed()
     ports: List[int] = []
     env = os.environ.get("LOCUM_CDP_PORT", "").strip()
     if env.isdigit():
         ports.append(int(env))
-    for name, dirs in _user_data_dirs().items():
-        for d in [*dirs, managed_profile_dir(name)]:
-            p = _active_port_file(d)
-            if p and p not in ports:
-                ports.append(p)
-    if 9222 not in ports:
-        ports.append(9222)
+    dirs = [managed_profile_dir(name) for name in BROWSERS]
+    if allow_any:
+        dirs += [d for ds in _user_data_dirs().values() for d in ds]
+    for d in dirs:
+        p = _active_port_file(d)
+        if p and p not in ports:
+            ports.append(p)
+    if allow_any and _DEFAULT_PORT not in ports:
+        ports.append(_DEFAULT_PORT)
     return ports
+
+
+def _is_local_ws(url: Any) -> bool:
+    """``url`` is a ``ws://`` URL on this machine (127.0.0.1 / localhost / ::1)."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url))
+        return parts.scheme == "ws" and (parts.hostname or "").lower() in _LOCAL_HOSTS
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -152,17 +183,37 @@ class CDPSession:
         self._id = 0
         self._lock = threading.Lock()
         self.events: Deque[Dict[str, Any]] = deque(maxlen=500)
+        self._broken = False
+
+    @property
+    def broken(self) -> bool:
+        """The connection failed (or its stream can no longer be trusted): make a new session."""
+        return self._broken or self.ws.closed
+
+    def _fail(self, exc: BaseException) -> CDPError:
+        self._broken = True
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+        return CDPError(f"DevTools connection lost: {exc}")
 
     def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> Dict[str, Any]:
         from .._cancel import check
 
+        # Before anything goes out: an MCP call that timed out or was cancelled (possibly while
+        # waiting for this lock) must not send input -- an ``Input.*`` call -- afterwards.
+        check()
         with self._lock:
+            check()
+            if self.broken:
+                raise CDPError("DevTools connection lost (the session is closed)")
             self._id += 1
             mid = self._id
             try:
                 self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
             except (OSError, WebSocketError) as exc:
-                raise CDPError(f"DevTools connection lost: {exc}") from exc
+                raise self._fail(exc) from exc
             end = time.monotonic() + timeout
             while True:
                 check()  # an MCP call that timed out / was cancelled stops here
@@ -172,9 +223,9 @@ class CDPSession:
                 try:
                     msg = json.loads(self.ws.recv(timeout=min(left, 0.5)))
                 except socket.timeout:
-                    continue
+                    continue  # partial frames stay buffered in the WebSocket (no desync)
                 except (OSError, WebSocketError, ValueError) as exc:
-                    raise CDPError(f"DevTools connection lost: {exc}") from exc
+                    raise self._fail(exc) from exc
                 if msg.get("id") == mid:
                     if "error" in msg:
                         err = msg["error"]
@@ -188,8 +239,25 @@ class CDPSession:
 
 
 # ------------------------------------------------------------------ JS helpers
+#: ``__locumName(e)``: the name of an element. Never what a user typed or the page (or a
+#: password manager) filled in: an input's value names only buttons (``type=submit`` /
+#: ``button`` / ``reset``, whose value *is* the label); text fields, textareas, selects and
+#: contenteditable regions are named by aria-label, label, placeholder or title only.
+_NAME_FN = r"""
+const __locumName = (e) => {
+  const tag = e.tagName.toLowerCase();
+  const type = (e.getAttribute('type') || '').toLowerCase();
+  const field = tag === 'input' || tag === 'textarea' || tag === 'select' || e.isContentEditable;
+  const lab = e.labels && e.labels.length ? e.labels[0].innerText : '';
+  const btnValue = tag === 'input' && ['submit', 'button', 'reset'].includes(type) ? e.value : '';
+  return (e.getAttribute('aria-label') || lab || (field ? '' : e.innerText) || e.getAttribute('placeholder')
+          || e.getAttribute('title') || e.getAttribute('alt') || btnValue || '').trim().replace(/\s+/g, ' ');
+};
+"""
+
 _ELEMENTS_JS = r"""
 (max) => {
+""" + _NAME_FN + r"""
   const sel = 'a[href],button,input:not([type=hidden]),select,textarea,summary,[contenteditable=""],[contenteditable=true],'
     + '[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],'
     + '[role=combobox],[role=textbox],[role=searchbox],[onclick],[tabindex]:not([tabindex="-1"])';
@@ -208,9 +276,7 @@ _ELEMENTS_JS = r"""
     if (tag === 'input') role = ({checkbox: 'checkbox', radio: 'radio', submit: 'button', button: 'button', reset: 'button',
                                   image: 'button', range: 'slider'})[type] || 'edit';
     if (!role) role = e.isContentEditable ? 'edit' : 'button';
-    const lab = e.labels && e.labels.length ? e.labels[0].innerText : '';
-    let name = (e.getAttribute('aria-label') || lab || (tag === 'input' ? '' : e.innerText) || e.getAttribute('placeholder')
-                || e.getAttribute('title') || e.getAttribute('alt') || (type === 'submit' ? e.value : '') || '').trim().replace(/\s+/g, ' ');
+    const name = __locumName(e);
     const secret = type === 'password';
     let value = null;
     if (tag === 'input' || tag === 'textarea' || tag === 'select') value = secret ? (e.value ? '***' : '') : e.value;
@@ -233,14 +299,51 @@ _ELEMENTS_JS = r"""
 
 _RESOLVE_JS = r"""
 (css, scroll) => {
+""" + _NAME_FN + r"""
   const e = document.querySelector(css);
   if (!e) return null;
   if (scroll) e.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
   const r = e.getBoundingClientRect();
   const type = (e.getAttribute('type') || '').toLowerCase();
-  const name = (e.getAttribute('aria-label') || e.innerText || e.getAttribute('placeholder') || e.value || '').trim().slice(0, 80);
+  const name = __locumName(e).slice(0, 80);
   return {x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height,
           password: type === 'password', name, tag: e.tagName.toLowerCase(), disabled: !!e.disabled};
+}
+"""
+
+#: What Enter in ``css`` (default: the focused element) will activate, so the policy can
+#: judge a ``submit=True`` like a click on that control. ``kind``: ``self`` (a button or
+#: link: Enter presses it), ``form`` (implicit submission: ``label`` is the form's default
+#: button -- its first submit button --, ``action`` / ``form`` describe the form),
+#: ``nearby`` (no form: the closest button of the field's container, which page scripts
+#: usually wire to Enter -- chat "Send", search "Go"), ``none`` (nothing found), or
+#: ``null`` (no such element / nothing focused). Labels never come from field values.
+_ENTER_TARGET_JS = r"""
+(css) => {
+""" + _NAME_FN + r"""
+  const e = css ? document.querySelector(css) : document.activeElement;
+  if (!e || e === document.body || e === document.documentElement) return null;
+  const tag = e.tagName.toLowerCase();
+  const type = (e.getAttribute('type') || '').toLowerCase();
+  const short = (t) => String(t || '').slice(0, 80);
+  if (tag === 'button' || tag === 'a' || tag === 'summary' || (tag === 'input' && ['submit', 'button', 'reset', 'image',
+      'checkbox', 'radio'].includes(type)) || ['button', 'link', 'menuitem', 'tab'].includes(e.getAttribute('role') || ''))
+    return {kind: 'self', label: short(__locumName(e)), form: '', action: ''};
+  const form = e.form || e.closest('form');
+  if (form) {
+    const def = Array.from(form.elements).find(b => (b.tagName === 'BUTTON' || b.tagName === 'INPUT')
+                                                    && (b.type === 'submit' || b.type === 'image'));
+    return {kind: 'form', label: def ? short(__locumName(def) || def.getAttribute('name') || 'submit') : '',
+            form: short(form.getAttribute('aria-label') || form.getAttribute('name') || form.id || ''),
+            action: short(form.getAttribute('action') || '')};
+  }
+  const btn = 'button,input[type=submit],input[type=button],input[type=image],[role=button]';
+  let c = e.parentElement;
+  for (let i = 0; c && i < 6 && c !== document.body; i++, c = c.parentElement) {
+    const b = Array.from(c.querySelectorAll(btn)).find(b => b !== e && !b.disabled && b.getClientRects().length);
+    if (b) return {kind: 'nearby', label: short(__locumName(b)), form: '', action: ''};
+  }
+  return {kind: 'none', label: '', form: '', action: ''};
 }
 """
 
@@ -307,6 +410,14 @@ class Page:
             raise ElementNotFound(f"no element {target!r} on the page (snapshot ids change with every browser_observe)")
         return info
 
+    def enter_target(self, target: Any = None) -> Optional[Dict[str, Any]]:
+        """What pressing Enter in ``target`` (snapshot id / CSS; default: the focused element)
+        activates: ``{"kind", "label", "form", "action"}`` (see ``_ENTER_TARGET_JS``), or ``None``."""
+        css = None
+        if target is not None:
+            css = f'[data-locum-id="{int(target)}"]' if isinstance(target, int) or str(target).isdigit() else str(target)
+        return self.call_js(_ENTER_TARGET_JS, css)
+
     # -------------------------------------------------------------- input
     def click(self, target: Any) -> Dict[str, Any]:
         info = self.resolve(target)
@@ -362,7 +473,14 @@ class Browser:
         self.host, self.port = host, int(port)
         self.process = process
         self.profile = profile
+        if str(host).lower() not in _LOCAL_HOSTS:
+            raise CDPError(f"DevTools host {host!r} is not this machine (only 127.0.0.1 / localhost / ::1)")
         self.version = _http_json(host, port, "/json/version")
+        if not isinstance(self.version, dict) or not self.version.get("Browser") \
+                or not self.version.get("Protocol-Version") or not self.version.get("webSocketDebuggerUrl"):
+            raise CDPError(f"port {port} does not answer like a Chromium DevTools endpoint (/json/version)")
+        if not _is_local_ws(self.version["webSocketDebuggerUrl"]):
+            raise CDPError(f"port {port}: the DevTools WebSocket {self.version['webSocketDebuggerUrl']!r} is not local")
         product = str(self.version.get("Browser", ""))
         self.name = name or ("edge" if "Edg" in product else "chrome" if "Chrome" in product else "chromium")
         self.managed = process is not None or profile is not None
@@ -371,19 +489,37 @@ class Browser:
 
     # -------------------------------------------------------------- creation
     @classmethod
-    def attach(cls, port: Optional[int] = None, host: str = "127.0.0.1") -> "Browser":
-        """Connect to a browser that already exposes DevTools (see the module docstring)."""
-        ports = [int(port)] if port else discover_ports()
+    def attach(cls, port: Optional[int] = None, host: str = "127.0.0.1", *, allow_any: bool = False) -> "Browser":
+        """Connect to a browser that already exposes DevTools on this machine.
+
+        ``port`` given: exactly that port. Otherwise, in order, ``$LOCUM_CDP_PORT`` and the
+        browsers running with a locum-managed profile (:meth:`launch`). The everyday
+        profiles' ``DevToolsActivePort`` and port 9222 are tried only with ``allow_any=True``
+        or ``$LOCUM_CDP_ATTACH_ANY=1``: whatever listens there may be your signed-in
+        browser or another program. Every endpoint must answer ``/json/version`` like a
+        Chromium DevTools server whose WebSocket is local (127.0.0.1 / localhost / ::1).
+        """
+        allow = allow_any or attach_any_allowed()
+        ports = [int(port)] if port else (discover_ports(allow_any=True) if allow else discover_ports())
         errors = []
         for p in ports:
             try:
                 return cls(host, p)
+            except CDPError as exc:
+                errors.append(f"{p}: {exc}")
             except (OSError, ValueError, urllib.error.URLError) as exc:
                 errors.append(f"{p}: {exc.__class__.__name__}")
+        tried = ", ".join(map(str, ports)) or "none"
+        rejected = [e for e in errors if "DevTools" in e or "not local" in e]
+        hint = "" if port or allow else (
+            " Browsers with your everyday profile or on port 9222 are not attached to unless you pass "
+            "Browser.attach(port=...) / Browser.attach(allow_any=True) or set LOCUM_CDP_ATTACH_ANY=1.")
         raise CDPError(
-            "No browser with a DevTools port found (tried " + ", ".join(map(str, ports)) + "). Start one with "
-            "browser_launch / Browser.launch(), or start Edge/Chrome yourself with --remote-debugging-port=9222 "
-            "--user-data-dir=<a separate profile folder>.")
+            f"No locum-usable browser with a DevTools port found (tried {tried})."
+            + (" Rejected: " + "; ".join(rejected) + "." if rejected else "")
+            + " Start one with browser_launch / Browser.launch(), or start Edge/Chrome yourself with "
+            "--remote-debugging-port=9222 --user-data-dir=<a separate profile folder> and set LOCUM_CDP_PORT=9222."
+            + hint)
 
     @classmethod
     def launch(cls, browser: str = "edge", *, url: Optional[str] = None, profile_dir: Optional[str] = None,
@@ -404,7 +540,7 @@ class Browser:
                 if url:
                     b.new_page(url)
                 return b
-            except (OSError, ValueError, urllib.error.URLError):
+            except (CDPError, OSError, ValueError, urllib.error.URLError):
                 try:
                     (profile / "DevToolsActivePort").unlink()
                 except OSError:
@@ -418,7 +554,7 @@ class Browser:
             if port:
                 try:
                     return cls("127.0.0.1", port, process=proc, name=browser, profile=profile)
-                except (OSError, ValueError, urllib.error.URLError):
+                except (CDPError, OSError, ValueError, urllib.error.URLError):
                     pass
             if proc.poll() is not None and not port:
                 break
@@ -429,7 +565,8 @@ class Browser:
     def pages(self) -> List[PageInfo]:
         out = []
         for t in _http_json(self.host, self.port, "/json/list"):
-            if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+            # A target whose WebSocket is not on this machine is never connected to.
+            if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and _is_local_ws(t["webSocketDebuggerUrl"]):
                 out.append(PageInfo(t["id"], t.get("title", ""), t.get("url", ""), t["webSocketDebuggerUrl"]))
         return out
 
@@ -451,20 +588,40 @@ class Browser:
             raise ElementNotFound(f"no browser tab matches {match!r}" if match else "the browser has no open tab")
         info = pages[0]
         cached = self._pages.get(info.id)
-        if cached is not None and not cached.session.ws.closed:
+        if cached is not None and not cached.session.broken:
             cached.info = info
             return cached
+        if cached is not None:
+            try:
+                cached.close()
+            except Exception:
+                pass
         page = Page(info, self)
         self._pages[info.id] = page
         return page
 
     def new_page(self, url: str = "about:blank") -> Page:
-        from urllib.parse import quote
+        """Open a new tab on ``url`` (its ``#fragment`` included).
 
-        t = _http_json(self.host, self.port, "/json/new?" + quote(url, safe=":/?&=#%"), method="PUT")
+        The tab is created blank and then navigated over DevTools: ``/json/new?<url>``
+        cannot carry a fragment (HTTP clients strip it from the request)."""
+        t = _http_json(self.host, self.port, "/json/new?about:blank", method="PUT")
+        if not _is_local_ws(t.get("webSocketDebuggerUrl")):
+            raise CDPError(f"the new tab's DevTools WebSocket {t.get('webSocketDebuggerUrl')!r} is not local")
         info = PageInfo(t["id"], t.get("title", ""), t.get("url", ""), t["webSocketDebuggerUrl"])
         page = Page(info, self)
         self._pages[info.id] = page
+        if url and url != "about:blank":
+            page.session.call("Page.navigate", {"url": url})
+            info.url = url
+            end = time.monotonic() + 5.0  # until the new document replaced about:blank
+            while time.monotonic() < end:
+                try:
+                    if page.evaluate("location.href", timeout=2) != "about:blank":
+                        break
+                except CDPError:
+                    pass
+                time.sleep(0.05)
         return page
 
     @property
@@ -518,5 +675,5 @@ class Browser:
                     pass
 
 
-__all__ = ["BROWSERS", "Browser", "CDPError", "CDPSession", "Page", "PageInfo", "discover_ports",
+__all__ = ["BROWSERS", "Browser", "CDPError", "CDPSession", "Page", "PageInfo", "attach_any_allowed", "discover_ports",
            "find_executable", "managed_profile_dir"]

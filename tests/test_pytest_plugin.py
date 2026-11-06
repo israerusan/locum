@@ -39,20 +39,20 @@ def test_desktop_fixture_on_mock_and_failure_trace(pytester):
         """
         from locum.backends.mock import MockBackend
 
-        def _scene(desktop):
-            w = desktop.backend.add_window("Invoice", (100, 100, 400, 300))
+        def _scene(locum_desktop):
+            w = locum_desktop.backend.add_window("Invoice", (100, 100, 400, 300))
             w.add_button("OK", (20, 240, 80, 30))
 
-        def test_passes(desktop):
-            assert isinstance(desktop.backend, MockBackend)
-            assert desktop.failsafe.enabled is False
-            _scene(desktop)
-            desktop.click('button "OK"')
+        def test_passes(locum_desktop):
+            assert isinstance(locum_desktop.backend, MockBackend)
+            assert locum_desktop.failsafe.enabled is False
+            _scene(locum_desktop)
+            locum_desktop.click('button "OK"')
 
-        def test_fails(desktop):
-            _scene(desktop)
-            desktop.click('button "OK"')
-            desktop.find('button "Missing"', timeout=0)
+        def test_fails(locum_desktop):
+            _scene(locum_desktop)
+            locum_desktop.click('button "OK"')
+            locum_desktop.find('button "Missing"', timeout=0)
         """
     )
     result = pytester.runpytest(*MOCK)
@@ -67,8 +67,8 @@ def test_desktop_fixture_on_mock_and_failure_trace(pytester):
 def test_trace_path_in_user_properties_and_junit(pytester):
     pytester.makepyfile(
         """
-        def test_fails(desktop):
-            desktop.press("a")
+        def test_fails(locum_desktop):
+            locum_desktop.press("a")
             assert False
         """
     )
@@ -81,8 +81,8 @@ def test_trace_path_in_user_properties_and_junit(pytester):
 def test_trace_modes_and_dir(pytester):
     pytester.makepyfile(
         """
-        def test_ok(desktop):
-            desktop.press("a")
+        def test_ok(locum_desktop):
+            locum_desktop.press("a")
 
         def test_no_desktop():
             pass
@@ -98,22 +98,22 @@ def test_trace_modes_and_dir(pytester):
 def test_trace_off_and_tracer_fixture(pytester):
     pytester.makepyfile(
         """
-        def test_tracer(locum_tracer, desktop):
-            desktop.press("a")
+        def test_tracer(locum_tracer, locum_desktop):
+            locum_desktop.press("a")
             assert [s.method for s in locum_tracer.steps] == ["press"]
 
-        def test_fails(desktop):
+        def test_fails(locum_desktop):
             assert False
         """
     )
     pytester.runpytest(*MOCK).assert_outcomes(passed=1, failed=1)
     pytester.makepyfile(
         test_off="""
-        def test_tracer(locum_tracer, desktop):
+        def test_tracer(locum_tracer, locum_desktop):
             assert locum_tracer is None
-            assert "click" not in vars(desktop)
+            assert "click" not in vars(locum_desktop)
 
-        def test_fails(desktop):
+        def test_fails(locum_desktop):
             assert False
         """
     )
@@ -133,8 +133,8 @@ def test_ini_options(pytester):
     )
     pytester.makepyfile(
         """
-        def test_ok(desktop):
-            assert desktop.backend.name == "mock"
+        def test_ok(locum_desktop):
+            assert locum_desktop.backend.name == "mock"
         """
     )
     env_backend = os.environ.pop("LOCUM_BACKEND", None)
@@ -152,8 +152,8 @@ def test_app_fixture_launches_waits_and_closes_only_its_windows(pytester):
         import pytest
 
         @pytest.fixture
-        def fake_launch(desktop):
-            be = desktop.backend
+        def fake_launch(locum_desktop):
+            be = locum_desktop.backend
             be.add_window("Other", (0, 0, 200, 200), app="other")
 
             def launch(command, **kw):
@@ -162,18 +162,18 @@ def test_app_fixture_launches_waits_and_closes_only_its_windows(pytester):
 
             be.launch = launch
             yield be
-            # Runs after app's teardown: both launched windows are closed, the other one is left alone.
+            # Runs after locum_app's teardown: both launched windows are closed, the other one is left alone.
             assert [w.title for w in be.windows] == ["Other"]
 
-        def test_app(fake_launch, app):
-            w = app("calc", window="Calc window", timeout=1)
+        def test_app(fake_launch, locum_app):
+            w = locum_app("calc", window="Calc window", timeout=1)
             assert w.title == "Calc window"
-            any_new = app("notes")
+            any_new = locum_app("notes")
             assert any_new.title == "Notes window"
             assert fake_launch.launched == ["calc", "notes"]
 
-        def test_app_window_closed_by_the_test(fake_launch, app):
-            app("calc", window="Calc window").close()
+        def test_app_window_closed_by_the_test(fake_launch, locum_app):
+            locum_app("calc", window="Calc window").close()
         """
     )
     pytester.runpytest(*MOCK).assert_outcomes(passed=2)
@@ -182,8 +182,8 @@ def test_app_fixture_launches_waits_and_closes_only_its_windows(pytester):
 def test_app_fixture_timeout_fails_with_a_trace(pytester):
     pytester.makepyfile(
         """
-        def test_app(app):
-            app("nothing.exe", window="Never", timeout=0.1)
+        def test_app(locum_app):
+            locum_app("nothing.exe", window="Never", timeout=0.1)
         """
     )
     result = pytester.runpytest(*MOCK)
@@ -206,17 +206,24 @@ def test_local_fixtures_override_the_plugin(pytester):
         def app():
             return "local app"
 
-        def test_local(desktop, app):
+        @pytest.fixture
+        def locum_desktop():
+            return "local locum desktop"
+
+        def test_local(desktop, app, locum_desktop):
             assert desktop == "local desktop" and app == "local app"
+            assert locum_desktop == "local locum desktop"
         """
     )
     pytester.runpytest(*MOCK).assert_outcomes(passed=1)
+    # The short aliases are opt-in, and local fixtures still win over them.
+    pytester.runpytest(*MOCK, "--locum-aliases").assert_outcomes(passed=1)
 
 
 def test_bad_backend_is_a_fixture_error(pytester):
     pytester.makepyfile(
         """
-        def test_x(desktop):
+        def test_x(locum_desktop):
             pass
         """
     )

@@ -92,6 +92,9 @@ class MCPServer:
 
     #: Extra seconds granted beyond a tool's own ``timeout`` argument.
     TIMEOUT_MARGIN = 15.0
+    #: Largest ``timeout`` argument any tool honours (``wait_for``/``wait_window`` clamp to 0-120 s);
+    #: a bigger value extends the server's deadline no further.
+    MAX_TOOL_TIMEOUT = 120.0
 
     def __init__(
         self,
@@ -246,11 +249,23 @@ class MCPServer:
 
     # ------------------------------------------------------- call execution
     def _timeout_for(self, args: Dict[str, Any]) -> Optional[float]:
+        """The call's time limit: ``call_timeout``, extended for a tool's own ``timeout`` argument.
+
+        The extension is capped at :attr:`MAX_TOOL_TIMEOUT` (the most any tool waits)
+        plus the margin, so ``wait_for(timeout=1e9)`` cannot switch the server
+        deadline off; non-numeric, non-finite and negative values are ignored.
+        """
         t = self.call_timeout
         req = args.get("timeout")
-        if t is not None and isinstance(req, (int, float)) and not isinstance(req, bool) and math.isfinite(req):
-            t = max(t, float(req) + self.TIMEOUT_MARGIN)
-        return t
+        if t is None or isinstance(req, bool) or not isinstance(req, (int, float)):
+            return t
+        try:
+            req = float(req)
+        except (OverflowError, ValueError):  # a (finite) int too large for a float: just huge
+            req = self.MAX_TOOL_TIMEOUT
+        if not math.isfinite(req) or req < 0:
+            return t
+        return max(t, min(req, self.MAX_TOOL_TIMEOUT) + self.TIMEOUT_MARGIN)
 
     def _send(self, obj: Any) -> None:
         out = self._out
@@ -273,7 +288,10 @@ class MCPServer:
             self._jobs.pop(_key(job.id), None)
         job.response = response
         if response is not None and not job.batch:
-            self._send(response)
+            # Under the job's send lock: a heartbeat the monitor decided on before
+            # ``answered`` was set is written first, never after this response.
+            with job.send_lock:
+                self._send(response)
         job.done.set()
 
     def _work(self) -> None:
@@ -328,7 +346,12 @@ class MCPServer:
                                           "message": f"{job.name} running for {elapsed:.0f}s"}
                 if job.timeout is not None:
                     params["total"] = job.timeout
-                self._send({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
+                # Decided and written under the lock the final answer is written under,
+                # and only while the job is unanswered: no heartbeat follows the response.
+                with job.send_lock:
+                    if job.answered:
+                        return
+                    self._send({"jsonrpc": "2.0", "method": "notifications/progress", "params": params})
 
     def _cancel_request(self, params: Dict[str, Any]) -> None:
         with self._jobs_lock:
@@ -435,6 +458,8 @@ class _Job:
         self.scope = CancelScope(timeout)  # counts from receipt: queueing time is included
         self.done = threading.Event()
         self.answered = False
+        #: Serialises this job's final response with its progress heartbeats.
+        self.send_lock = threading.Lock()
         self.response: Optional[Dict[str, Any]] = None
 
 

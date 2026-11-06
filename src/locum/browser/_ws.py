@@ -13,7 +13,7 @@ import os
 import socket
 import struct
 import threading
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import urlsplit
 
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -41,7 +41,9 @@ class WebSocket:
             path += "?" + parts.query
         self._sock = socket.create_connection((host, port), timeout=timeout)
         self._send_lock = threading.Lock()
-        self._buf = b""
+        self._buf = bytearray()
+        self._parts: List[bytes] = []  # fragments of a message not yet complete
+        self._parts_len = 0
         self.closed = False
         key = base64.b64encode(os.urandom(16)).decode()
         req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -71,22 +73,17 @@ class WebSocket:
             if not chunk:
                 raise WebSocketError("connection closed during the WebSocket handshake")
             self._buf += chunk
-        head, _, self._buf = self._buf.partition(marker)
+        head, _, rest = bytes(self._buf).partition(marker)
+        self._buf = bytearray(rest)
         return head
 
-    def _read_exact(self, n: int) -> bytes:
-        out = bytearray()
-        if self._buf:
-            take = self._buf[:n]
-            out += take
-            self._buf = self._buf[len(take):]
-        while len(out) < n:
-            chunk = self._sock.recv(min(1 << 20, n - len(out)))
-            if not chunk:
-                self.closed = True
-                raise WebSocketError("WebSocket connection closed")
-            out += chunk
-        return bytes(out)
+    def _fill(self) -> None:
+        """Append what the socket has to the buffer (``socket.timeout`` leaves the buffer intact)."""
+        chunk = self._sock.recv(1 << 20)
+        if not chunk:
+            self.closed = True
+            raise WebSocketError("WebSocket connection closed")
+        self._buf += chunk
 
     def _send_frame(self, opcode: int, payload: bytes) -> None:
         header = bytearray([0x80 | opcode])
@@ -110,28 +107,53 @@ class WebSocket:
             raise WebSocketError("WebSocket is closed")
         self._send_frame(OP_TEXT, text.encode("utf-8"))
 
-    def _recv_frame(self) -> Tuple[bool, int, bytes]:
-        b1, b2 = self._read_exact(2)
-        fin, opcode = bool(b1 & 0x80), b1 & 0x0F
-        n = b2 & 0x7F
+    def _parse_frame(self) -> Optional[Tuple[bool, int, bytes]]:
+        """One complete frame from the buffer (removed from it), or ``None`` if more bytes are needed."""
+        buf = self._buf
+        if len(buf) < 2:
+            return None
+        b1, b2 = buf[0], buf[1]
+        n, pos = b2 & 0x7F, 2
         if n == 126:
-            n = struct.unpack("!H", self._read_exact(2))[0]
+            if len(buf) < 4:
+                return None
+            n, pos = struct.unpack("!H", bytes(buf[2:4]))[0], 4
         elif n == 127:
-            n = struct.unpack("!Q", self._read_exact(8))[0]
+            if len(buf) < 10:
+                return None
+            n, pos = struct.unpack("!Q", bytes(buf[2:10]))[0], 10
         if n > self.MAX_MESSAGE:
+            self.closed = True  # the stream cannot be resynchronised
             raise WebSocketError(f"WebSocket frame of {n} bytes is too large")
-        mask = self._read_exact(4) if b2 & 0x80 else None
-        data = self._read_exact(n)
+        mask = None
+        if b2 & 0x80:
+            if len(buf) < pos + 4:
+                return None
+            mask, pos = bytes(buf[pos:pos + 4]), pos + 4
+        if len(buf) < pos + n:
+            return None
+        data = bytes(buf[pos:pos + n])
+        del buf[:pos + n]
         if mask:
             data = _mask(data, mask)
-        return fin, opcode, data
+        return bool(b1 & 0x80), b1 & 0x0F, data
 
     def recv(self, timeout: Optional[float] = None) -> str:
-        """The next text message; raises ``socket.timeout`` after ``timeout`` seconds."""
+        """The next text message; raises ``socket.timeout`` after ``timeout`` seconds without one.
+
+        A timeout never loses data: bytes of a frame (or of a fragmented message)
+        that arrived so far stay buffered and the next ``recv`` resumes there, so a
+        frame that stalls mid-way does not desynchronise the stream.
+        """
+        if self.closed:
+            raise WebSocketError("WebSocket is closed")
         self._sock.settimeout(timeout)
-        parts = []
         while True:
-            fin, opcode, data = self._recv_frame()
+            frame = self._parse_frame()
+            if frame is None:
+                self._fill()
+                continue
+            fin, opcode, data = frame
             if opcode == OP_PING:
                 self._send_frame(OP_PONG, data)
                 continue
@@ -144,11 +166,15 @@ class WebSocket:
                 except OSError:
                     pass
                 raise WebSocketError("WebSocket closed by the peer")
-            parts.append(data)
-            if sum(len(p) for p in parts) > self.MAX_MESSAGE:
+            self._parts.append(data)
+            self._parts_len += len(data)
+            if self._parts_len > self.MAX_MESSAGE:
+                self.closed = True
                 raise WebSocketError("WebSocket message too large")
             if fin:
-                return b"".join(parts).decode("utf-8", errors="replace")
+                out = b"".join(self._parts)
+                self._parts, self._parts_len = [], 0
+                return out.decode("utf-8", errors="replace")
 
     def close(self) -> None:
         if not self.closed:

@@ -41,6 +41,29 @@ PATCH_SIZE = 28
 #: Oldest observation (seconds) whose unchanged windows ``observe(reuse=...)`` reuses;
 #: bounds a missed change event to a short window of staleness.
 REUSE_MAX_AGE = 20.0
+#: Processes whose top-level windows only frame content drawn by *another* process
+#: (Store/UWP apps such as Calculator and Settings: the window belongs to
+#: ApplicationFrameHost.exe, its content and its change events to the app). Such a
+#: window is reused only when the backend names the hosted processes
+#: (``window_content_pids``); otherwise it is always walked again.
+HOST_PROCESSES = frozenset({"applicationframehost.exe"})
+
+
+def _window_pids(backend: Any, info: WindowInfo) -> Optional[frozenset]:
+    """Processes whose change events can alter ``info``'s content: its own plus any
+    process with a child window inside it (the UWP CoreWindow hosted by
+    ApplicationFrameHost, a WebView2 or other cross-process child). ``None`` when that
+    cannot be told (a host-process window without hosted-pid information)."""
+    own = {int(info.pid)} if info.pid else set()
+    lookup = getattr(backend, "window_content_pids", None)
+    extra = _safe(lambda: lookup(info.handle)) if callable(lookup) else None
+    is_host = (info.app or "").lower() in HOST_PROCESSES
+    if extra is None:
+        return None if is_host or not own else frozenset(own)
+    pids = own | {int(p) for p in extra if p}
+    if is_host and not (pids - own):
+        return None  # the hosted app's window is detached: its events cannot be attributed
+    return frozenset(pids) if pids else None
 
 #: States worth showing to a model, in display order.
 _SHOWN_STATES = ("focused", "disabled", "checked", "selected", "expanded", "collapsed", "readonly", "occluded")
@@ -224,6 +247,9 @@ class Observation:
     # Live desktop roots + prefix cache from observe(): selectors built later (lazily,
     # add_element, refresh) are proven unique among all windows, not only inside their own.
     _ctx: Optional["_SelectorContext"] = field(default=None, init=False, repr=False, compare=False)
+    # Highest element id ever handed out in this chain of observations (obsdiff.compare
+    # carries it forward). Ids reported "gone" stay retired: a new element never gets one.
+    _max_id: int = field(default=0, init=False, repr=False, compare=False)
 
     # Older spelling (an Observation built by hand, e.g. by the toolkit before any observe):
     # setting the roots gives a context that cannot re-read them from a backend.
@@ -309,7 +335,8 @@ class Observation:
                 _refresh(el, node, self._ctx)
                 return el
         b = _safe(lambda: node.bounds)
-        next_id = max((e.id for e in self.elements), default=0) + 1
+        next_id = self.next_id()
+        win = self._window_of(node)
         entry = ObservedElement(
             id=next_id,
             role=(_safe(lambda: node.role, "") or "unknown").lower(),
@@ -319,11 +346,39 @@ class Observation:
             states=frozenset(_safe(lambda: node.states, frozenset()) or ()),
             selector=selector or LAZY_SELECTOR,
             node=node,
+            window_title=win.title if win is not None else "",
+            app=win.app if win is not None else "",
             _selector_source=None if selector else (
                 lambda n=node, c=self._ctx: _selector_in(n, c)),
         )
         self.elements.append(entry)
+        self._max_id = next_id
         return entry
+
+    def _window_of(self, node: AccessibleNode) -> Optional[WindowInfo]:
+        """The listed top-level window containing ``node``, so an element added later
+        carries the same ``window_title`` as one found by ``observe`` (the diff of the
+        next ``changes_only`` matches on it when the backend has no runtime ids)."""
+        by_handle = {w.handle: w for w in self.windows if w.handle is not None}
+        if not by_handle:
+            return None
+        cur: Optional[AccessibleNode] = node
+        # With runtime ids (UI Automation) the diff matches without the title: skip the
+        # cross-process walk up the tree and only try the node's own handle.
+        depth = 0 if _safe(lambda: node.runtime_id) else 64
+        for _ in range(depth + 1):
+            if cur is None:
+                break
+            w = by_handle.get(_safe(lambda: cur.handle))
+            if w is not None:
+                return w
+            cur = _safe(lambda: cur.parent())
+        return None
+
+    def next_id(self) -> int:
+        """The id the next new element gets: above every id used in this chain of
+        observations, including ids already reported gone (they are never reused)."""
+        return max(max((e.id for e in self.elements), default=0), int(getattr(self, "_max_id", 0) or 0)) + 1
 
     # ------------------------------------------------------------------ output
     def describe_element(self, el: ObservedElement) -> str:
@@ -467,7 +522,11 @@ def _selector(node: AccessibleNode, roots: Optional[Sequence[AccessibleNode]] = 
 
 
 def _root_key(root: AccessibleNode) -> Tuple[Any, ...]:
-    return (_safe(lambda: root.handle), _safe(lambda: root.role), _safe(lambda: root.name),
+    # The stable part of the title: a spinner or dirty marker animating in a window title
+    # (selectors already tolerate it) must not reset the prefix cache on every selector.
+    from .._nodeinfo import stable_title
+
+    return (_safe(lambda: root.handle), _safe(lambda: root.role), stable_title(_safe(lambda: root.name, "") or ""),
             _safe(lambda: root.automation_id))
 
 
@@ -597,7 +656,9 @@ def observe(
         reuse: A previous observation (same options) whose elements may be reused for
             windows that did not change: only with a backend that reports
             accessibility change events (UI Automation on Windows), only for windows
-            whose process raised no event since then and whose rectangle and title are
+            whose process -- and every process whose content the window hosts (a
+            Store/UWP app inside ApplicationFrameHost, see :data:`HOST_PROCESSES`) --
+            raised no event since then and whose rectangle and title are
             unchanged, and only within :data:`REUSE_MAX_AGE` seconds. Occlusion is
             recomputed. Without events this does nothing.
         prune_documents: Process ids (browsers connected over DevTools) whose windows are
@@ -691,7 +752,12 @@ def observe(
         zi = z_index.get(handle)
         start_len = len(elements)
         g = prev_groups.get(handle) if handle is not None else None
-        if (g is not None and info is not None and info.pid and dirty is not None and info.pid not in dirty
+        # Events are attributed to the *sending* process, which for a Store/UWP window is
+        # not the window's owner (ApplicationFrameHost): check every process it hosts, now
+        # and at the previous observe (a suspended app's CoreWindow detaches).
+        pids = _window_pids(backend, info) if tracker is not None and info is not None else None
+        if (g is not None and info is not None and pids is not None and g.get("pids") is not None
+                and dirty is not None and not ((pids | g["pids"]) & dirty)
                 and g["complete"] and g["rect"] == info.rect and g["title"] == win_title):
             for old in g["elements"]:
                 if len(elements) >= limit:
@@ -705,7 +771,7 @@ def observe(
                     _selector_source=(lambda n=old.node: _selector_in(n, ctx)) if selectors else None,
                 ))
             groups[handle] = {"rect": info.rect, "title": win_title, "elements": elements[start_len:],
-                              "complete": len(elements) - start_len == len(g["elements"])}
+                              "complete": len(elements) - start_len == len(g["elements"]), "pids": pids}
             reused += 1
             continue
         complete = True
@@ -765,7 +831,7 @@ def observe(
             )
         if handle is not None and info is not None:
             groups[handle] = {"rect": info.rect, "title": win_title, "elements": elements[start_len:],
-                              "complete": complete}
+                              "complete": complete, "pids": pids}
 
     # ---------------------------------------------------------------- screenshot
     shot = None
@@ -799,6 +865,7 @@ def observe(
         region=region,
     )
     obs.capped = limit > 0 and len(elements) >= limit
+    obs._max_id = len(elements)
     obs._groups, obs._gen, obs._opts, obs._taken = groups, gen0, opts, taken
     obs.reused_windows = reused
     if pruned:

@@ -56,6 +56,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import failsafe as _failsafe_mod
+from ._cancel import check as _cancel_check
 from .backends.base import CAP_ACCESSIBILITY, AccessibleNode, Backend
 from .element import ELEMENT_STATES, Element
 from .errors import (
@@ -1286,6 +1287,7 @@ class Desktop:
                 before = [w.handle for w in self.backend.list_windows()]
             except Exception:
                 before = None  # cannot tell old from new windows: accept any match
+        _cancel_check()  # a timed-out / cancelled call must not start an application
         proc = self.backend.launch(command, **kw)
         if wait_window is None:
             return proc

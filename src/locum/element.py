@@ -50,6 +50,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
+from ._cancel import check as _cancel_check
 from .backends.base import CAP_CLIPBOARD, AccessibleNode
 from .errors import (
     ActionTimeout,
@@ -661,6 +662,7 @@ class Element:
         checks in :class:`~locum.mouse.Mouse`/:class:`~locum.keyboard.Keyboard`
         never see them; every state-changing element action calls this first.
         """
+        _cancel_check()
         fs = getattr(self.desktop, "failsafe", None)
         check = getattr(fs, "check", None)
         if callable(check):
@@ -704,7 +706,7 @@ class Element:
         if b is None or not self.is_visible:
             if not require:
                 return None
-            _safe(lambda: self._node.scroll_into_view(), False)
+            self._native(lambda: self._node.scroll_into_view(), False)
             b = self.bounds
             if b is None or b.is_empty or not self.is_visible:
                 # Still hidden/offscreen: its (virtual) bounds may lie under another control.
@@ -713,7 +715,7 @@ class Element:
         part = self._on_screen(b)
         if part is None and require:
             # Entirely off-screen: ask the toolkit to scroll it into view once.
-            _safe(lambda: self._node.scroll_into_view(), False)
+            self._native(lambda: self._node.scroll_into_view(), False)
             nb = self.bounds
             part = self._on_screen(nb) if nb is not None and not nb.is_empty else None
             if part is not None:
@@ -733,9 +735,20 @@ class Element:
             raise ElementNotFound(f"Click point ({point.x}, {point.y}) of {self!r} is off-screen")
         return point
 
+    @staticmethod
+    def _native(fn: Callable[[], Any], default: Any = None) -> Any:
+        """Run a state-changing native action (invoke, toggle, set_value, focus...) best effort.
+
+        The running call's cancel scope is checked right before the action -- after
+        any wait that preceded it -- and *outside* the error swallowing, so a call
+        that already timed out or was cancelled changes nothing.
+        """
+        _cancel_check()
+        return _safe(fn, default)
+
     def _try_invoke(self) -> bool:
         self._guard()
-        ok = bool(_safe(lambda: self._node.invoke(), False))
+        ok = bool(self._native(lambda: self._node.invoke(), False))
         if ok:
             _notify(self, "invoke")
         return ok
@@ -747,6 +760,7 @@ class Element:
         info = owning_window(self.backend, self._node, guess=False)
         if info is None:
             return False
+        _cancel_check()
         try:
             self.backend.activate_window(info.handle)
         except Exception:
@@ -868,7 +882,7 @@ class Element:
         Raises :class:`ElementNotFound` if the element is disabled or the click
         did not give it focus (see :meth:`type`)."""
         self._guard()
-        if _safe(lambda: self._node.focus(), False):
+        if self._native(lambda: self._node.focus(), False):
             return self
         if self._is_text_input():
             self._focus_by_click()
@@ -989,7 +1003,7 @@ class Element:
         if self._has_focus(allow_ancestor=False) is True:
             return
         self._check_enabled()
-        if _safe(lambda: self._node.focus(), False):
+        if self._native(lambda: self._node.focus(), False):
             # Native focus targeted this element, but the focused element being
             # merely an ancestor still is not proof; that case goes to the click.
             state = self._has_focus(allow_ancestor=False)
@@ -1036,7 +1050,7 @@ class Element:
         target = text if clear else (self.value or "") + text
         typed = text
         if mode is not False:
-            ok = bool(_safe(lambda: self._node.set_value(target), False))
+            ok = bool(self._native(lambda: self._node.set_value(target), False))
             if ok:
                 current = self.value
                 if current is None or _same_text(current, target) or mode is True:
@@ -1211,7 +1225,7 @@ class Element:
     def toggle(self) -> "Element":
         """Toggle a checkbox / toggle button (native first, then click)."""
         self._guard()
-        if _safe(lambda: self._node.toggle(), False):
+        if self._native(lambda: self._node.toggle(), False):
             _notify(self, "toggle")
             return self
         return self.click()
@@ -1251,7 +1265,7 @@ class Element:
     def select(self) -> "Element":
         """Select a list/tree/tab item (native select, then invoke, then click)."""
         self._guard()
-        if _safe(lambda: self._node.select(), False):
+        if self._native(lambda: self._node.select(), False):
             _notify(self, "select")
             return self
         return self.click()
@@ -1261,7 +1275,7 @@ class Element:
         self._guard()
         if "expanded" in self.states:
             return self
-        if _safe(lambda: self._node.expand(), False):
+        if self._native(lambda: self._node.expand(), False):
             _notify(self, "expand")
             return self
         role = self.role
@@ -1276,7 +1290,7 @@ class Element:
         self._guard()
         if "collapsed" in self.states:
             return self
-        if _safe(lambda: self._node.collapse(), False):
+        if self._native(lambda: self._node.collapse(), False):
             _notify(self, "collapse")
             return self
         role = self.role
@@ -1289,7 +1303,7 @@ class Element:
     def scroll_into_view(self) -> "Element":
         """Ask the backend to scroll the element into view (best effort)."""
         self._guard()
-        _safe(lambda: self._node.scroll_into_view(), False)
+        self._native(lambda: self._node.scroll_into_view(), False)
         return self
 
     def scroll(self, dy: int, dx: int = 0) -> "Element":

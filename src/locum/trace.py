@@ -31,9 +31,11 @@ colored by status; clicking one shows its screenshot large with the target
 highlighted, the selector, arguments, result or error and annotations.
 
 Secrets: text typed into a password field (:meth:`Desktop.type` with a
-password field focused, :meth:`Element.type`/``set_text`` on one) and text put
-on the clipboard is recorded as ``***``, and that text is also scrubbed from
-errors and log messages. Pass ``redact=[...]`` for other strings that must
+password field focused, :meth:`Element.type`/``set_text`` on one), text put on
+or read from the clipboard (``clipboard_set``/``clipboard_get``), text a call on
+a password field returns and the text value of a ``wait_until`` predicate are
+recorded as ``***``, and that text is also scrubbed from errors and log
+messages. A password field's value never appears in element descriptions. Pass ``redact=[...]`` for other strings that must
 never appear in a trace. Screenshots are taken as they are: a password field
 shows its bullets, but other sensitive content on screen is captured -- use
 ``screenshots=False`` (or ``"errors"``) where that matters.
@@ -99,6 +101,10 @@ _TARGET_PARAMS = ("selector", "target", "start", "image", "title", "wait_window"
 # (kind, method) -> parameter holding text that may be secret.
 _TEXT_PARAMS = {("desktop", "type"): "text", ("element", "type"): "text", ("element", "set_text"): "text",
                 ("desktop", "clipboard_set"): "text"}
+# Calls whose text result is never recorded: the clipboard may hold anything (a
+# password copied from a manager...), and a wait_until predicate's value is
+# arbitrary user data (``d.wait_until(lambda: field.value)``).
+_SECRET_RESULTS = frozenset({"clipboard_get", "wait_until"})
 _MIN_SCRUB = 3  # shorter secrets are masked in arguments but not scrubbed out of other text
 _MAX_REPR = 300
 
@@ -361,6 +367,10 @@ class Tracer:
         self.logs: List[Dict[str, Any]] = []
         self.started_at: Optional[float] = None
         self.finished_at: Optional[float] = None
+        #: Screenshot taken by :meth:`capture_final` (e.g. when a test fails after its last step).
+        self.final_screenshot: Optional[str] = None
+        self.final_screen: Optional[List[int]] = None
+        self.final_screenshot_error: Optional[str] = None
         self._secrets: set = {str(s) for s in redact if s}
         self._lock = threading.RLock()
         self._local = threading.local()
@@ -535,6 +545,23 @@ class Tracer:
             return True  # cannot tell: err on the side of not recording it
         return False
 
+    def _secret_result(self, owner: Any, kind: str, name: str, params: Dict[str, Any], result: Any) -> bool:
+        """Whether the text this call returned is a secret: what was on the clipboard,
+        the value of a password field, or whatever a ``wait_until`` predicate returned
+        (arbitrary user code, typically reading a field's value)."""
+        if not isinstance(result, str) or not result:
+            return False
+        if name in _SECRET_RESULTS:
+            return True
+        from ._nodeinfo import is_password
+
+        try:
+            if kind == "element" and is_password(owner.node):
+                return True
+            return any(_is_element(v) and is_password(v.node) for v in params.values())
+        except Exception:
+            return True  # cannot tell: err on the side of not recording it
+
     def _scrub(self, text: Optional[str]) -> Optional[str]:
         if not text or not self._secrets:
             return text
@@ -598,7 +625,13 @@ class Tracer:
             step.duration = time.perf_counter() - t0
             if result is not owner:
                 self._note_target(step, result)
-            step.result = self._scrub(_fmt(result))
+            if self._secret_result(owner, kind, name, params, result):
+                if len(result) >= _MIN_SCRUB:
+                    with self._lock:
+                        self._secrets.add(result)
+                step.result = MASK
+            else:
+                step.result = self._scrub(_fmt(result))
             self._instrument_result(result)
             return result
         finally:
@@ -638,6 +671,20 @@ class Tracer:
             pass
 
     # ---------------------------------------------------------- screenshots
+    def capture_final(self) -> Optional[str]:
+        """Take one screenshot now, outside any step, as :attr:`final_screenshot`.
+
+        The pytest plugin calls it when a test fails, so a trace recorded with
+        ``screenshots="errors"`` also shows the screen at the moment of a failure
+        that no step raised (an ``assert`` in the test). Works also after
+        :meth:`stop`. Returns the data URL, or ``None`` when no screenshot could be taken.
+        """
+        holder = TraceStep(index=-1, method="final")
+        self.final_screenshot = self._capture(holder)
+        self.final_screen = holder.screen
+        self.final_screenshot_error = holder.screenshot_error
+        return self.final_screenshot
+
     def _capture(self, step: TraceStep) -> Optional[str]:
         screen = getattr(self.desktop, "screen", None)
         if screen is None:
@@ -687,6 +734,9 @@ class Tracer:
         """The trace as JSON-able data (``screenshots=False`` drops the image data URLs)."""
         steps = list(self.steps)
         end = self.finished_at or time.time()
+        final: Dict[str, Any] = {"final_screen": self.final_screen, "final_screenshot_error": self.final_screenshot_error}
+        if screenshots:
+            final["final_screenshot"] = self.final_screenshot
         return {
             "title": self.title,
             "started_at": self.started_at,
@@ -699,6 +749,7 @@ class Tracer:
                        "failed": sum(1 for s in steps if s.failed)},
             "steps": [s.to_dict(screenshots=screenshots) for s in steps],
             "logs": [dict(r) for r in self.logs],
+            **final,
         }
 
     def to_json(self, *, indent: Optional[int] = 2, screenshots: bool = True) -> str:
@@ -950,6 +1001,11 @@ def _render_html(tracer: Tracer) -> str:
             for r in tracer.logs
         )
         loose = f'<section class="detail" data-i="log"><h2>Log outside steps</h2><ul class="ann">{lis}</ul></section>'
+    if tracer.final_screenshot or tracer.final_screenshot_error:
+        holder = TraceStep(index=len(steps), method="final", screen=tracer.final_screen)
+        body = (_shot_html(holder, tracer.final_screenshot, "Screen at failure") if tracer.final_screenshot
+                else f'<div class="meta">screenshot failed: {_esc(tracer.final_screenshot_error)}</div>')
+        loose = f'<section class="detail" data-i="final"><h2>Screen at failure</h2>{body}</section>' + loose
     c = data["counts"]
     parts = [
         "<!DOCTYPE html>",

@@ -2144,7 +2144,24 @@ class DesktopToolkit:
         args = {"text": text, "element": element, "selector": selector, "clear": bool(clear), "submit": bool(submit), "tab": tab}
         ctx = self._browser_ctx(b, page, name)
         if submit:
+            # Enter submits the field's form (its default button: "Pay now") or triggers the page's
+            # own handler: the policy judges that control, as for a click on it (cf. _with_default_button).
             ctx["enter"] = True
+            hit = page.enter_target(target)
+            if not hit:
+                ctx["target_unknown"] = True  # nothing focused / readable: Enter goes who knows where
+            else:
+                label = str(hit.get("label") or "")
+                extra = [x for x in (label, str(hit.get("form") or ""), str(hit.get("action") or "")) if x]
+                if extra:
+                    ctx["enter_target"] = extra
+                if label and hit.get("kind") != "self":
+                    ctx["target"] = f"{name} -> {label}"
+                    how = "the form's default button" if hit.get("kind") == "form" else "the nearby button"
+                    desc += f" (Enter activates {how} {label!r})"
+                elif hit.get("kind") == "form" and hit.get("action"):
+                    desc += f" (Enter submits the form to {str(hit['action'])!r})"
+            ctx["description"] = desc
         return self._act("browser_type", args, ctx, desc,
                          lambda: (page.type(text, target, clear=bool(clear), submit=bool(submit)),
                                   f"{desc[0].upper()}{desc[1:]}; the tab is now {page.title!r}.")[1],

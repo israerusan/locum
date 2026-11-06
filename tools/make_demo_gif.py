@@ -20,6 +20,7 @@ import argparse
 import importlib.util
 import pathlib
 import sys
+import time
 from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
@@ -27,6 +28,8 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CAPTION = "locum demo (mock desktop)"
 REAL_CAPTION = "locum driving Windows 11 Calculator and Paint"
+#: Seconds to let the real app repaint before each frame is captured.
+SETTLE = 0.35
 BAR = 30
 
 
@@ -113,6 +116,9 @@ def record_real(width: int) -> List[Tuple[Image.Image, int]]:
     d = Desktop()
 
     def capture(desk, label: str, ms: int = 260) -> None:
+        # The step hook runs right after the click/drag is sent; the app repaints a moment
+        # later. Without this pause the frame labelled "clicked 'Equals'" still shows 30.
+        time.sleep(SETTLE)
         aw = desk.backend.active_window()
         region = aw.rect.intersect(desk.virtual_rect()) if aw is not None else desk.virtual_rect()
         shot = desk.screenshot(region)

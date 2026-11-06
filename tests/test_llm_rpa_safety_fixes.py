@@ -441,7 +441,7 @@ def test_recorded_dollar_brace_text_replays_literally(monkeypatch):
     w = be.add_window("T", (100, 100, 400, 300))
     e = w.add_edit("Name", (10, 50, 200, 28))
     b = w.add_button("OK", (10, 100, 80, 30))
-    rec = Recorder(d)
+    rec = Recorder(d, trust_unknown_focus=True)  # manual feed: no real focus
     c = e.screen_rect.center
     rec.feed(("down", "left", c.x, c.y))
     rec.feed(("up", "left", c.x, c.y))

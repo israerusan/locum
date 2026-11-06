@@ -1,15 +1,22 @@
-"""pytest plugin: ``desktop`` / ``app`` fixtures and a trace for every failing test.
+"""pytest plugin: ``locum_desktop`` / ``locum_app`` fixtures and a trace for every failing test.
 
 Installed with locum and registered automatically (``pytest11`` entry point)::
 
-    def test_calculator(app):
-        calc = app("calc.exe", window="Calculator")
+    def test_calculator(locum_app):
+        calc = locum_app("calc.exe", window="Calculator")
         calc.find('button "Seven"').click()
 
-    def test_on_ci(desktop):             # pytest --locum-backend mock
-        win = desktop.backend.add_window("Invoice", (100, 100, 400, 300))
+    def test_on_ci(locum_desktop):       # pytest --locum-backend mock
+        win = locum_desktop.backend.add_window("Invoice", (100, 100, 400, 300))
         win.add_button("OK", (20, 240, 80, 30))
-        desktop.click('button "OK"')
+        locum_desktop.click('button "OK"')
+
+The fixtures are namespaced because the plugin is active in *every* project
+that has locum installed: generic names such as ``app`` would collide with the
+``app`` fixture of web-framework suites (Flask, FastAPI, pytest-flask...), and
+which one a test got would depend on plugin registration order. The short names
+``desktop`` / ``app`` are available opt-in (``--locum-aliases`` or the
+``locum_fixture_aliases = true`` ini key).
 
 Options (command line, or the ini keys in brackets):
 
@@ -17,7 +24,13 @@ Options (command line, or the ini keys in brackets):
   desktop, for CI), ``windows``, ``macos``, ``x11``. Default: the
   ``LOCUM_BACKEND`` environment variable, else the ini key, else the platform's.
 * ``--locum-trace {off,on,failed}`` [``locum_trace``] -- trace tests that use
-  ``desktop`` and save the trace never, always, or (default) when the test fails.
+  ``locum_desktop`` and save the trace never, always, or (default) when the test fails.
+* ``--locum-screenshots {errors,all,none}`` [``locum_screenshots``] -- every step
+  is recorded, but by default (``errors``) a screenshot is taken only at a failing
+  step, plus one final screenshot when the test fails. ``all`` adds one after every
+  step (slow, and the whole desktop is captured each time); ``none`` takes none.
+* ``--locum-aliases`` [``locum_fixture_aliases``] -- also provide the fixtures as
+  ``desktop`` and ``app``.
 * ``--locum-trace-dir DIR`` [``locum_trace_dir``] -- where traces go
   (default ``.locum-traces``, relative to the directory pytest was started in).
 
@@ -38,10 +51,12 @@ from typing import Any, Callable, Iterator, List, Optional
 
 import pytest
 
-__all__ = ["TRACE_MODES", "trace_path_for"]
+__all__ = ["TRACE_MODES", "SCREENSHOT_MODES", "trace_path_for"]
 
 #: Values of ``--locum-trace``.
 TRACE_MODES = ("off", "on", "failed")
+#: Values of ``--locum-screenshots`` -> the :class:`~locum.trace.Tracer` ``screenshots`` argument.
+SCREENSHOT_MODES = {"errors": "errors", "all": True, "none": False}
 
 _TRACER_KEY = "_locum_tracer"
 _TRACE_PATH_KEY = "_locum_trace_path"
@@ -58,9 +73,22 @@ def pytest_addoption(parser: Any) -> None:
                          "or failed (default).")
     group.addoption("--locum-trace-dir", dest="locum_trace_dir", default=None, metavar="DIR",
                     help="Directory for saved traces (default: .locum-traces).")
+    group.addoption("--locum-screenshots", dest="locum_screenshots", default=None, choices=tuple(SCREENSHOT_MODES),
+                    help="Trace screenshots: errors (default: at a failing step and when the test fails), "
+                         "all (after every step) or none.")
+    group.addoption("--locum-aliases", dest="locum_aliases", action="store_true", default=None,
+                    help="Also provide the locum_desktop/locum_app fixtures as 'desktop' and 'app'.")
     parser.addini("locum_backend", "Default backend for the locum fixtures (overridden by $LOCUM_BACKEND).", default="")
     parser.addini("locum_trace", "locum trace mode: off, on or failed.", default="failed")
     parser.addini("locum_trace_dir", "Directory for saved locum traces.", default=".locum-traces")
+    parser.addini("locum_screenshots", "locum trace screenshots: errors, all or none.", default="errors")
+    parser.addini("locum_fixture_aliases", "Also provide the locum fixtures as 'desktop' and 'app'.",
+                  type="bool", default=False)
+
+
+def pytest_configure(config: Any) -> None:
+    if config.getoption("locum_aliases") or config.getini("locum_fixture_aliases"):
+        config.pluginmanager.register(_Aliases(), "locum-fixture-aliases")
 
 
 # ---------------------------------------------------------------- settings
@@ -79,6 +107,13 @@ def _trace_mode(config: Any) -> str:
     if mode not in TRACE_MODES:
         raise pytest.UsageError(f"locum_trace must be one of {', '.join(TRACE_MODES)}, got {mode!r}")
     return mode
+
+
+def _screenshots(config: Any) -> Any:
+    mode = str(config.getoption("locum_screenshots") or config.getini("locum_screenshots") or "errors").strip().lower()
+    if mode not in SCREENSHOT_MODES:
+        raise pytest.UsageError(f"locum_screenshots must be one of {', '.join(SCREENSHOT_MODES)}, got {mode!r}")
+    return SCREENSHOT_MODES[mode]
 
 
 def _trace_dir(config: Any) -> str:
@@ -105,14 +140,14 @@ def trace_path_for(nodeid: str, directory: str) -> str:
 # ---------------------------------------------------------------- fixtures
 
 @pytest.fixture
-def desktop(request: Any) -> Iterator[Any]:
+def locum_desktop(request: Any) -> Iterator[Any]:
     """A fresh :class:`~locum.desktop.Desktop` on the selected backend (see ``--locum-backend``).
 
     ``mock`` gets a new in-memory :class:`~locum.backends.mock.MockBackend` per test
     (reach it as ``desktop.backend`` to build the scene); real backends run with
     the screen-corner fail-safe on. The desktop is closed after the test (held
     keys and buttons are released). With ``--locum-trace`` other than ``off``
-    the test is traced (:func:`locum_tracer`).
+    the test is traced (:func:`locum_tracer`; screenshots per ``--locum-screenshots``).
     """
     from .desktop import Desktop
 
@@ -128,7 +163,7 @@ def desktop(request: Any) -> Iterator[Any]:
     if _trace_mode(config) != "off":
         from .trace import Tracer
 
-        tracer = Tracer(d, title=request.node.nodeid).start()
+        tracer = Tracer(d, title=request.node.nodeid, screenshots=_screenshots(config)).start()
         setattr(request.node, _TRACER_KEY, tracer)
     try:
         yield d
@@ -141,13 +176,13 @@ def desktop(request: Any) -> Iterator[Any]:
 
 
 @pytest.fixture
-def locum_tracer(request: Any, desktop: Any) -> Any:
-    """The :class:`~locum.trace.Tracer` recording this test's ``desktop`` (``None`` with ``--locum-trace off``)."""
+def locum_tracer(request: Any, locum_desktop: Any) -> Any:
+    """The :class:`~locum.trace.Tracer` recording this test's ``locum_desktop`` (``None`` with ``--locum-trace off``)."""
     return getattr(request.node, _TRACER_KEY, None)
 
 
 @pytest.fixture
-def app(desktop: Any) -> Iterator[Callable[..., Any]]:
+def locum_app(locum_desktop: Any) -> Iterator[Callable[..., Any]]:
     """Factory that launches an application and returns its window.
 
     ``app(command, window=None, timeout=None, **launch_kw)`` runs
@@ -156,10 +191,11 @@ def app(desktop: Any) -> Iterator[Callable[..., Any]]:
     window that appears after the launch). At teardown it closes the windows it
     returned -- only those, and only if they are still open::
 
-        def test_notepad(app):
-            pad = app("notepad.exe", window="*Notepad", timeout=15)
+        def test_notepad(locum_app):
+            pad = locum_app("notepad.exe", window="*Notepad", timeout=15)
             pad.find("document").type("hello")
     """
+    desktop = locum_desktop
     opened: List[Any] = []
 
     def launch(command: Any, window: Any = None, *, timeout: Optional[float] = None, **kw: Any) -> Any:
@@ -179,6 +215,20 @@ def app(desktop: Any) -> Iterator[Callable[..., Any]]:
         raise errors[0]
 
 
+class _Aliases:
+    """Opt-in short names (``--locum-aliases`` / ``locum_fixture_aliases = true``)."""
+
+    @pytest.fixture
+    def desktop(self, locum_desktop: Any) -> Any:
+        """Alias of ``locum_desktop``."""
+        return locum_desktop
+
+    @pytest.fixture
+    def app(self, locum_app: Any) -> Any:
+        """Alias of ``locum_app``."""
+        return locum_app
+
+
 # ------------------------------------------------------------------- hooks
 
 @pytest.hookimpl(hookwrapper=True)
@@ -189,6 +239,11 @@ def pytest_runtest_makereport(item: Any, call: Any) -> Iterator[None]:
         return
     report = outcome.get_result()
     mode = _trace_mode(item.config)
+    if report.failed and tracer.screenshots is not False and tracer.final_screenshot is None:
+        try:  # the screen at the failure, also when no step raised (an assert in the test)
+            tracer.capture_final()
+        except Exception:  # pragma: no cover - capture errors are recorded by the tracer
+            pass
     if mode == "on":
         save = report.when == "teardown"
     else:

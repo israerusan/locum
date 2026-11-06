@@ -5,7 +5,11 @@ PNG on a 1080p desktop) after every action. :func:`compare` instead
 
 * matches the new elements to the previous ones -- by the backend's runtime id
   when it has one (UI Automation), else by window, role, name and position --
-  and **keeps their ids**, so ``[12]`` still means the same button;
+  and **keeps their ids**, so ``[12]`` still means the same button. Two elements
+  whose runtime ids are both known and differ are never paired (a new "Delete"
+  button where "Cancel" was is a new element, not Cancel renamed), and a control
+  whose *name* changed is matched by position only when its name is content (a
+  text display, an edit, a status bar) or its automation id is the same;
 * lists only the elements that are new, changed (name, value, states, position)
   or gone, and the windows that opened or closed;
 * finds the screen area whose pixels changed (ignoring tiny isolated changes such
@@ -51,11 +55,36 @@ def _b(r: Rect) -> Tuple[int, int, int, int]:
     return (r.left, r.top, r.width, r.height)
 
 
+#: Roles whose name is their *content* (it changes while the element stays the same):
+#: only these may be matched by position alone when the name changed. A button,
+#: checkbox, menu item ... with a different name at the same place is a different control.
+CONTENT_ROLES = frozenset({
+    "text", "statictext", "label", "edit", "document", "statusbar", "progressbar", "slider",
+    "spinbutton", "combobox", "cell", "heading", "paragraph", "tooltip", "titlebar", "value",
+})
+
+
+def _automation_id(el: "ObservedElement") -> str:
+    aid = _safe(lambda: getattr(el.node, "automation_id", ""), "")
+    return aid if isinstance(aid, str) else ""
+
+
+def _position_key(e: "ObservedElement") -> Optional[Hashable]:
+    """Same place, new name: a display ("Display is 0" -> "Display is 15"), or any
+    control whose automation id says it is the same one ("Play" -> "Pause")."""
+    aid = _automation_id(e)
+    if aid:
+        return (e.window_title, e.role, _b(e.bounds), "aid", aid)
+    if e.role in CONTENT_ROLES:
+        return (e.window_title, e.role, _b(e.bounds))
+    return None
+
+
 # Match tiers, strongest first. Each maps an element to a key (or None = no key).
 _TIERS: Sequence[Callable[["ObservedElement"], Optional[Hashable]]] = (
     lambda e: ("rid", _runtime_id(e)) if _runtime_id(e) else None,
     lambda e: (e.window_title, e.role, e.name, _b(e.bounds)),
-    lambda e: (e.window_title, e.role, _b(e.bounds)),  # same place, new text (a display)
+    _position_key,
     lambda e: (e.window_title, e.role, e.name) if e.name else None,  # same control, moved
 )
 
@@ -65,6 +94,13 @@ def match(prev: Sequence["ObservedElement"], new: Sequence["ObservedElement"]) -
     pairs: List[Tuple["ObservedElement", "ObservedElement"]] = []
     left_prev = list(prev)
     left_new = list(new)
+    # Known, different runtime ids = different elements, whatever a later tier says.
+    rids: Dict[int, Optional[Tuple[Any, ...]]] = {id(e): _runtime_id(e) for e in (*left_prev, *left_new)}
+
+    def compatible(p: "ObservedElement", n: "ObservedElement") -> bool:
+        a, b = rids.get(id(p)), rids.get(id(n))
+        return a is None or b is None or a == b
+
     for key_of in _TIERS:
         if not left_prev or not left_new:
             break
@@ -80,8 +116,9 @@ def match(prev: Sequence["ObservedElement"], new: Sequence["ObservedElement"]) -
         for n in left_new:
             k = _safe(lambda: key_of(n))
             bucket = index.get(k) if k is not None else None
-            if bucket:
-                p = bucket.pop(0)
+            pick = next((i for i, p in enumerate(bucket) if compatible(p, n)), None) if bucket else None
+            if pick is not None:
+                p = bucket.pop(pick)
                 used.add(id(p))
                 pairs.append((p, n))
             else:
@@ -243,7 +280,8 @@ def compare(prev: "Observation", new: "Observation") -> ObservationDiff:
             diff.changed.append((old, n, c))
         else:
             diff.unchanged += 1
-    next_id = max([e.id for e in prev.elements] + [getattr(prev, "_max_id", 0)], default=0) + 1
+    # Above every id ever used in the chain (ids reported gone are never handed out again).
+    next_id = max([e.id for e in prev.elements] + [int(getattr(prev, "_max_id", 0) or 0)], default=0) + 1
     for n in new.elements:
         if id(n) not in matched_new:
             n.id = next_id
@@ -285,4 +323,4 @@ def compare(prev: "Observation", new: "Observation") -> ObservationDiff:
     return diff
 
 
-__all__ = ["FULL_IMAGE_SHARE", "ObservationDiff", "changed_regions", "compare", "match"]
+__all__ = ["CONTENT_ROLES", "FULL_IMAGE_SHARE", "ObservationDiff", "changed_regions", "compare", "match"]

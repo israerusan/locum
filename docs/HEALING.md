@@ -55,7 +55,14 @@ When a heal fails, the usual `ElementNotFound` message gets
 unchanged.
 
 The scan calls `locum._cancel.check()` for every node and visits at most
-`HealOptions.max_nodes` nodes (20,000 by default).
+`HealOptions.max_nodes` nodes (20,000 by default). **A truncated scan does not
+heal.** A "clear winner" among the nodes scanned so far may not be the best
+match overall, and the real target may be among the nodes that were never
+scanned. The lookup fails with the reason `scan truncated after N nodes`, and
+`HealOutcome.truncated` is `True`. To fix it, raise `max_nodes` or narrow the
+selector's scope (a `window "…"` prefix, `Element.find`). Use
+`HealOptions(allow_partial=True)` only if you accept a decision based on part
+of the tree.
 
 ## Logging
 

@@ -438,6 +438,8 @@ def test_record_saves_python_and_json(desk, be, tmp_path, monkeypatch):
     from locum.rpa import recorder as rec_mod
 
     def fake_start(self):
+        # Fed events never really focus the field: tell the (fail-closed) recorder to trust it.
+        self.trust_unknown_focus = True
         for ev in (("move", 370, 99), ("down", "left", 370, 99), ("up", "left", 370, 99), ("type", "ACME")):
             self.feed(ev)
 

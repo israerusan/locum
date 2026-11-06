@@ -1002,6 +1002,8 @@ class Policy:
                 else f"{tool_name!r} always requires confirmation"
         # Key names are deliberately not matched: the Delete key is editing, not a "delete" commit.
         haystack = [str(context.get(k)) for k in ("target", "target_text", "selector", "command") if context.get(k)]
+        # What the Enter of the action activates (a browser form's default button, its action URL).
+        haystack.extend(_strings(context.get("enter_target") or ()))
         # Controls a keyboard shortcut presses (access key / accelerator: alt+p on "&Pay now").
         haystack.extend(_strings(context.get("shortcut_targets") or ()))
         for key in ("selector", "command", "title"):
@@ -1037,6 +1039,9 @@ class Policy:
         ``target_unknown`` (the input can activate a control that cannot be
         identified; see ``unknown_target``), ``arg_texts`` (argument strings
         matched against ``confirm_patterns``, for integration tools),
+        ``enter`` / ``enter_target`` (the action presses Enter, and what that
+        activates -- e.g. a browser form's default button "Pay now" or its action
+        URL; matched against ``confirm_patterns`` like a target),
         ``require_confirmation`` (always ask, e.g. ``ToolSpec(confirm=True)``).
         For allow rules: ``target_node`` (the accessibility node acted on,
         matched against rule selectors), ``target_window`` (title of the window

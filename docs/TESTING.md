@@ -3,18 +3,18 @@
 locum ships two things for tests:
 
 * a **pytest plugin** (registered automatically when locum is installed) with
-  `desktop` and `app` fixtures, a `--locum-backend` switch (use `mock` on CI) and
-  a trace saved for every failing test;
+  `locum_desktop` and `locum_app` fixtures, a `--locum-backend` switch (use `mock`
+  on CI) and a trace saved for every failing test;
 * **traces** (`locum.trace`): a step-by-step record of everything a `Desktop`
-  did -- method, arguments, resolved target, result or error, log notes and a
-  screenshot -- saved as one self-contained HTML page.
+  did -- method, arguments, resolved target, result or error, log notes and
+  screenshots -- saved as one self-contained HTML page.
 
 ## The pytest plugin
 
 ```python
 # test_calculator.py
-def test_seven_plus_one(app):
-    calc = app("calc.exe", window="Calculator", timeout=15)
+def test_seven_plus_one(locum_app):
+    calc = locum_app("calc.exe", window="Calculator", timeout=15)
     for name in ("Seven", "Plus", "One", "Equals"):
         calc.find(f'button "{name}"').click()
     assert "8" in calc.find("#CalculatorResults").name
@@ -23,21 +23,40 @@ def test_seven_plus_one(app):
 ```
 pytest                                  # the platform's backend, a trace for each failure
 pytest --locum-backend mock             # in-memory virtual desktop (CI, no display needed)
-pytest --locum-trace on                 # save a trace for every test that uses `desktop`
+pytest --locum-trace on                 # save a trace for every test that uses `locum_desktop`
 pytest --locum-trace off                # no tracing at all
 pytest --locum-trace-dir build/traces   # where traces go (default: .locum-traces)
+pytest --locum-screenshots all          # a screenshot after every step (default: errors only)
+pytest --locum-aliases                  # also provide the fixtures as `desktop` and `app`
 ```
 
 ### Fixtures
 
 | Fixture | What it gives you |
 | --- | --- |
-| `desktop` | A fresh `Desktop` per test on the selected backend. Real backends run with the screen-corner fail-safe **on**; `mock` gets a new `MockBackend` per test (`desktop.backend`) and no fail-safe. Closed after the test (held keys/buttons released). |
-| `app` | A factory: `app(command, window=None, *, timeout=None, **launch_kw)` launches through `desktop.launch(command, wait_window=window)` and returns the new `Window` (`window=None`: any window that appears after the launch). At teardown it closes the windows **it** returned that are still open -- nothing else. |
-| `locum_tracer` | The `Tracer` recording this test's `desktop` (`None` with `--locum-trace off`), e.g. to assert on steps or save extra copies. |
+| `locum_desktop` | A fresh `Desktop` per test on the selected backend. Real backends run with the screen-corner fail-safe **on**; `mock` gets a new `MockBackend` per test (`desktop.backend`) and no fail-safe. Closed after the test (held keys/buttons released). |
+| `locum_app` | A factory: `locum_app(command, window=None, *, timeout=None, **launch_kw)` launches through `locum_desktop.launch(command, wait_window=window)` and returns the new `Window` (`window=None`: any window that appears after the launch). At teardown it closes the windows **it** returned that are still open -- nothing else. |
+| `locum_tracer` | The `Tracer` recording this test's `locum_desktop` (`None` with `--locum-trace off`), e.g. to assert on steps or save extra copies. |
 
-A fixture with the same name in your `conftest.py` or test module overrides the
-plugin's (standard pytest rules), so existing suites keep working.
+The names are prefixed because the plugin is active in **every** project that
+has locum installed. A plugin fixture called `app` would collide with the `app`
+fixture of Flask, FastAPI or pytest-flask suites, and which one a test received
+would depend on the order the plugins were registered in. With the `locum_`
+prefix, locum never takes a name another plugin or your `conftest.py` uses. A
+fixture with the same name in your `conftest.py` or test module still overrides
+the plugin's (standard pytest rules).
+
+**Short names (opt-in).** `--locum-aliases`, or `locum_fixture_aliases = true`
+in the ini file, also provides the fixtures as `desktop` and `app`. Turn this on
+only in suites where nothing else defines those names:
+
+```toml
+[tool.pytest.ini_options]
+locum_fixture_aliases = true
+```
+
+**Upgrading.** Older versions named the fixtures `desktop` and `app`. Rename the
+test parameters, or turn on the aliases.
 
 ### Options
 
@@ -49,6 +68,8 @@ Each option also has an ini key, so a project can set defaults in `pytest.ini`
 | `--locum-backend NAME` | `locum_backend` | `$LOCUM_BACKEND`, else the ini key, else the platform's backend |
 | `--locum-trace {off,on,failed}` | `locum_trace` | `failed` |
 | `--locum-trace-dir DIR` | `locum_trace_dir` | `.locum-traces` (relative to where pytest was started) |
+| `--locum-screenshots {errors,all,none}` | `locum_screenshots` | `errors` |
+| `--locum-aliases` | `locum_fixture_aliases` | `false` |
 
 ```toml
 [tool.pytest.ini_options]
@@ -61,7 +82,7 @@ against the in-memory desktop.
 
 ### Traces of failing tests
 
-With the default `--locum-trace failed`, every test that uses `desktop` is
+With the default `--locum-trace failed`, every test that uses `locum_desktop` is
 traced and, when it fails (in setup, the test itself or teardown), the trace is
 saved as `<trace dir>/<test id>.html` (characters other than letters, digits,
 `.`, `_`, `-` become `_`). The failure report says where:
@@ -73,42 +94,51 @@ trace saved: /work/.locum-traces/tests_test_invoice.py_test_submit.html
 
 and the path is added to the test's `user_properties` as `locum_trace`, which
 `--junitxml` writes as a `<property>` (CI systems can attach it as an artifact).
-Tests that pass leave nothing behind. Tracing takes a screenshot after every
-step (about as long as one `desktop.screenshot()`); use `--locum-trace off` for
-timing-sensitive suites.
+Tests that pass leave nothing behind.
+
+**Screenshots.** Every step is recorded, but screenshots are taken only when they
+are needed. This is the default, `--locum-screenshots errors`: one screenshot at
+the step that failed, plus a final "Screen at failure" screenshot when the test
+fails (this also covers an `assert` in the test that no step raised). A screenshot
+captures the whole desktop and takes about as long as one
+`desktop.screenshot()`. Taking one after every step of every test would slow the
+suite down, and would put whatever else was on screen into every trace.
+`--locum-screenshots all` adds a screenshot after every step, when you need the
+full film strip. `none` takes no screenshots (steps are still recorded). Use
+`--locum-trace off` to turn tracing off entirely.
 
 ### Testing against the mock backend
 
 The mock backend is a full virtual desktop: windows, widgets, an
 accessibility tree, a rendered screen. Build the scene through
-`desktop.backend`:
+`locum_desktop.backend`:
 
 ```python
-def test_submit_invoice(desktop):
-    win = desktop.backend.add_window("Invoice", (100, 100, 500, 400), app="erp")
+def test_submit_invoice(locum_desktop):
+    win = locum_desktop.backend.add_window("Invoice", (100, 100, 500, 400), app="erp")
     win.add_edit("Customer", (20, 50, 250, 28))
     sent = []
     win.add_button("Submit", (20, 340, 80, 30), on_click=lambda w: sent.append(True))
 
-    desktop.find('edit "Customer"').type("ACME")
-    desktop.click('button "Submit"')
+    locum_desktop.find('edit "Customer"').type("ACME")
+    locum_desktop.click('button "Submit"')
     assert sent == [True]
 ```
 
-To test code that uses `app(...)` on the mock backend, make `launch` open a
+To test code that uses `locum_app(...)` on the mock backend, make `launch` open a
 window (the mock's own `launch` only records the command):
 
 ```python
 import pytest
 
 @pytest.fixture
-def fake_calc(desktop):
-    be = desktop.backend
+def fake_calc(locum_desktop):
+    be = locum_desktop.backend
     be.launch = lambda command, **kw: be.add_window("Calculator", (200, 200, 320, 480), app="calc")
     return be
 
-def test_opens(fake_calc, app):
-    assert app("calc.exe", window="Calculator").title == "Calculator"
+def test_opens(fake_calc, locum_app):
+    assert locum_app("calc.exe", window="Calculator").title == "Calculator"
 ```
 
 ## Traces in scripts
@@ -173,15 +203,25 @@ Without JavaScript all steps are shown one after another.
 
 ### Secrets
 
-Text typed into a password field (`d.type(...)` while one has focus,
-`element.type(...)` / `element.set_text(...)` on one) and text put on the
-clipboard is recorded as `***`, and is scrubbed from error and log messages.
-Screenshots show the screen as it is (password fields show bullets, but other
-sensitive data on screen is captured): use `screenshots="errors"` or `False`,
-or `redact=[...]` for known strings in text, where that matters.
+These are recorded as `***`, and are also scrubbed from error and log messages:
+
+* text typed into a password field (`d.type(...)` while one has focus,
+  `element.type(...)` / `element.set_text(...)` on one);
+* text put on the clipboard (`clipboard_set`), and text read from it
+  (`clipboard_get` -- the clipboard often holds a password copied from a
+  password manager);
+* text that a call on a password field returns, and the text value of a
+  `wait_until` predicate. `d.wait_until(lambda: field.value)` returns the field's
+  content, so it is never written to the trace.
+
+A password field's value never appears in element descriptions. Screenshots show
+the screen as it is. Password fields show bullets, but any other sensitive data
+on screen is captured. Use `screenshots="errors"` (the plugin's default) or
+`False` where that matters, and `redact=[...]` for known strings in text.
 
 Screenshots are of the **whole screen**, so a trace of a test run on your own
 desktop also contains every other window that was visible (a terminal, mail,
-a browser). Keep the trace directory out of version control
-(`.locum-traces/` in `.gitignore`), and run UI tests on a dedicated machine or
-VM, or with `--locum-trace off`, when that matters.
+a browser). This is why the plugin only takes screenshots on failure by default.
+Keep the trace directory out of version control (`.locum-traces/` in
+`.gitignore`), and run UI tests on a dedicated machine or VM, or with
+`--locum-screenshots none` / `--locum-trace off`, when that matters.

@@ -350,7 +350,7 @@ def test_clipboard_typing_is_recorded_as_text():
     from locum.backends.mock import MockBackend
 
     d = Desktop(MockBackend(), sleep=_noop, default_timeout=0)
-    r = Recorder(d, use_selectors=False).start(source="backend")
+    r = Recorder(d, use_selectors=False, trust_unknown_focus=True).start(source="backend")  # empty desktop: no focus
     d.keyboard.type("Hello 1,234.56", mode="clipboard")
     d.press("tab")
     d.hotkey("ctrl+v")  # an explicit paste later is still a paste

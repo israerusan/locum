@@ -18,11 +18,16 @@ rectangle contains a point).
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any, Callable, Iterable, List, Optional, Sequence
 
 from .types import Point, Rect, WindowInfo
 
-__all__ = ["ancestors", "owning_window", "node_app", "window_at", "list_windows_safe", "target_label", "is_password"]
+__all__ = [
+    "ancestors", "owning_window", "node_app", "window_at", "list_windows_safe", "target_label", "is_password",
+    "stable_title",
+]
 
 _MAX_DEPTH = 256
 
@@ -32,6 +37,46 @@ def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
         return fn()
     except Exception:
         return default
+
+
+# Window-title decorations that come and go on their own: an animated spinner
+# glyph (terminals, "✳ ◐ ◑ ⠋"), a dirty marker ("*doc.txt", "● main.py"), a
+# notification count ("(3) Inbox") and Windows' "(Not Responding)" suffix.
+_EDGE_MARKS = frozenset("*•·")  # *, bullet, middle dot
+_EDGE_CATEGORIES = frozenset({"So", "Co", "Cf", "Cc", "Mn", "Zs", "Zl", "Zp"})
+_LEADING_COUNT = re.compile(r"^\(\d+\+?\)\s+")
+_NOT_RESPONDING = re.compile(r"\s*[(\[]\s*not responding\s*[)\]]\s*$", re.I)
+
+
+def _edge_mark(ch: str) -> bool:
+    return ch.isspace() or ch in _EDGE_MARKS or unicodedata.category(ch) in _EDGE_CATEGORIES
+
+
+def stable_title(title: Any) -> str:
+    """``title`` without the decorations that change on their own.
+
+    Strips leading/trailing symbol glyphs (spinners, status icons, emoji,
+    private-use icon-font glyphs), ``*`` / ``•`` / ``·`` dirty markers, a
+    leading ``(3)`` notification count and a trailing ``(Not Responding)``:
+    ``"◐ Pypilot library"`` -> ``"Pypilot library"``, ``"*doc.txt - Notepad"``
+    -> ``"doc.txt - Notepad"``. Letters, digits and ordinary punctuation
+    (``~/src - bash``, ``Mail (1 unread)``) are kept. A title that is nothing
+    but decoration is returned stripped of whitespace only.
+    """
+    text = str(title or "").strip()
+    cur = text
+    while True:
+        prev = cur
+        cur = _NOT_RESPONDING.sub("", cur)
+        i, j = 0, len(cur)
+        while i < j and _edge_mark(cur[i]):
+            i += 1
+        while j > i and _edge_mark(cur[j - 1]):
+            j -= 1
+        cur = _LEADING_COUNT.sub("", cur[i:j])
+        if cur == prev:
+            break
+    return cur or text
 
 
 def list_windows_safe(backend: Any) -> List[WindowInfo]:
@@ -114,6 +159,11 @@ def owning_window(
     candidates = pool or [w for w in wins if not (pid and w.pid and w.pid != pid)]
     if title:
         same_title = [w for w in candidates if w.title == title]
+        if not same_title:
+            # The title animated (spinner glyph) or gained a dirty marker between
+            # list_windows() and reading the node: compare the stable parts.
+            core = stable_title(title)
+            same_title = [w for w in candidates if stable_title(w.title) == core]
         if len(same_title) == 1:
             return same_title[0]
         if same_title:

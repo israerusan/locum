@@ -28,6 +28,17 @@ produce no input events (``Element.set_text`` through the accessibility API,
 ``set_text``/``invoke``/... actions with the element's selector.
 * ``"manual"`` -- nothing is hooked; call :meth:`Recorder.feed` yourself.
 
+Secrets: text typed into a password field is never recorded; the flow reads it
+from ``${env.LOCUM_PASSWORD}`` and the script from ``os.environ``. The recorder
+*fails closed*: when it cannot tell which field has the focus (the backend has
+no focus support, ``focused_element()`` fails or returns nothing, the field's
+state cannot be read), the typed text is treated as a secret too and replaced by
+``${env.LOCUM_SECRET}`` (with a comment in the script) -- pass
+``trust_unknown_focus=True`` to record it verbatim instead. The focus is checked
+for every piece of typed text, so a typing burst ends where the focus moves
+(Tab from the user name into the password field, a click, an auto-advancing
+form) and the password part is never glued onto the user name.
+
 Output: :meth:`Recorder.to_flow` (a YAML/JSON-ready dict for
 :func:`locum.rpa.flow.run_flow`), :meth:`Recorder.to_python` (a script using
 the :class:`locum.Desktop` API) and :meth:`Recorder.save`.
@@ -62,7 +73,7 @@ from ..types import MouseButton
 if TYPE_CHECKING:  # pragma: no cover
     from ..desktop import Desktop
 
-__all__ = ["Recorder", "RecordedAction", "ACTION_KINDS", "PASSWORD_ENV"]
+__all__ = ["Recorder", "RecordedAction", "ACTION_KINDS", "PASSWORD_ENV", "SECRET_ENV"]
 
 _log = logging.getLogger("locum.recorder")
 
@@ -130,7 +141,18 @@ class _BackendHooks:
             originals["key_up"](key)
 
         def type_text(text: str) -> None:
-            originals["type_text"](text)  # raises NotSupported -> keyboard falls back to keys, which we see
+            # The event is fed after typing (a NotSupported here makes the keyboard fall back
+            # to keys, which we see one by one); the focus *before* typing is what the text
+            # went into, so take it now -- a Tab in the text may move the focus elsewhere.
+            recorders = list(self.recorders)
+            for rec in recorders:
+                rec._snapshot_focus()
+            try:
+                originals["type_text"](text)
+            except BaseException:
+                for rec in recorders:
+                    rec._pre_focus = None
+                raise
             feed(("type", text))
 
         def set_clipboard(text: str) -> None:
@@ -272,6 +294,14 @@ def _escape_flow_strings(value: Any) -> Any:
 PASSWORD_ENV = "LOCUM_PASSWORD"
 _PASSWORD_REF = "${env." + PASSWORD_ENV + "}"
 _PASSWORD_PY = f"os.environ[{PASSWORD_ENV!r}]"
+#: Environment variable that replaces text typed while the focused field could not be
+#: determined (the recorder fails closed: that text may have been a password).
+SECRET_ENV = "LOCUM_SECRET"
+_SECRET_REF = "${env." + SECRET_ENV + "}"
+_SECRET_PY = f"os.environ[{SECRET_ENV!r}]"
+#: :attr:`RecordedAction.secret_reason` of text typed with an unknown focus.
+UNKNOWN_FOCUS = "unknown_focus"
+_UNKNOWN_FOCUS_NOTE = "typed text not recorded: the focused field could not be determined"
 
 
 def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
@@ -291,7 +321,11 @@ def _same(a: Any, b: Any) -> bool:
 
 
 def _root_key(root: Any) -> Tuple[Any, ...]:
-    return (_safe(lambda: root.handle), _safe(lambda: root.role), _safe(lambda: root.name),
+    # The stable part of the title: a spinner or dirty marker animating in a window title
+    # (selectors already tolerate it) must not reset the prefix cache on every selector.
+    from .._nodeinfo import stable_title
+
+    return (_safe(lambda: root.handle), _safe(lambda: root.role), stable_title(_safe(lambda: root.name, "") or ""),
             _safe(lambda: root.automation_id))
 
 
@@ -444,6 +478,9 @@ class RecordedAction:
             ``os.environ["LOCUM_PASSWORD"]`` (:data:`PASSWORD_ENV`).
         mode: ``type`` only: ``"clipboard"`` for text locum pasted that holds a
             Tab/newline, so the replay pastes it too instead of pressing those keys.
+        secret_reason: Why a ``secret`` action is secret: ``""`` (a password field) or
+            ``"unknown_focus"`` (the focused field could not be determined, so the text
+            is replaced by ``${env.LOCUM_SECRET}`` / ``os.environ["LOCUM_SECRET"]``).
     """
 
     kind: str
@@ -464,6 +501,7 @@ class RecordedAction:
     presses: int = 1
     secret: bool = False
     mode: str = ""
+    secret_reason: str = ""
     _last_time: float = field(default=0.0, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -471,6 +509,8 @@ class RecordedAction:
             raise ValueError(f"kind must be one of {', '.join(ACTION_KINDS)}, got {self.kind!r}")
         if self.secret:
             self.text = ""  # a password is never stored, saved or logged
+        else:
+            self.secret_reason = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {"kind": self.kind, "time": round(self.time, 4)}
@@ -484,6 +524,8 @@ class RecordedAction:
             d["text"] = self.text
             if self.secret:
                 d["secret"] = True
+                if self.secret_reason:
+                    d["secret_reason"] = self.secret_reason
             if self.mode and self.kind == "type":
                 d["mode"] = self.mode
         elif self.kind == "press":
@@ -520,11 +562,12 @@ class RecordedAction:
         """
         step = _escape_flow_strings(self._raw_flow_step())
         if self.secret:  # the one deliberate interpolation: the password comes from the environment
+            ref = _SECRET_REF if self.secret_reason == UNKNOWN_FOCUS else _PASSWORD_REF
             args = step.get("type") if self.kind == "type" else step.get("set_text")
             if isinstance(args, dict):
-                args["text"] = _PASSWORD_REF
+                args["text"] = ref
             else:
-                step["type"] = _PASSWORD_REF
+                step["type"] = ref
         return step
 
     def _raw_flow_step(self) -> Dict[str, Any]:
@@ -601,12 +644,14 @@ class RecordedAction:
             at = repr(self.selector) if self.selector else f"({self.x}, {self.y})"
             dx = f", dx={self.dx}" if self.dx else ""
             return f"{var}.scroll({self.dy}{dx}, at={at})"
-        text = _PASSWORD_PY if self.secret else repr(self.text)
+        unknown = self.secret and self.secret_reason == UNKNOWN_FOCUS
+        text = (_SECRET_PY if unknown else _PASSWORD_PY) if self.secret else repr(self.text)
+        note = f"  # {_UNKNOWN_FOCUS_NOTE}" if unknown else ""
         if k == "type":
             mode = f", mode={self.mode!r}" if self.mode else ""
             if self.selector:
-                return f"{var}.find({self.selector!r}).type({text}{mode})"
-            return f"{var}.type({text}{mode})"
+                return f"{var}.find({self.selector!r}).type({text}{mode}){note}"
+            return f"{var}.type({text}{mode}){note}"
         if k == "set_text":
             if self.selector:
                 return f"{var}.find({self.selector!r}).set_text({text})"
@@ -633,6 +678,9 @@ class Recorder:
         double_click_distance: Max pixels between clicks of a multi-click.
         drag_threshold: Pixels the pointer must travel while pressed to count as a drag.
         clock: Time source used for events without an explicit time.
+        trust_unknown_focus: Record text typed while the focused field cannot be
+            determined verbatim. Off by default: such text is treated as a secret
+            (``${env.LOCUM_SECRET}``), since it may have gone into a password field.
     """
 
     def __init__(
@@ -644,8 +692,10 @@ class Recorder:
         double_click_distance: float = 4.0,
         drag_threshold: float = 6.0,
         clock: Callable[[], float] = time.monotonic,
+        trust_unknown_focus: bool = False,
     ):
         self._desktop = desktop
+        self.trust_unknown_focus = bool(trust_unknown_focus)
         self.use_selectors = bool(use_selectors)
         self.double_click_interval = float(double_click_interval)
         self.double_click_distance = float(double_click_distance)
@@ -669,6 +719,7 @@ class Recorder:
         self._buffer_target: Dict[str, Any] = {}
         self._pos: Optional[Tuple[int, int]] = None
         self._paste: Optional[str] = None  # text locum just put on the clipboard to paste
+        self._pre_focus: Optional[Tuple[Any, str]] = None  # focus probe taken before a hooked type_text
 
     # ----------------------------------------------------------------- plumbing
     @property
@@ -965,15 +1016,56 @@ class Recorder:
             pass
         return node
 
-    def _capture_focus(self) -> Dict[str, Any]:
-        """Selector of the focused text field (with ``use_selectors``) and ``secret``: it is a password field."""
+    def _focus_probe(self) -> Tuple[Any, str]:
+        """``(focused node, status)``; status is ``"plain"``, ``"password"`` or ``"unknown"``
+        (no focus support, the query failed, nothing reported, or the field's state is unreadable)."""
         try:
             node = self.backend.focused_element()
-        except Exception:
-            return {}
+        except Exception as exc:
+            _log.debug("focused_element() failed: %s", type(exc).__name__)
+            return None, "unknown"
         if node is None:
-            return {}
-        out: Dict[str, Any] = {"secret": True} if is_password(node) else {}
+            return None, "unknown"
+        return node, _password_status(node)
+
+    def _snapshot_focus(self) -> None:
+        """Remember the focus before a hooked ``type_text`` runs (see :class:`_BackendHooks`)."""
+        if self._source != "backend":
+            return
+        try:
+            probe = self._focus_probe()
+        except Exception:  # pragma: no cover - _focus_probe does not raise
+            probe = (None, "unknown")
+        with self._lock:
+            self._pre_focus = probe
+
+    def _focus_moved(self, probe: Tuple[Any, str]) -> bool:
+        """Whether ``probe`` designates another field than the pending typing burst's."""
+        target = self._buffer_target
+        old, old_status = target.get("_node"), target.get("_status", "unknown")
+        node, status = probe
+        if old_status == "unknown" or status == "unknown":
+            return old_status != status
+        if status != old_status:
+            return True
+        try:
+            return not (old.same_as(node) or node.same_as(old))
+        except Exception:
+            return True
+
+    def _capture_focus(self, probe: Optional[Tuple[Any, str]] = None) -> Dict[str, Any]:
+        """Selector of the focused text field (with ``use_selectors``) and ``secret``: it is a
+        password field -- or the focus could not be determined (fails closed, see
+        ``trust_unknown_focus``)."""
+        node, status = probe if probe is not None else self._focus_probe()
+        out: Dict[str, Any] = {"_node": node, "_status": status}
+        if status == "password":
+            out["secret"] = True
+        elif status == "unknown" and not self.trust_unknown_focus:
+            out["secret"] = True
+            out["secret_reason"] = UNKNOWN_FOCUS
+        if node is None or status == "unknown":
+            return out
         if not self.use_selectors:
             return out
         try:
@@ -1001,7 +1093,8 @@ class Recorder:
             return
         target = self._buffer_target
         self._emit(RecordedAction("type", time=self._buffer_time, text=self._buffer, selector=target.get("selector"),
-                                  element=target.get("element"), secret=bool(target.get("secret"))))
+                                  element=target.get("element"), secret=bool(target.get("secret")),
+                                  secret_reason=target.get("secret_reason", "")))
         self._buffer = ""
         self._buffer_target = {}
 
@@ -1087,7 +1180,7 @@ class Recorder:
                     target = self._capture_focus()
                     self._emit(RecordedAction("type", time=t, text=text, selector=target.get("selector"),
                                               element=target.get("element"), secret=bool(target.get("secret")),
-                                              mode="clipboard"))
+                                              secret_reason=target.get("secret_reason", ""), mode="clipboard"))
                     return
                 self._append_text(text, t)
                 return
@@ -1139,16 +1232,39 @@ class Recorder:
             self._flush_typing()
             self._emit(RecordedAction("press", time=t, keys=[base]))
 
-    def _append_text(self, text: str, t: float) -> None:
+    def _append_text(self, text: str, t: float, probe: Optional[Tuple[Any, str]] = None) -> None:
+        """Add typed ``text`` to the pending burst. The focus is checked every time: when
+        it moved (Tab, a click the recorder did not see, an auto-advancing form, a native
+        ``focus()``), the burst ends and a new one starts for the new field, so text typed
+        into a password field never joins the user name typed just before it."""
         if not text:
             return
+        if probe is None:
+            probe = self._focus_probe()
+        if self._buffer and self._focus_moved(probe):
+            self._flush_typing()
         if not self._buffer:
             self._buffer_time = t
-            self._buffer_target = self._capture_focus()
+            self._buffer_target = self._capture_focus(probe)
         self._buffer += text
 
     def _on_text(self, text: str, t: float) -> None:
-        self._append_text(text, t)
+        pre, self._pre_focus = self._pre_focus, None
+        hooked = pre is not None  # fed after the text was typed (backend type_text hook)
+        segments = _split_at_focus_keys(text)
+        for i, seg in enumerate(segments):
+            if i == 0:
+                probe = pre if hooked else self._focus_probe()
+            elif segments[i - 1].endswith("\t") and not (hooked and i == len(segments) - 1):
+                # After a Tab inside one text event the focus is not observable: the field
+                # it moved to is known only once the whole text was typed (the last part of
+                # a hooked event). Fail closed.
+                probe = (None, "unknown")
+            else:
+                probe = self._focus_probe()
+            self._append_text(seg, t, probe)
+            if seg[-1] in "\t\r\n":
+                self._flush_typing()  # a typing burst ends at a focus-changing key
 
     # ---------------------------------------------------------- native actions
     def record_native(self, kind: str, element: Any, text: Optional[str] = None) -> Optional[RecordedAction]:
@@ -1182,7 +1298,8 @@ class Recorder:
                 _log.warning("cannot record %s on %r: no selector and no position", kind, element)
                 return None
             action = RecordedAction(kind, time=self._clock(), x=x, y=y, selector=sel, element=self._describe(node),
-                                    text=text or "", secret=kind == "set_text" and is_password(node))
+                                    text=text or "",
+                                    secret=kind == "set_text" and _password_status(node) != "plain")
             return self._emit(action)
 
     def _install_action_listener(self) -> None:
@@ -1361,7 +1478,8 @@ class Recorder:
             if self._buffer:
                 t = self._buffer_target
                 actions.append(RecordedAction("type", time=self._buffer_time, text=self._buffer, selector=t.get("selector"),
-                                              element=t.get("element"), secret=bool(t.get("secret"))))
+                                              element=t.get("element"), secret=bool(t.get("secret")),
+                                              secret_reason=t.get("secret_reason", "")))
             return actions
 
     def to_flow(self, name: str = "recorded") -> Dict[str, Any]:
@@ -1379,8 +1497,12 @@ class Recorder:
         actions = self._final_actions()
         lines = [
             f'"""Recorded with locum on {_dt.datetime.now().isoformat(timespec="seconds")}."""',
-            *(["# Passwords are never recorded: set the LOCUM_PASSWORD environment variable before running.",
-               "import os", ""] if any(a.secret for a in actions) else []),
+            *(["# Passwords are never recorded: set the LOCUM_PASSWORD environment variable before running."]
+              if any(a.secret and a.secret_reason != UNKNOWN_FOCUS for a in actions) else []),
+            *([f"# Text typed where the focused field could not be determined was not recorded: "
+               f"set {SECRET_ENV} (or edit those lines) before running."]
+              if any(a.secret and a.secret_reason == UNKNOWN_FOCUS for a in actions) else []),
+            *(["import os", ""] if any(a.secret for a in actions) else []),
             "from locum import Desktop",
             "",
             f"{var} = {desktop_expr}",
@@ -1424,6 +1546,39 @@ def _event_kind(event: Any) -> str:
     if isinstance(event, (list, tuple)) and event:
         return str(event[0])
     return type(event).__name__
+
+
+def _password_status(node: Any) -> str:
+    """``"password"``, ``"plain"`` or ``"unknown"`` (the node's state cannot be read).
+
+    Unlike :func:`locum._nodeinfo.is_password`, a failure to read the state is not
+    taken to mean "not a password": the recorder must fail closed.
+    """
+    try:
+        node.states
+    except Exception:
+        return "unknown"
+    return "password" if is_password(node) else "plain"
+
+
+def _split_at_focus_keys(text: str) -> List[str]:
+    """``text`` cut after every Tab / newline (``"a\tb"`` -> ``["a\t", "b"]``; ``\r\n`` stays together)."""
+    out: List[str] = []
+    cur = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        cur += ch
+        if ch == "\r" and i + 1 < len(text) and text[i + 1] == "\n":
+            cur += "\n"
+            i += 1
+        if ch in "\t\r\n":
+            out.append(cur)
+            cur = ""
+        i += 1
+    if cur:
+        out.append(cur)
+    return out
 
 
 def _click_kind(button: str, clicks: int) -> str:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Optional, Union
 
+from ._cancel import check as _cancel_check
 from .failsafe import FailSafe
 from .motion import Humanize, fitts_duration, plan_path
 from .types import MouseButton, Point, coerce_point
@@ -58,6 +59,13 @@ class Mouse:
 
     # ------------------------------------------------------------------ helpers
     def _check(self, ignore: Optional[Point] = None) -> None:
+        """Gate run right before every move/press/scroll reaches the backend (never before a release).
+
+        Besides the fail-safe it honours the running call's cancel scope, so a
+        call the MCP server already reported as timed out / stopped sends no
+        further input.
+        """
+        _cancel_check()
         if self.failsafe is not None:
             self.failsafe.check(ignore=ignore)
 
@@ -300,6 +308,7 @@ class Mouse:
         else:
             self._check()
         target = self._point(end)
+        _cancel_check()  # the move to ``start`` may have outlived the call's deadline
         down = False
         try:
             self.backend.mouse_down(btn)

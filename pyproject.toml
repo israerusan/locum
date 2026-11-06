@@ -52,7 +52,7 @@ dev = ["pytest>=7", "pyyaml>=6.0"]
 locum = "locum.cli:main"
 locum-mcp = "locum.mcp:main"
 
-# pytest plugin: desktop/app fixtures, --locum-backend, traces of failing tests (docs/TESTING.md).
+# pytest plugin: locum_desktop/locum_app fixtures, --locum-backend, traces of failing tests (docs/TESTING.md).
 [project.entry-points.pytest11]
 locum = "locum.pytest_plugin"
 

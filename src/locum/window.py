@@ -16,6 +16,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
 
+from ._cancel import check as _cancel_check
 from .errors import ActionTimeout, ElementNotFound, NotSupported, WindowNotFound
 from .types import Rect, RectLike, WindowInfo
 from .wait import wait_until
@@ -219,8 +220,11 @@ class Window:
         """Honour the fail-safe (global abort flag + screen corners) before changing the window.
 
         Window operations go straight to the backend (no mouse/keyboard input),
-        so the input-level fail-safe checks never see them.
+        so the input-level fail-safe checks never see them. The running call's
+        cancel scope is checked too: every caller runs this immediately before
+        its backend call, so a timed-out / cancelled call changes no window.
         """
+        _cancel_check()
         fs = getattr(self.desktop, "failsafe", None)
         check = getattr(fs, "check", None)
         if callable(check):

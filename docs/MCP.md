@@ -118,15 +118,31 @@ Two ways to connect, both opt-in:
   it stays signed in there.
 * **attach** to a browser you started yourself with a DevTools port, e.g.
   `msedge --remote-debugging-port=9222 --user-data-dir=C:\automation-profile`
-  (Chrome 136+ ignores the port on the default profile). locum finds it through
-  its `DevToolsActivePort` file, `$LOCUM_CDP_PORT`, or port 9222.
+  (Chrome 136+ ignores the port on the default profile), and tell locum the
+  port with `LOCUM_CDP_PORT=9222` (Python: `Browser.attach(port=9222)`).
+
+Which browser locum attaches to when no port is given, in order:
+`$LOCUM_CDP_PORT`, then a running browser with a locum-managed profile. It does
+**not** pick the `DevToolsActivePort` of your everyday Edge/Chrome profile or
+whatever answers on port 9222 (that may be your signed-in browser or some other
+program) unless you opt in with `LOCUM_CDP_ATTACH_ANY=1` (Python:
+`Browser.attach(allow_any=True)`). Every endpoint must answer `/json/version`
+like a Chromium DevTools server, and locum only connects to DevTools
+WebSockets on this machine (`127.0.0.1`, `localhost`, `::1`); tabs whose
+WebSocket points elsewhere are ignored.
 
 While a browser is connected, `observe` skips that browser window's page
 content (its tabs and toolbar stay listed) and says to use `browser_observe`.
 The browser tools go through the same safety policy as everything else
 (app allow-lists use `msedge.exe` / `chrome.exe`; a "Pay now" click asks for
-confirmation; passwords are redacted). DevTools gives full control of that
-browser, so only connect to browsers you started for automation.
+confirmation; passwords are redacted, and a field's value -- e.g. an autofilled
+password -- is never used as its name). `browser_type(..., submit=True)` is
+judged by what Enter activates: the field's form's default button (its first
+submit button, e.g. "Pay now") and the form's action URL, or, outside a form,
+the field's nearby button (a chat's "Send") -- so typing a card number and
+pressing Enter needs the same confirmation as clicking "Pay now". A cancelled
+or timed-out tool call sends no further input to the page. DevTools gives full
+control of that browser, so only connect to browsers you started for automation.
 
 ## Elevated (administrator) windows
 

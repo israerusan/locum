@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .backends.base import CAP_CLIPBOARD, CAP_UNICODE_TYPING
+from ._cancel import check as _cancel_check
 from .errors import NotSupported
 from .failsafe import FailSafe
 from .keys import check_combo, lower_combo_letters, normalize_key, parse_hotkey, press_actions, split_text_tokens
@@ -85,6 +86,9 @@ class Keyboard:
 
     # ------------------------------------------------------------------ helpers
     def _check(self) -> None:
+        # The running call's cancel scope first: a call the MCP server already
+        # reported as timed out / stopped must not send further input.
+        _cancel_check()
         if self.failsafe is not None:
             self.failsafe.check()
 
@@ -101,6 +105,9 @@ class Keyboard:
         # Record the key *before* the backend call: a KeyboardInterrupt that lands
         # inside key_down after the press reached the OS (X11 spends most of the call
         # waiting for the server) must still leave release_all() knowing about it.
+        # Every key press goes through here (taps, hotkeys, typed characters, paste):
+        # a cancelled / timed-out call stops before the press. Releases never check.
+        _cancel_check()
         added = key not in self._pressed
         if added:
             self._pressed.append(key)

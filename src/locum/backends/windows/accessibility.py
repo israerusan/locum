@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import sys
-from typing import Any, Dict, List, Optional
+from ctypes import wintypes
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from ...errors import NotSupported
 from ..base import AccessibleNode
@@ -52,6 +54,48 @@ class _AccessibilityMixin:
             return None
         self._change_tracker = tracker
         return tracker
+
+    def window_content_pids(self, handle: Any) -> Optional[FrozenSet[int]]:
+        """Processes drawing content inside top-level window ``handle``: its owner plus the
+        owner of every descendant child window; ``None`` if the window cannot be read.
+
+        UI Automation change events carry the *sending* element's process. A Store/UWP
+        app's top-level window (Calculator, Settings) belongs to ApplicationFrameHost.exe
+        while its content -- and its events -- come from the app's own process, whose
+        ``Windows.UI.Core.CoreWindow`` is a child window of the frame; WebView2 and other
+        cross-process children work the same way. ``observe(reuse=...)`` treats the window
+        as changed when any of these processes raised an event. Win32 only (no UIA call):
+        ``EnumChildWindows`` + ``GetWindowThreadProcessId``, microseconds per child.
+        """
+        u32 = _user32()
+        try:
+            hwnd = int(handle)
+        except (TypeError, ValueError):
+            return None
+        if u32 is None or not hwnd or not u32.IsWindow(hwnd):
+            return None
+        pids = set()
+
+        def pid_of(h: int) -> int:
+            out = wintypes.DWORD(0)
+            u32.GetWindowThreadProcessId(h, ctypes.byref(out))
+            return int(out.value)
+
+        own = pid_of(hwnd)
+        if own:
+            pids.add(own)
+
+        def cb(child: int, _lp: int) -> bool:
+            p = pid_of(child)
+            if p:
+                pids.add(p)
+            return len(pids) < 64  # a pathological window cannot make this unbounded
+
+        try:
+            u32.EnumChildWindows(hwnd, _ENUM_PROC(cb), 0)
+        except Exception:
+            return None
+        return frozenset(pids) if pids else None
 
     def _close_change_tracker(self) -> None:
         tracker = getattr(self, "_change_tracker", None)
@@ -163,3 +207,22 @@ class _AccessibilityMixin:
         self._pid_names = {}
         el = ctx.focused()
         return UIANode(el, ctx) if el is not None else None
+
+
+_ENUM_PROC: Any = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM) if sys.platform == "win32" else None
+_U32: Any = None
+
+
+def _user32() -> Any:
+    """``user32`` with the signatures :meth:`_AccessibilityMixin.window_content_pids` uses."""
+    global _U32
+    if _U32 is None and sys.platform == "win32":
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.IsWindow.argtypes = [wintypes.HWND]
+        u.IsWindow.restype = wintypes.BOOL
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.EnumChildWindows.argtypes = [wintypes.HWND, _ENUM_PROC, wintypes.LPARAM]
+        u.EnumChildWindows.restype = wintypes.BOOL
+        _U32 = u
+    return _U32

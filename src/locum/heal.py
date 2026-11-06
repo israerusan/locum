@@ -234,11 +234,22 @@ FINGERPRINT_KEYS = ("role", "name", "automation_id", "id", "class_name", "bounds
 
 @dataclass(frozen=True)
 class HealOptions:
-    """Tuning for :func:`heal` (``Desktop(heal_selectors=HealOptions(...))`` enables healing with these)."""
+    """Tuning for :func:`heal` (``Desktop(heal_selectors=HealOptions(...))`` enables healing with these).
+
+    Attributes:
+        threshold: Minimum score (0..1) the winner needs.
+        margin: Minimum lead of the winner over the runner-up.
+        max_nodes: Cap on the nodes one heal scan visits.
+        allow_partial: Decide even when the scan stopped at ``max_nodes``. Off by
+            default: a "clear winner" among the nodes scanned so far may not be the
+            best match overall, and the real target may not have been scanned at
+            all, so a truncated scan refuses to heal.
+    """
 
     threshold: float = DEFAULT_THRESHOLD
     margin: float = DEFAULT_MARGIN
     max_nodes: int = DEFAULT_MAX_NODES
+    allow_partial: bool = False
 
     def __post_init__(self) -> None:
         if not (0.0 < float(self.threshold) <= 1.0):
@@ -290,6 +301,8 @@ class HealOutcome:
     info: Optional[HealInfo] = None
     reason: str = ""
     candidates: List[Tuple[float, str]] = field(default_factory=list)
+    #: The scan stopped at :attr:`HealOptions.max_nodes` (the candidates are partial).
+    truncated: bool = False
 
     def __bool__(self) -> bool:
         return self.node is not None
@@ -560,20 +573,29 @@ def heal(
                     best[id(e)] = (s, e, t, window)
             if visited > opts.max_nodes:
                 break
-    if not best:
-        return HealOutcome(reason="no candidate with a compatible role in the selector's scope")
+    truncated = visited > opts.max_nodes
     ranked = sorted(best.values(), key=lambda x: (-x[0], x[1].path))
     shown = [(round(s, 3), _describe(e.node)) for s, e, _, _ in ranked[:3]]
+    if truncated and not opts.allow_partial:
+        # A winner among the first max_nodes nodes is not a winner overall: the real
+        # target (or a closer runner-up) may be among the nodes never scanned.
+        return HealOutcome(
+            reason=(f"scan truncated after {int(opts.max_nodes)} nodes: not healing on a partial scan "
+                    "(raise HealOptions.max_nodes, narrow the selector's scope, or pass allow_partial=True)"),
+            candidates=shown, truncated=True,
+        )
+    if not best:
+        return HealOutcome(reason="no candidate with a compatible role in the selector's scope", truncated=truncated)
     top_score, top_e, top_t, top_win = ranked[0]
     runner = ranked[1][0] if len(ranked) > 1 else None
     if top_score < opts.threshold:
         return HealOutcome(reason=f"best candidate {shown[0][1]} scored {top_score:.2f} < {opts.threshold:g}",
-                           candidates=shown)
+                           candidates=shown, truncated=truncated)
     if runner is not None and top_score - runner < opts.margin:
         return HealOutcome(
             reason=(f"ambiguous: {shown[0][1]} ({top_score:.2f}) and {shown[1][1]} ({runner:.2f}) "
                     f"are within {opts.margin:g} of each other"),
-            candidates=shown,
+            candidates=shown, truncated=truncated,
         )
     node = top_e.node
     new_fp = Fingerprint.from_node(node, window=top_win if top_e.depth > 0 else "")
@@ -590,7 +612,7 @@ def heal(
                     changes=_changes(old_fp, new_fp, partial_name=top_t.name_partial), old=old_fp, new=new_fp)
     if log:
         log_heal(info)
-    return HealOutcome(node=node, info=info, candidates=shown)
+    return HealOutcome(node=node, info=info, candidates=shown, truncated=truncated)
 
 
 def log_heal(info: HealInfo) -> None:

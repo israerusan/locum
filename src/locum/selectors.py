@@ -23,6 +23,13 @@ CSS-like (canonical)
     window "Calc" > pane button     descendant (space) and child (``>``) combinators
     button "OK", button "Yes"       union
 
+Window and dialog titles are compared ignoring decorations that change on
+their own (:func:`locum._nodeinfo.stable_title`): ``window "doc.txt - Notepad"``
+also matches ``*doc.txt - Notepad`` and ``window "Pypilot library"`` matches
+``◐ Pypilot library`` (an animated terminal spinner). This applies to the
+``=``, ``!=``, ``^=``, ``$=`` and ``*=`` tests of ``name`` / ``text`` on
+window and dialog nodes; ``~=`` and ``%=`` patterns are matched as written.
+
 UiPath XML
 ----------
 ::
@@ -56,10 +63,12 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .backends.base import AccessibleNode
 from ._cancel import check as _cancel_check
+from ._nodeinfo import stable_title
 from .errors import SelectorSyntaxError
 
 __all__ = [
@@ -197,6 +206,10 @@ _PSEUDO_ALIASES = {
     "contains": "has-text", "offscreen": "hidden", "invisible": "hidden", "indeterminate": "mixed",
 }
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-]*$")
+#: Operators whose name test also compares window titles without volatile decorations.
+_CORE_OPS = frozenset({"=", "!=", "*=", "^=", "$="})
+#: Roles whose names are titles that decorate themselves (spinners, dirty markers).
+_TITLED_ROLES = frozenset({"window", "dialog"})
 _GLOB_CHARS = re.compile(r"[*?]")
 
 
@@ -372,6 +385,14 @@ class _Snapshot:
         self.roots = [_Entry(n, None, 0, (i,)) for i, n in enumerate(roots) if n is not None]
         self.memo: Dict[Tuple[int, int], bool] = {}
 
+    @classmethod
+    def over(cls, entries: Sequence[_Entry], max_depth: int) -> "_Snapshot":
+        """A snapshot over already-materialised root entries (their cached children and
+        properties are reused; the match memo is fresh)."""
+        snap = cls((), max_depth)
+        snap.roots = list(entries)
+        return snap
+
     def walk(self, start: _Entry, include_self: bool = True) -> Iterator[_Entry]:
         """Pre-order traversal of ``start``'s subtree, honouring ``max_depth``."""
         md = self.max_depth
@@ -432,6 +453,11 @@ class _AttrCond(_Cond):
         if key == "app" and op in ("=", "!="):
             cmp = _norm_app(cmp)
         self._cmp = cmp.casefold() if self._fold else cmp
+        # Window titles: the value without volatile decorations (spinner glyphs, dirty markers).
+        self._core: Optional[str] = None
+        if key in ("name", "text") and op in _CORE_OPS and value is not None:
+            core = stable_title(value)
+            self._core = core.casefold() if self._fold else core
 
     def _one(self, actual: Optional[str]) -> bool:
         op = self.op
@@ -469,7 +495,25 @@ class _AttrCond(_Cond):
     def test(self, entry: _Entry, snap: _Snapshot) -> bool:
         vals = _attr_values(entry, self.key)
         hit = any(self._one(v) for v in vals)
+        if not hit and self._core is not None and entry.prop("role") in _TITLED_ROLES:
+            hit = self._core_hit(entry.prop("name"))
         return not hit if self.op == "!=" else hit
+
+    def _core_hit(self, actual: str) -> bool:
+        """The test on the stable parts of a window title (see :func:`stable_title`)."""
+        core = stable_title(actual)
+        if core == actual and self._core == self._cmp:
+            return False  # neither side is decorated: the plain test already answered
+        a = core.casefold() if self._fold else core
+        v = self._core or ""
+        op = self.op
+        if op == "=" or op == "!=":
+            return a == v
+        if op == "*=":
+            return v in a
+        if op == "^=":
+            return a.startswith(v)
+        return a.endswith(v)  # $=
 
     def render(self) -> str:
         v = self.value or ""
@@ -871,10 +915,13 @@ def _as_roots(roots: Union[AccessibleNode, Sequence[AccessibleNode], None]) -> L
         return []
     if isinstance(roots, AccessibleNode):
         return [roots]
+    if not isinstance(roots, (list, tuple)) and hasattr(roots, "node"):
+        return [roots.node]  # a single Element-like wrapper
     out = []
     for r in roots:
-        n = getattr(r, "node", r)  # accept Element-like wrappers
-        out.append(n)
+        # Unwrap Element-like wrappers (Element, ObservedElement), never a node itself:
+        # an AccessibleNode subclass may well have an unrelated ``node`` attribute.
+        out.append(r if isinstance(r, AccessibleNode) else getattr(r, "node", r))
     return out
 
 
@@ -1558,6 +1605,10 @@ def _compound_for(node: AccessibleNode, *, use_id: bool = True, use_class: bool 
     head = _role_head(role)
     aid = _safe(lambda: node.automation_id, "") or ""
     name = _safe(lambda: node.name, "") or ""
+    if role in _TITLED_ROLES:
+        # "◐ Pypilot library" -> window "Pypilot library": the spinner animates and a
+        # dirty marker comes and goes; window titles are matched without them anyway.
+        name = stable_title(name)
     out = head
     if use_id and aid:
         out += "#" + aid if _IDENT_RE.match(aid) else f"[automation_id={quote(aid)}]"
@@ -1665,45 +1716,172 @@ def selector_for(
     scope = list(roots) if roots is not None else [top]
 
     depth = max(64, len(chain) + 1)
+    # With a prefix cache, the trees of ``roots`` are read once (per few seconds) and
+    # shared by every selector built with that cache: each uniqueness test below is
+    # then a pure-Python search instead of a walk of the live tree (one cross-process
+    # call per node and property, ~0.5-5 s per test on a busy desktop).
+    tree = _tree_cache(prefix_cache) if prefix_cache is not None and roots is not None else None
+    if tree is not None:
+        tree.seed(roots or ())
+    state: Dict[str, Any] = {"tree": tree, "refreshed": False}
+
+    def find(sel_text: str, where: Sequence[AccessibleNode], max_depth: int = 64,
+             limit: Optional[int] = None) -> List[AccessibleNode]:
+        sel = parse(sel_text)
+        t = state["tree"]
+        if t is None:
+            return sel.find_all(where, max_depth=max_depth, limit=limit)
+        snap = _Snapshot.over(t.entries_for(where), max_depth)
+        out = [e.node for e in sel._search(snap, snap.roots, None, limit, True)]
+        if t.building:
+            t.born = time.monotonic()  # its lifetime counts from the end of the read
+        return out
+
+    def find_with(sel_text: str, where: Sequence[AccessibleNode], max_depth: int = 64,
+                  live_limit: Optional[int] = None) -> List[AccessibleNode]:
+        """Matches (live: up to ``live_limit``); on the shared tree all of them, and the tree
+        is re-read once when ``node`` is not among them (it changed since it was read:
+        ``node`` is new, or was renamed)."""
+        if state["tree"] is None:
+            return find(sel_text, where, max_depth, live_limit)
+        found = find(sel_text, where, max_depth)
+        if not any(_same(f, node) for f in found) and not state["refreshed"]:
+            state["refreshed"] = True
+            state["tree"] = _tree_cache(prefix_cache, fresh=True)
+            state["tree"].seed(roots or ())
+            found = find(sel_text, where, max_depth)
+        return found
 
     def unique(sel_text: str) -> bool:
         """Whether ``sel_text`` matches exactly ``node`` within ``scope``."""
         try:
-            found = parse(sel_text).find_all(scope, max_depth=depth, limit=2)
+            found = find_with(sel_text, scope, depth, live_limit=2)
         except Exception:
             return False
         return len(found) == 1 and _same(found[0], node)
 
     def count(sel_text: str) -> int:
         try:
-            return len(parse(sel_text).find_all(scope, max_depth=depth))
+            return len(find(sel_text, scope, depth))
         except Exception:
             return 0
 
-    # Prefix identifying the top-level ancestor.
-    cached = None
-    if prefix_cache is not None and roots is not None:
-        cached = next((entry for entry in prefix_cache if _same(entry[0], top)), None)
-    if cached is not None:
-        top_sel, top_unique = cached[1], cached[2]
-    else:
-        top_sel, top_unique = _top_prefix(top, roots, scope, count)
+    def index_among(sel_text: str, where: Sequence[AccessibleNode], target: AccessibleNode) -> Optional[int]:
+        try:
+            found = find_with(sel_text, where) if target is node else find(sel_text, where)
+        except Exception:
+            return None
+        return next((i for i, f in enumerate(found) if _same(f, target)), None)
+
+    try:
+        # Prefix identifying the top-level ancestor.
+        cached = None
         if prefix_cache is not None and roots is not None:
-            prefix_cache.append((top, top_sel, top_unique))
-    if len(chain) == 1:
-        return top_sel
-    if top_unique:
-        # The prefix matches exactly one node anywhere in ``roots`` (``top``), so every
-        # match of "<prefix> <rest>" lies inside ``top``: checking the rest against that
-        # one window gives the same answer as searching every window again (which cost
-        # seconds per element on a desktop with thousands of accessible elements).
-        scope = [top]
-    return _selector_below(node, chain, top_sel, scope, unique)
+            cached = next((entry for entry in prefix_cache
+                           if isinstance(entry, (tuple, list)) and len(entry) >= 3 and _same(entry[0], top)), None)
+        if cached is not None:
+            top_sel, top_unique = cached[1], cached[2]
+        else:
+            top_sel, top_unique = _top_prefix(top, roots, scope, count, index_among=index_among)
+            if prefix_cache is not None and roots is not None:
+                prefix_cache.append((top, top_sel, top_unique))
+        if len(chain) == 1:
+            return top_sel
+        if top_unique:
+            # The prefix matches exactly one node anywhere in ``roots`` (``top``), so every
+            # match of "<prefix> <rest>" lies inside ``top``: checking the rest against that
+            # one window gives the same answer as searching every window again (which cost
+            # seconds per element on a desktop with thousands of accessible elements).
+            scope = [top]
+        return _selector_below(node, chain, top_sel, scope, unique, index_among=index_among)
+    finally:
+        if state["tree"] is not None:
+            state["tree"].building = False
+
+
+# --------------------------------------------------------------------------- shared tree
+
+#: Seconds a tree read for :func:`selector_for` is reused by later calls sharing its
+#: ``prefix_cache``, counted from the end of the call that read it: long enough for one
+#: listing (``find_elements``, an observation's selectors, a recorder burst), short
+#: enough that a selector built later is proven unique against a fresh tree.
+_TREE_TTL = 2.0
+_TREES_PER_THREAD = 4
+
+
+class _TreeCache:
+    """Read-once :class:`_Entry` trees of the search roots, shared through a ``prefix_cache``.
+
+    Kept beside the cache (not in it: callers inspect its ``(top, prefix, unique)``
+    entries), keyed by the cache list's identity, so a caller that starts a new
+    prefix cache because the windows changed also starts a new tree. Root entries
+    get the position of their root in ``roots`` so document order across roots is
+    the same as a fresh search's.
+    """
+
+    __slots__ = ("owner", "born", "building", "nodes", "entries", "_alias")
+
+    def __init__(self, owner: List[Any], born: float):
+        self.owner = owner
+        self.born = born
+        self.building = True  # until the selector_for call that created it returns
+        self.nodes: List[AccessibleNode] = []
+        self.entries: List[_Entry] = []
+        # Other objects for the same roots (a chain's top, a re-read root): id -> (object, index).
+        self._alias: Dict[int, Tuple[AccessibleNode, int]] = {}
+
+    def seed(self, roots: Sequence[AccessibleNode]) -> None:
+        if not self.nodes:
+            self.entries_for(roots)
+
+    def entries_for(self, where: Sequence[AccessibleNode]) -> List[_Entry]:
+        return [self._entry(n, i) for i, n in enumerate(where) if n is not None]
+
+    def _entry(self, node: AccessibleNode, hint: int) -> _Entry:
+        nodes = self.nodes
+        if hint < len(nodes) and nodes[hint] is node:
+            return self.entries[hint]
+        for j, n in enumerate(nodes):
+            if n is node:
+                return self.entries[j]
+        alias = self._alias.get(id(node))
+        if alias is not None and alias[0] is node:
+            return self.entries[alias[1]]
+        order = ([hint] if hint < len(nodes) else []) + [j for j in range(len(nodes)) if j != hint]
+        for j in order:
+            if _same(nodes[j], node):
+                self._alias[id(node)] = (node, j)
+                return self.entries[j]
+        entry = _Entry(node, None, 0, (len(nodes),))
+        nodes.append(node)
+        self.entries.append(entry)
+        return entry
+
+
+_TREES = threading.local()  # per thread: COM nodes are used and released by the thread that read them
+
+
+def _tree_cache(prefix_cache: List[Any], fresh: bool = False) -> _TreeCache:
+    """The shared tree of ``prefix_cache`` (a new one when absent, expired or ``fresh``)."""
+    trees: List[_TreeCache] = getattr(_TREES, "trees", None) or []
+    now = time.monotonic()
+    trees = [t for t in trees if now - t.born <= _TREE_TTL]  # expired trees are dropped
+    tree = None if fresh else next((t for t in trees if t.owner is prefix_cache), None)
+    if tree is None:
+        trees = [t for t in trees if t.owner is not prefix_cache]
+        tree = _TreeCache(prefix_cache, now)
+        trees.append(tree)
+        del trees[:-_TREES_PER_THREAD]
+    _TREES.trees = trees
+    return tree
 
 
 def _top_prefix(top: AccessibleNode, roots: Optional[Sequence[AccessibleNode]], scope: Sequence[AccessibleNode],
-                count: Callable[[str], int]) -> Tuple[str, bool]:
+                count: Callable[[str], int], *,
+                index_among: Optional[Callable[[str, Sequence[AccessibleNode], AccessibleNode], Optional[int]]] = None,
+                ) -> Tuple[str, bool]:
     """``(prefix, unique)`` for the top-level ancestor: unique means it matches only ``top``."""
+    index_among = index_among or _index_among
     top_sel = _compound_for(top, use_id=True)
     top_unique = roots is None  # without roots the scope is the node's own window already
     if roots is not None:
@@ -1716,15 +1894,18 @@ def _top_prefix(top: AccessibleNode, roots: Optional[Sequence[AccessibleNode]], 
             n = count(top_sel)
             top_unique = n == 1
             if n > 1:
-                idx = _index_among(top_sel, scope, top)
+                idx = index_among(top_sel, scope, top)
                 if idx is not None:
                     top_sel += f":nth({idx})"
     return top_sel, top_unique
 
 
 def _selector_below(node: AccessibleNode, chain: Sequence[AccessibleNode], top_sel: str,
-                    scope: Sequence[AccessibleNode], unique: Callable[[str], bool]) -> str:
+                    scope: Sequence[AccessibleNode], unique: Callable[[str], bool], *,
+                    index_among: Optional[Callable[[str, Sequence[AccessibleNode], AccessibleNode], Optional[int]]] = None,
+                    ) -> str:
     """The part of :func:`selector_for` below the top-level prefix (``unique`` searches ``scope``)."""
+    index_among = index_among or _index_among
     candidates = [
         _compound_for(node, use_id=True),
         _compound_for(node, use_id=False),
@@ -1750,7 +1931,7 @@ def _selector_below(node: AccessibleNode, chain: Sequence[AccessibleNode], top_s
         break
     # Positional fallback on the most specific form.
     for text in [base] + tried:
-        idx = _index_among(text, scope, node)
+        idx = index_among(text, scope, node)
         if idx is not None:
             return f"{text}:nth({idx})"
     # Last resort: an explicit child path from the top.
