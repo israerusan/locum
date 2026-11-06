@@ -298,15 +298,20 @@ class Window:
     def wait_closed(self, timeout: Optional[float] = 10) -> bool:
         """Wait until the window disappears. Returns True; raises :class:`ActionTimeout` otherwise."""
         t = _default_timeout(self.desktop, timeout)
+        # _lookup (not the error-swallowing ``exists``) so transient backend
+        # errors are retried and fatal ones propagate instead of reading as "closed".
+        pred: Any = lambda: self._lookup() is None  # noqa: E731
+        interval, sleep = _desktop_interval(self.desktop), _desktop_sleep(self.desktop)
+        event_wait = getattr(self.desktop, "_event_wait", None)
+        if callable(event_wait):  # wake on accessibility change events where available
+            pred, sleep, interval = event_wait(pred, interval)
         wait_until(
-            # _lookup (not the error-swallowing ``exists``) so transient backend
-            # errors are retried and fatal ones propagate instead of reading as "closed".
-            lambda: self._lookup() is None,
+            pred,
             t,
-            _desktop_interval(self.desktop),
+            interval,
             message=f"Window {self.title!r} still open after {t:g}s",
             ignore_exceptions="transient",
-            sleep=_desktop_sleep(self.desktop),
+            sleep=sleep,
             clock=_desktop_clock(self.desktop),
         )
         return True

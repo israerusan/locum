@@ -28,6 +28,41 @@ class _AccessibilityMixin:
 
         return importlib.util.find_spec("comtypes") is not None
 
+    def change_tracker(self) -> Any:
+        """Desktop-wide UI Automation change events (see :mod:`.uia_events`); ``None`` if off/unavailable."""
+        tracker = getattr(self, "_change_tracker", None)
+        if tracker is not None:
+            return tracker if tracker.alive else None
+        if getattr(self, "_change_tracker_failed", False) or getattr(self, "_closed", False):
+            return None
+        from .uia_events import ChangeTracker, events_enabled
+
+        if not events_enabled():
+            self._change_tracker_failed = True
+            return None
+        try:
+            from .uia import CLSID_CUIAutomation, CLSID_CUIAutomation8
+
+            tracker = ChangeTracker(self.uia.module, (CLSID_CUIAutomation8, CLSID_CUIAutomation))
+        except Exception:
+            self._change_tracker_failed = True
+            return None
+        if not tracker.alive:
+            self._change_tracker_failed = True
+            return None
+        self._change_tracker = tracker
+        return tracker
+
+    def _close_change_tracker(self) -> None:
+        tracker = getattr(self, "_change_tracker", None)
+        self._change_tracker = None
+        self._change_tracker_failed = True
+        if tracker is not None:
+            try:
+                tracker.close()
+            except Exception:
+                pass
+
     @property
     def uia(self) -> Any:
         """The :class:`_UIAContext` (raises NotSupported when UI Automation is unavailable)."""

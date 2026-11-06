@@ -155,6 +155,10 @@ class WindowsBackend(
             self.release_all()
         except Exception:
             pass
+        try:
+            self._close_change_tracker()
+        except Exception:
+            pass
         with self._mss_lock:
             closers, self._mss_closers = self._mss_closers, []
         for closer in closers:

@@ -268,12 +268,59 @@ class Desktop:
         # interval=0 would busy-spin (and never advance an injected clock), as for poll_interval=0.
         return _wait_until(predicate, self._timeout(timeout), interval or 0.05, **kw)
 
+    #: Fallback poll interval of event-driven waits: accessibility change events wake
+    #: them at once, so the tree is re-searched slowly while nothing happens.
+    EVENT_POLL_INTERVAL = 0.5
+
+    def _event_wait(self, predicate: Callable[[], Any], interval: float) -> Tuple[Callable[[], Any], Callable[[float], Any], float]:
+        """``(predicate, sleep, interval)`` for an accessibility-tree wait.
+
+        When the backend has change events (UI Automation on Windows) and this desktop
+        uses the real clock, the wait sleeps until the next change event (or the slow
+        fallback interval) instead of re-searching the tree every ``interval``. Under an
+        event storm it never re-checks more often than ``interval``. Otherwise the
+        arguments come back unchanged.
+        """
+        if self._sleep_fn is not time.sleep or self._clock is not time.monotonic:
+            return predicate, self.sleep, interval  # injected clock/sleep (tests): plain polling
+        try:
+            tracker = self.backend.change_tracker()
+        except Exception:
+            tracker = None
+        if tracker is None:
+            return predicate, self.sleep, interval
+        seen = [tracker.generation]
+
+        def checked() -> Any:
+            seen[0] = tracker.generation
+            return predicate()
+
+        def sleep(seconds: float) -> None:
+            start = time.monotonic()
+            end = start + max(0.0, float(seconds))
+            while True:
+                self._check_abort()
+                now = time.monotonic()
+                if now >= end:
+                    break
+                if tracker.wait(seen[0], min(0.1, end - now)) > seen[0]:
+                    # Something changed: re-check, but not more often than the normal interval.
+                    rest = start + min(float(interval), float(seconds)) - time.monotonic()
+                    if rest > 0:
+                        _failsafe_mod.abortable_sleep(rest, self._sleep_fn)
+                    break
+            self._check_abort()
+
+        return checked, sleep, max(float(interval), self.EVENT_POLL_INTERVAL)
+
     def _poll(
         self,
         probe: Callable[[], Any],
         timeout: float,
         message: str,
         fatal: Tuple[type, ...] = (),
+        *,
+        events: bool = False,
     ) -> Any:
         """Poll ``probe`` until truthy; transient errors count as "not yet", fatal ones propagate.
 
@@ -294,10 +341,13 @@ class Desktop:
                 last[:] = [exc]  # transient backend / stale tree errors
                 return None
 
+        # poll_interval=0 would busy-spin (and never advance an injected clock).
+        pred, sleep, interval = guarded, self.sleep, self.poll_interval or 0.05
+        if events:  # an accessibility-tree probe: wake on change events where available
+            pred, sleep, interval = self._event_wait(guarded, interval)
         try:
-            # poll_interval=0 would busy-spin (and never advance an injected clock).
-            return _wait_until(guarded, timeout, self.poll_interval or 0.05, message=message, ignore_exceptions=False,
-                               sleep=self.sleep, clock=self._clock)
+            return _wait_until(pred, timeout, interval, message=message, ignore_exceptions=False,
+                               sleep=sleep, clock=self._clock)
         except ActionTimeout:
             if last:
                 raise ActionTimeout(f"{message}; last error: {type(last[0]).__name__}: {last[0]}") from last[0]
@@ -934,7 +984,7 @@ class Desktop:
         t = self._timeout(timeout)
         text = self._selector_text(selector, sel)
         try:
-            node = self._poll(lambda: sel.find_first(self.roots()), t, f"No element matching {text!r}")
+            node = self._poll(lambda: sel.find_first(self.roots()), t, f"No element matching {text!r}", events=True)
         except ActionTimeout as exc:
             raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}") from exc
         return Element(node, self, text)
@@ -1007,7 +1057,7 @@ class Desktop:
 
         label = getattr(state, "__name__", None) or str(state)
         if isinstance(state, str) and state.lower() == "gone":
-            self._poll(lambda: not candidates(), t, f"Element {text!r} still present after {t:g}s")
+            self._poll(lambda: not candidates(), t, f"Element {text!r} still present after {t:g}s", events=True)
             return None
 
         seen = [False]
@@ -1022,7 +1072,7 @@ class Desktop:
             return None
 
         try:
-            return self._poll(probe, t, f"Element {text!r} did not become {label!r} within {t:g}s")
+            return self._poll(probe, t, f"Element {text!r} did not become {label!r} within {t:g}s", events=True)
         except ActionTimeout as exc:
             if not seen[0]:
                 raise ElementNotFound(f"No element matching {text!r} within {t:g}s{self._hint(text)}") from exc
@@ -1098,7 +1148,7 @@ class Desktop:
             return sorted(found, key=lambda w: self._rank(w, title))[0]
 
         try:
-            return self._poll(probe, t, "window not found")
+            return self._poll(probe, t, "window not found", events=True)
         except ActionTimeout as exc:
             crit = ", ".join(
                 f"{k}={v!r}" for k, v in (("title", title), ("app", app), ("class_name", class_name), ("pid", pid)) if v is not None
@@ -1163,7 +1213,7 @@ class Desktop:
             return sorted(fresh, key=lambda w: self._rank(w, wait_window))[0]
 
         try:
-            return self._poll(probe, t, "window not found")
+            return self._poll(probe, t, "window not found", events=True)
         except ActionTimeout:
             try:  # subprocess.Popen.poll(): None while the process runs
                 running = callable(getattr(proc, "poll", None)) and proc.poll() is None

@@ -1341,13 +1341,17 @@ class Element:
         if timeout is None:
             timeout = float(getattr(self.desktop, "default_timeout", 10.0))
         label = getattr(state, "__name__", None) or str(state)
+        sleep = _desktop_sleep(self.desktop)
+        event_wait = getattr(self.desktop, "_event_wait", None)
+        if callable(event_wait):  # wake on accessibility change events where available
+            pred, sleep, interval = event_wait(pred, interval)
         wait_until(
             pred,
             timeout,
             interval,
             message=f"{self!r} did not become {label!r} within {timeout:g}s",
             ignore_exceptions="transient",
-            sleep=_desktop_sleep(self.desktop),
+            sleep=sleep,
             clock=_desktop_clock(self.desktop),
         )
         return self

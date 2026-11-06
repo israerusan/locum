@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 import time as _time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..backends.base import AccessibleNode
@@ -38,6 +38,9 @@ if TYPE_CHECKING:  # pragma: no cover
 MAX_LONG_EDGE = 2576
 MAX_VISUAL_TOKENS = 4784
 PATCH_SIZE = 28
+#: Oldest observation (seconds) whose unchanged windows ``observe(reuse=...)`` reuses;
+#: bounds a missed change event to a short window of staleness.
+REUSE_MAX_AGE = 20.0
 
 #: States worth showing to a model, in display order.
 _SHOWN_STATES = ("focused", "disabled", "checked", "selected", "expanded", "collapsed", "readonly", "occluded")
@@ -549,6 +552,7 @@ def observe(
     selectors: bool = True,
     max_depth: int = 32,
     time_budget: Optional[float] = None,
+    reuse: Optional[Observation] = None,
 ) -> Observation:
     """Snapshot the desktop for an LLM (set-of-marks).
 
@@ -570,6 +574,12 @@ def observe(
             left, so one huge or hung application (a browser with thousands of nodes)
             cannot stall the observation; windows cut short are named in
             :attr:`Observation.notes` and the partial result is returned.
+        reuse: A previous observation (same options) whose elements may be reused for
+            windows that did not change: only with a backend that reports
+            accessibility change events (UI Automation on Windows), only for windows
+            whose process raised no event since then and whose rectangle and title are
+            unchanged, and only within :data:`REUSE_MAX_AGE` seconds. Occlusion is
+            recomputed. Without events this does nothing.
 
     Elements are numbered from 1 in window Z-order (front-most first), then
     document order. Elements whose center is covered by a window in front are
@@ -627,9 +637,26 @@ def observe(
     # the window's selector prefix is unique on the desktop (while the windows are unchanged).
     ctx = _SelectorContext(backend, all_roots)
     limit = max(0, int(max_elements))
-    budget_end = None if time_budget is None else _time.monotonic() + max(0.0, float(time_budget))
+    taken = _time.monotonic()
+    budget_end = None if time_budget is None else taken + max(0.0, float(time_budget))
     partial: List[str] = []
     unscanned: List[str] = []
+
+    # Reuse of unchanged windows (change events say which processes changed since `reuse`).
+    try:
+        tracker = backend.change_tracker()
+    except Exception:
+        tracker = None
+    gen0 = tracker.generation if tracker is not None else None  # read before walking
+    opts = (bool(interactive_only), int(max_depth), region, bool(selectors))
+    dirty = None
+    if (reuse is not None and tracker is not None and getattr(reuse, "_gen", None) is not None
+            and getattr(reuse, "_opts", None) == opts and taken - getattr(reuse, "_taken", 0.0) <= REUSE_MAX_AGE):
+        dirty = tracker.dirty_since(reuse._gen)
+    prev_groups: Dict[Any, Dict[str, Any]] = getattr(reuse, "_groups", {}) if dirty is not None else {}
+    groups: Dict[Any, Dict[str, Any]] = {}
+    reused = 0
+
     for idx, root in enumerate(roots):
         if len(elements) >= limit:
             break
@@ -638,6 +665,26 @@ def observe(
         win_title = info.title if info is not None else (_safe(lambda: root.name, "") or "")
         app = info.app if info is not None else ""
         zi = z_index.get(handle)
+        start_len = len(elements)
+        g = prev_groups.get(handle) if handle is not None else None
+        if (g is not None and info is not None and info.pid and dirty is not None and info.pid not in dirty
+                and g["complete"] and g["rect"] == info.rect and g["title"] == win_title):
+            for old in g["elements"]:
+                if len(elements) >= limit:
+                    break
+                st = set(old.states) - {"occluded"}
+                if zi is not None and any(r.contains(old.bounds.center) for _, r in front[:zi]):
+                    st.add("occluded")
+                elements.append(_dc_replace(
+                    old, id=len(elements) + 1, states=frozenset(st),
+                    selector=LAZY_SELECTOR if selectors else "",
+                    _selector_source=(lambda n=old.node: _selector_in(n, ctx)) if selectors else None,
+                ))
+            groups[handle] = {"rect": info.rect, "title": win_title, "elements": elements[start_len:],
+                              "complete": len(elements) - start_len == len(g["elements"])}
+            reused += 1
+            continue
+        complete = True
         win_end = None
         if budget_end is not None:
             now = _time.monotonic()
@@ -649,9 +696,11 @@ def observe(
             win_end = now + max(left / (len(roots) - idx), left * 0.5)
         for node in root.walk(max_depth=max_depth):
             if len(elements) >= limit:
+                complete = False
                 break
             if win_end is not None and _time.monotonic() >= win_end:
                 partial.append(win_title)
+                complete = False
                 break
             if node is root and _safe(lambda: node.role, "") == "window":
                 continue  # windows are listed separately
@@ -687,6 +736,9 @@ def observe(
                     if selectors else None,
                 )
             )
+        if handle is not None and info is not None:
+            groups[handle] = {"rect": info.rect, "title": win_title, "elements": elements[start_len:],
+                              "complete": complete}
 
     # ---------------------------------------------------------------- screenshot
     shot = None
@@ -720,6 +772,8 @@ def observe(
         region=region,
     )
     obs.capped = limit > 0 and len(elements) >= limit
+    obs._groups, obs._gen, obs._opts, obs._taken = groups, gen0, opts, taken
+    obs.reused_windows = reused
     if partial or unscanned:
         def _names(ts: List[str]) -> str:
             shown = ", ".join(_quote(t) if t else "(untitled)" for t in ts[:8])

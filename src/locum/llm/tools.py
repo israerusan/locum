@@ -1322,6 +1322,7 @@ class DesktopToolkit:
         kw["screenshot"] = bool(include_screenshot)
         kw.setdefault("time_budget", self.OBSERVE_BUDGET)
         prev = self.last_observation
+        kw.setdefault("reuse", prev)  # unchanged windows are not re-walked (Windows: UIA change events)
         obs = observe(self.desktop, window=window, **kw)
         if changes_only:
             if prev is not None and prev.region == obs.region and prev.image_size == obs.image_size and prev.elements is not obs.elements:
@@ -1357,6 +1358,7 @@ class DesktopToolkit:
         kw["screenshot"] = True
         kw["annotate"] = bool(annotated)
         kw.setdefault("time_budget", self.OBSERVE_BUDGET)
+        kw.setdefault("reuse", self.last_observation)
         obs = observe(self.desktop, **kw)
         self.last_observation = obs
         w, h = obs.image_size

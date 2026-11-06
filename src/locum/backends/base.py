@@ -372,5 +372,16 @@ class Backend(abc.ABC):
                     return node
         return None
 
+    def change_tracker(self) -> Any:
+        """An accessibility change-event source, or ``None`` (then waits just poll).
+
+        The object has ``generation`` (an int bumped on every change event),
+        ``alive``, ``wait(since, timeout)`` (block until the generation passes
+        ``since``) and ``dirty_since(generation)`` (the process ids that changed
+        since then, or ``None`` when unknown). Windows implements it with UI
+        Automation events.
+        """
+        return None
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name}>"
