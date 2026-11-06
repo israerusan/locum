@@ -242,6 +242,16 @@ def test_focus_lost(monkeypatch):
     assert rules_of(walk.findings) == ["tab-focus-lost"]
 
 
+def test_nothing_focused_is_a_note_not_a_finding():
+    be, w, *_ = form()
+    be._set_focus(None)
+    w._last_focus = None  # activating the window must not bring a focused field back
+    walk = tab_walk(desk(be), "Form")
+    assert walk.stopped == "no-focus" and walk.presses == 1 and not walk.findings
+    assert "click it" in walk.notes[0]
+    assert walk.restored_focus is None
+
+
 def test_focus_escaping_the_window(monkeypatch):
     be, _w, (name, email, ok, cancel), other, other_box = form()
     orig = be._focus_next

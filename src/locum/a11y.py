@@ -793,8 +793,9 @@ class TabWalk:
     #: The focus came back to the first stop: the whole cycle was seen.
     complete: bool = False
     #: Why the walk ended: ``cycle``, ``max_tabs``, ``trap``, ``escape``, ``focus-lost``,
-    #: ``interrupted`` (another window took the focus), ``refused`` (the policy) or
-    #: ``dry-run`` (a dry-run policy: nothing was pressed).
+    #: ``interrupted`` (another window took the focus), ``refused`` (the policy),
+    #: ``dry-run`` (a dry-run policy: nothing was pressed) or ``no-focus`` (nothing was
+    #: focused before the first press, and Tab did not focus anything either).
     stopped: str = ""
     #: Shift+Tab retraced the whole cycle (``None``: not checked).
     reverse_ok: Optional[bool] = None
@@ -1108,6 +1109,11 @@ def _forward(walk: TabWalk, seen: List[Any], max_tabs: int, backend: Any, handle
             add(node, "tab-escape", f"Tab press {i} moved the keyboard focus out of {walk.window!r} "
                                     f"(from {label(before)} to {label(node)}); the walk stopped")
             walk.stopped = "escape"
+            return
+        if node is None and before is None and not seen:
+            walk.stopped = "no-focus"
+            walk.notes.append(f"nothing in {walk.window!r} has the keyboard focus and Tab did not focus anything: "
+                              "focus a control of the window (click it) and run the walk again")
             return
         if node is None:
             add(before, "tab-focus-lost", f"after Tab press {i} (from {label(before)}) no element has the "
