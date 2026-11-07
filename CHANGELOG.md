@@ -33,6 +33,17 @@ The rules apply from 0.3.0 on.
   context keys `sensitive_args` and `password_field` let integrations that
   call `policy.check` directly mark their own arguments.
 
+### Documentation
+
+- The README has a new **Limitations and known gaps** section. It covers alpha
+  status and pinning for financial or production use, how deeply each platform
+  and bridge has been validated, no orchestrator or multi-machine queue, when
+  typed text needs verification, and that this is a solo project built with
+  heavy AI assistance.
+- Corrected two stale README statements: the status block said "0.1 alpha",
+  and the bridges section said real JVM runs were "still to come". The
+  platform table now has a Citrix/RDP row.
+
 ## [0.4.1] - 2026-11-07
 
 A full review of 0.4.0 by seven independent reviewers found the defects below.

@@ -22,7 +22,17 @@ def test_platform_support_table_sits_next_to_the_headline():
 
 def test_headline_does_not_claim_equal_support_on_all_platforms():
     assert "on Windows, macOS\nand Linux." not in HEAD
-    assert "alpha" in HEAD and "APIs may still change" in HEAD
+    assert "alpha (0.x)" in HEAD and "can and\n> do break APIs" in HEAD
+    assert "Pin an exact version" in HEAD and "(#limitations-and-known-gaps)" in HEAD
+
+
+def test_limitations_section_states_the_known_gaps():
+    section = README.split("## Limitations and known gaps", 1)[1].split("\n## ", 1)[0]
+    for claim in ("pin the exact version", "never run on a real compositor", "never run against a real SAP GUI",
+                  "image matching and OCR only", "No orchestrator", "refuses network shares",
+                  "A bare `d.type()` into whatever has focus is not verified", "heavy AI assistance"):
+        assert claim in section, claim
+    assert "real JVM runs are still to come" not in README  # stale since 0.4.0 (blocking real-JVM CI)
 
 
 def test_ocr_extra_is_described_as_pytesseract_only():

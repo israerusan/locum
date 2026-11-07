@@ -16,6 +16,7 @@ and not yet validated on a real compositor**. Changes are in
 | Linux (Wayland) | xdg-desktop-portal + **AT-SPI** | unit tests against a fake D-Bus portal only: **experimental, not yet validated on a real compositor**; opt-in only (`LOCUM_BACKEND=wayland`) |
 | Java Swing/AWT (`locum.bridges.java`) | Java Access Bridge | **blocking** CI job driving a real Swing window through a Temurin JDK; **experimental** (one test window, no business application) |
 | SAP GUI (`locum.bridges.sap`) | SAP GUI Scripting (COM) | unit tests against a fake COM object graph only: **experimental, never run against a real SAP GUI** |
+| Citrix / RDP / Horizon (`locum.bridges.remote`) | pixels: image matching + OCR in the session window | unit tests only; no accessibility tree, so no selectors, and no real remote session in CI |
 
 * **Selectors, not coordinates.** `d.click('button "Save"')` finds the element
   through UI Automation / AX / AT-SPI, survives window moves, DPI and theme
@@ -42,8 +43,11 @@ and not yet validated on a real compositor**. Changes are in
 * **A drop-in PyAutoGUI layer** (`import locum.compat.pyautogui as pyautogui`)
   so existing scripts move over with one line.
 
-> Status: **0.1 alpha** — usable, tested, but APIs may still change between
-> releases. The design is in [`docs/ARCHITECTURE.md`](https://github.com/israerusan/locum/blob/main/docs/ARCHITECTURE.md).
+> Status: **alpha (0.x)**. Usable and tested, but minor releases (0.X.0) can and
+> do break APIs; each break is listed under **Breaking** in the changelog with a
+> migration line ([docs/API.md](docs/API.md)). Pin an exact version for anything
+> that matters, and read [Limitations](#limitations-and-known-gaps) before using
+> it for financial or production work. The design is in [`docs/ARCHITECTURE.md`](https://github.com/israerusan/locum/blob/main/docs/ARCHITECTURE.md).
 > See [`docs/COMPARISON.md`](https://github.com/israerusan/locum/blob/main/docs/COMPARISON.md) and [`docs/LLM.md`](https://github.com/israerusan/locum/blob/main/docs/LLM.md).
 
 ---
@@ -174,8 +178,11 @@ when the window is covered or off-screen, and grabs the screen otherwise.
 ### SAP GUI, Java and Citrix
 
 UI Automation can't see inside SAP GUI, Swing apps or remote sessions, so
-locum ships bridges ([docs/BRIDGES.md](docs/BRIDGES.md)). They are tested
-against fakes of the COM/DLL APIs; real SAP GUI and JVM runs are still to come.
+locum ships bridges ([docs/BRIDGES.md](docs/BRIDGES.md)). All three are
+**experimental**. The Java bridge drives a real Swing window through a real JVM
+in CI on every push, but no business application. The SAP bridge has only ever
+run against a fake of the COM API, never a real SAP GUI. The remote bridge is
+pixels and OCR only.
 
 <!-- norun -->
 ```python
@@ -478,6 +485,44 @@ pyautogui.click(pyautogui.center(box))
 
 See [`examples/pyautogui_migration.py`](https://github.com/israerusan/locum/blob/main/examples/pyautogui_migration.py) for
 the before/after.
+
+## Limitations and known gaps
+
+Read this before you depend on locum.
+
+* **It is alpha.** Minor releases have broken APIs (0.3.0 gated robots and
+  flows behind a default policy; 0.4.0 stopped auto-selecting Wayland). For
+  production, and above all for financial workflows: pin the exact version,
+  run your flows in `--dry-run` and against a test system first, and test
+  every upgrade.
+* **Validation depth is uneven.** Windows is the strongest (a real Windows 11
+  machine plus blocking CI). macOS has passed on a real Apple Silicon Mac and
+  passes blocking CI on hosted runners. Linux CI is Xvfb + openbox + AT-SPI:
+  real X11 and accessibility, but not a full GNOME/KDE session. Wayland is
+  opt-in (`LOCUM_BACKEND=wayland`) and has never run on a real compositor. SAP
+  has never run against a real SAP GUI. Java runs a real Swing test window,
+  not a business app. Citrix/RDP is image matching and OCR only. Treat
+  everything outside Windows, macOS and X11 as unproven until you have tested
+  it on your own system.
+* **No orchestrator.** There is no multi-machine queue, central scheduler,
+  visual designer or credential server. `WorkQueue` is a local file that
+  several processes on *one* machine can share. It refuses network shares and
+  synced folders on purpose, because their locking is not reliable. Schedule
+  runs with cron, systemd timers or Task Scheduler. For fleets of robots or
+  citizen developers, use an RPA platform such as UiPath.
+* **Typing can be garbled.** Unicode injection does not depend on the keyboard
+  layout, but busy applications sometimes drop or garble synthesized
+  keystrokes. When the exact text matters, use `Element.type` (it reads the
+  field back and repairs a bad result, or raises), `set_text` with
+  verification, or `mode="clipboard"`. For amounts and document numbers, use
+  `verify="amount"` or `verify="exact"` ([details](#humanized-layout-independent-input)).
+  A bare `d.type()` into whatever has focus is not verified.
+* **A solo project, built with heavy AI assistance.** One maintainer, with
+  much of the code, review and fixing done with Claude (commits carry a
+  `Co-Authored-By` line). Every fix has a regression test, and real-desktop
+  CI blocks every push. Even so, there has been far less real-world use than
+  a mature tool gets: expect edge cases, most of all on the less-tested
+  platforms and bridges above. Please report them.
 
 ## How it compares
 
