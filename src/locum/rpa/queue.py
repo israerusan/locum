@@ -1636,14 +1636,19 @@ class WorkQueue:
 
 
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+#: A plain number ("-12.50", "+15551234", "1e-3"): a spreadsheet reads it as a value, not a formula.
+_PLAIN_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
 
 
 def _cell(v: Any) -> str:
-    """A CSV cell; text a spreadsheet would run as a formula (``=HYPERLINK(...)``) gets a ``'`` prefix."""
+    """A CSV cell; text a spreadsheet would run as a formula (``=HYPERLINK(...)``) gets a ``'`` prefix.
+    Plain numbers ("-12.50", "+15551234") are left alone."""
     if isinstance(v, (dict, list)):
         return json.dumps(v, ensure_ascii=False, default=str)
     if v is None:
         return ""
     if isinstance(v, str):
-        return "'" + v if v.startswith(_FORMULA_START) else v
+        if v.startswith(_FORMULA_START) and not _PLAIN_NUMBER.fullmatch(v):
+            return "'" + v
+        return v
     return str(v)

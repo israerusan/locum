@@ -105,7 +105,11 @@ _TEXT_PARAMS = {("desktop", "type"): "text", ("element", "type"): "text", ("elem
 # password copied from a manager...), and a wait_until predicate's value is
 # arbitrary user data (``d.wait_until(lambda: field.value)``).
 _SECRET_RESULTS = frozenset({"clipboard_get", "wait_until"})
-_MIN_SCRUB = 3  # shorter secrets are masked in arguments but not scrubbed out of other text
+# Shorter secrets are masked in arguments but not scrubbed out of other text. A trace is for
+# humans: the strict scrubbing applies (a 4-digit PIN also blanks "1234" out of an order number
+# here); what the model reads uses _secret.MODEL_MIN_SCRUB instead. Error messages are scrubbed
+# here too: scrub_exception() does not rewrite an exception's custom __str__.
+_MIN_SCRUB = 3
 _MAX_REPR = 300
 
 _ACTIVE: Dict[int, "Tracer"] = {}  # id(desktop) -> its active tracer
@@ -708,7 +712,7 @@ class Tracer:
             img.save(buf, format="JPEG", quality=self.quality)
             return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
         except Exception as exc:
-            step.screenshot_error = f"{type(exc).__name__}: {_short(str(exc), 200)}"
+            step.screenshot_error = f"{type(exc).__name__}: {_short(self._scrub(str(exc)) or '', 200)}"
             return None
 
     # -------------------------------------------------------------- logging

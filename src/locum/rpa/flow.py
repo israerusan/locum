@@ -588,8 +588,9 @@ def flow_exempt_rules(doc: Mapping[str, Any]) -> list:
                              "keys or a launch command (a window/app/tool rule alone would exempt everything there)")
         if rule.selector is not None and not _selector_names_target(rule.selector):
             raise ValueError(f"rule {i} ({rule}) is too broad: a flow's exempt selector must name its target "
-                             "by name, text or automation id (e.g. 'button \"Delete row\"'); a bare role, '*' "
-                             "or a wildcard would switch the tripwire off for every such control")
+                             "by an exact name, text or automation id (e.g. 'button \"Delete row\"', "
+                             "'[automation_id=\"btnDelete\"]', '#btnDelete'); a bare role, '*', a wildcard or a "
+                             "substring/prefix/regex/:has-text test would switch the tripwire off for many controls")
         if rule.command is not None and not rule.command.strip("*? "):
             raise ValueError(f"rule {i} ({rule}) is too broad: a flow's exempt launch command must name a program")
         rules.append(rule)
@@ -601,30 +602,18 @@ _IDENTIFYING_ATTRS = frozenset({"name", "text", "automation_id"})
 
 
 def _selector_names_target(selector: str) -> bool:
-    """Whether every branch of ``selector`` constrains its target (last compound) by a
-    non-wildcard name, text or automation id (``:has-text(...)`` included)."""
-    import re
-
-    from ..selectors import _AttrCond, _HasTextCond, parse
+    """Whether every branch of ``selector`` pins its target (last compound) down by an
+    EXACT name, text or automation id: ``button "Save"``, ``[name="..."]``, ``[text="..."]``,
+    ``[automation_id="..."]`` or ``#id``, with a non-empty value and no wildcard characters.
+    Substring, prefix, suffix, regex and glob operators and ``:has-text(...)`` may refine
+    the rule but never count: ``[name*="e"]`` names nothing."""
+    from ..selectors import _AttrCond, parse
 
     def identifies(cond: Any) -> bool:
-        if isinstance(cond, _HasTextCond):
-            return bool(cond.text.strip())
-        if not isinstance(cond, _AttrCond) or cond.key not in _IDENTIFYING_ATTRS:
+        if not isinstance(cond, _AttrCond) or cond.key not in _IDENTIFYING_ATTRS or cond.op != "=":
             return False
         value = cond.value or ""
-        if cond.op in ("=", "^=", "$=", "*="):
-            return bool(value.strip())
-        if cond.op == "%=":
-            return bool(value.strip("*? "))
-        if cond.op == "~=":
-            # A regex must not match the empty string and must spell some literal text.
-            literal = re.sub(r"\\.|\[[^\]]*\]", "", value)
-            try:
-                return re.search(value, "") is None and re.search(r"[^\W_]", literal) is not None
-            except re.error:
-                return False
-        return False  # presence test or "!=": matches (almost) everything
+        return bool(value.strip()) and not any(ch in value for ch in "*?")
 
     try:
         sel = parse(selector)

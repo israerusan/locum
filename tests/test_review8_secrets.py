@@ -221,8 +221,9 @@ def test_scrubbing_errors_handles_chains_and_custom_str():
     with pytest.raises(Custom) as info:
         with scrubbing_errors():
             raise Custom()
-    assert isinstance(info.value, Custom) and type(info.value).__name__ == "Custom"
-    assert PW not in str(info.value) and "custom says" in str(info.value)
+    # The type is never swapped (review 9): a custom __str__ is scrubbed by the renderers.
+    assert type(info.value) is Custom
+    assert PW not in _secret.scrub(str(info.value)) and "custom says" in _secret.scrub(str(info.value))
 
     with pytest.raises(RuntimeError) as info:
         with scrubbing_errors():

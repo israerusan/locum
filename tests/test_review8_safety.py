@@ -253,9 +253,9 @@ def test_flow_exempt_rejects_rules_that_name_no_target(rule):
         flow_exempt_rules({"exempt": [rule]})
 
 
-@pytest.mark.parametrize("rule", ['button "Delete row"', "button#delete", 'button[name^="Delete"]',
+@pytest.mark.parametrize("rule", ['button "Delete row"', "button#delete", 'button[name="Delete"]',
                                   'window "Bank" button "Transfer all funds"', "keys=ctrl+s",
-                                  'button:has-text("Delete")', "launch=notepad.exe"])
+                                  'button[automation_id="btnDelete"]:has-text("Delete")', "launch=notepad.exe"])
 def test_flow_exempt_accepts_specific_rules(rule):
     assert len(flow_exempt_rules({"exempt": [rule]})) == 1
 

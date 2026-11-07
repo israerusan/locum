@@ -138,7 +138,7 @@ def test_compat_settings_still_apply_on_its_own_desktop(compat_settings, monkeyp
 def test_export_csv_neutralizes_formulas(tmp_path):
     q = WorkQueue("x")
     q.add({"vendor": '=HYPERLINK("http://evil",1)', "amt": "+1+cmd|' /C calc'!A0", "n": -5,
-           "@at": "@SUM(A1)", "tab": "\tx", "cr": "\rx", "dash": "-2", "ok": "plain"}, reference="=ref")
+           "@at": "@SUM(A1)", "tab": "\tx", "cr": "\rx", "dash": "-2+A1", "num": "-2", "ok": "plain"}, reference="=ref")
     out = q.export_csv(tmp_path / "out.csv")
     with open(out, encoding="utf-8", newline="") as fh:
         rows = list(csv.DictReader(fh))
@@ -146,8 +146,8 @@ def test_export_csv_neutralizes_formulas(tmp_path):
     assert r["vendor"] == '\'=HYPERLINK("http://evil",1)'
     assert r["amt"].startswith("'+")
     assert r["'@at"] == "'@SUM(A1)"
-    assert r["tab"] == "'\tx" and r["cr"] == "'\rx" and r["dash"] == "'-2"
-    assert r["n"] == "-5" and r["ok"] == "plain"
+    assert r["tab"] == "'\tx" and r["cr"] == "'\rx" and r["dash"] == "'-2+A1"
+    assert r["n"] == "-5" and r["num"] == "-2" and r["ok"] == "plain"  # a plain number is no formula
     assert r["reference"] == "'=ref"
 
 

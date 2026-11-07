@@ -68,6 +68,27 @@ if TYPE_CHECKING:  # pragma: no cover
 # =============================================================================== results
 
 
+def _scrub_result_text(text: Any) -> Any:
+    """Tool-result text for the model, without registered secrets.
+
+    Only unambiguous (``MODEL_MIN_SCRUB``\\ +) secrets are replaced -- a PIN must not turn
+    ``Clicked at (1234, 250)`` into ``(***, 250)`` -- and a JSON payload is scrubbed value
+    by value after parsing, so it stays valid JSON. A text that *is* a secret is masked."""
+    from .._secret import MODEL_MIN_SCRUB, mask_value, scrub_data
+
+    if not isinstance(text, str) or not text:
+        return text
+    if text.lstrip()[:1] in ("{", "["):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            pass
+        else:
+            clean = scrub_data(data, min_len=MODEL_MIN_SCRUB)
+            return text if clean == data else json.dumps(clean, ensure_ascii=False)
+    return mask_value(text) or text
+
+
 @dataclass
 class ToolResult:
     """What a tool returns to the model.
@@ -86,9 +107,7 @@ class ToolResult:
 
     def __post_init__(self) -> None:
         # Text reaches the model (and MCP clients): registered secrets never do.
-        from .._secret import scrub
-
-        self.text = scrub(self.text) or self.text
+        self.text = _scrub_result_text(self.text)
 
     @classmethod
     def ok(cls, text: str = "OK", **kw: Any) -> "ToolResult":

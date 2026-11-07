@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 from . import _inputlock, _target
 from ._cancel import check as _cancel_check
-from ._secret import MASK, accepts_secret, contains_secret, known_secrets, scrub
+from ._secret import MASK, accepts_secret, known_secrets, mask_value, scrub_for_model, typing_secret
 from .backends.base import CAP_CLIPBOARD, AccessibleNode
 from .errors import (
     ActionTimeout,
@@ -315,13 +315,19 @@ class VerifyResult:
     actual: Optional[str] = None
     reason: str = ""
 
+    def __post_init__(self) -> None:
+        # Whether a Secret was being typed when this result was made (not a field: the
+        # constructor signature is public API).
+        object.__setattr__(self, "_secret", typing_secret())
+
     @property
     def verified(self) -> bool:
         return self.status == "verified"
 
     def _shown(self) -> Tuple[str, Optional[str]]:
         # A secret was typed: the read-back is (a near-copy of) the password, never shown.
-        if _holds_secret(self.expected) or _holds_secret(self.actual):
+        if getattr(self, "_secret", False) or _holds_secret(self.expected) or _holds_secret(self.actual) \
+                or mask_value(self.actual) != self.actual:
             return MASK, (None if self.actual is None else MASK)
         return self.expected, self.actual
 
@@ -337,10 +343,13 @@ class VerifyResult:
 
 
 def _holds_secret(text: Optional[str]) -> bool:
-    """Whether ``text`` is or contains a registered secret (any length: also the short ones)."""
+    """Whether ``text`` (the expected text of a verification) holds a secret: the call is typing
+    a :class:`~locum._secret.Secret` (tracked, see ``typing_secret``) or ``text`` *is* a
+    registered value. Not a substring search: typing ``"Order 12345"`` with ``Secret("1234")``
+    registered is not typing a secret."""
     if not isinstance(text, str) or not text:
         return False
-    return contains_secret(text) or text in known_secrets()
+    return typing_secret() or text in known_secrets()
 
 
 def _secret_mismatch(actual: Optional[str], expected: str) -> str:
@@ -1728,20 +1737,23 @@ class Element:
             desc = describe_node(_ScrubbedNode(self._node))
         except Exception:  # pragma: no cover - defensive
             desc = self.role
-        return f"<Element {scrub(desc)}>"
+        return f"<Element {scrub_for_model(desc)}>"
 
     def _repr_without_value(self) -> str:
         """``repr(self)`` without the field's value (it may hold a near-copy of a secret)."""
         from .selectors import describe_node
 
         try:
-            return f"<Element {scrub(describe_node(_ScrubbedNode(self._node, hide_value=True)))}>"
+            return f"<Element {scrub_for_model(describe_node(_ScrubbedNode(self._node, hide_value=True)))}>"
         except Exception:  # pragma: no cover - defensive
             return f"<Element {self.role}>"
 
 
 class _ScrubbedNode:
-    """A node whose ``name`` / ``value`` have registered secrets masked (for :meth:`Element.__repr__`)."""
+    """A node whose ``name`` / ``value`` have registered secrets masked (for :meth:`Element.__repr__`).
+
+    The repr reaches the model (in tool errors) too, so it follows the observation rule: a
+    value that is a secret is masked whole, only long secrets are scrubbed out of names."""
 
     __slots__ = ("_n", "_hide_value")
 
@@ -1754,11 +1766,11 @@ class _ScrubbedNode:
 
     @property
     def name(self) -> Any:
-        return scrub(self._n.name)
+        return scrub_for_model(self._n.name)
 
     @property
     def value(self) -> Any:
         if self._hide_value:
             return None
         v = self._n.value
-        return scrub(v) if isinstance(v, str) else v
+        return mask_value(v)

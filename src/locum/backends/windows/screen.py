@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import ctypes
+import functools
+import inspect
 import threading
+import types
 import weakref
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from ...types import Monitor, Rect
 from ._win32api import (
@@ -148,25 +151,57 @@ def thread_is_per_monitor_aware(api: Any) -> Optional[bool]:
         return None
 
 
+def _dpi_scoped(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a backend entry point with the calling thread per-monitor (v2) DPI aware when
+    that is how the backend obtained its awareness (``dpi_mode == "thread_per_monitor_v2"``:
+    the process awareness was preset by a manifest or another library). The thread's own
+    awareness is restored afterwards, so a host GUI thread that calls the backend keeps
+    its scaling for the windows it creates. Nesting- and exception-safe."""
+
+    @functools.wraps(fn)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        local = getattr(self, "_dpi_local", None)
+        if local is None or getattr(self, "dpi_mode", None) != "thread_per_monitor_v2":
+            return fn(self, *args, **kwargs)
+        depth = getattr(local, "depth", 0)
+        set_ctx = getattr(self._api, "SetThreadDpiAwarenessContext", None)
+        if depth or set_ctx is None:  # an outer call already switched this thread
+            return fn(self, *args, **kwargs)
+        try:
+            old = set_ctx(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        except Exception:
+            old = None
+        local.depth = 1
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            local.depth = 0
+            if old:
+                try:
+                    set_ctx(old if isinstance(old, ctypes.c_void_p) else ctypes.c_void_p(int(old)))
+                except Exception:
+                    pass
+
+    wrapper.__locum_dpi_scoped__ = True  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _scope_public_methods(cls: type) -> type:
+    """Wrap every public method of ``cls`` (its mixins' included) with :func:`_dpi_scoped`."""
+    for name in dir(cls):
+        if name.startswith("_"):
+            continue
+        attr = inspect.getattr_static(cls, name)
+        if not isinstance(attr, types.FunctionType) or getattr(attr, "__locum_dpi_scoped__", False):
+            continue
+        if inspect.isgeneratorfunction(attr):
+            continue  # its body runs after the call returned
+        setattr(cls, name, _dpi_scoped(attr))
+    return cls
+
+
 class _ScreenMixin:
     """Virtual screen, monitors and screenshots of :class:`WindowsBackend`."""
-
-    def _ensure_thread_dpi(self) -> None:
-        """Make the calling thread per-monitor (v2) DPI aware once, when that is how the
-        backend obtained its awareness (``dpi_mode == "thread_per_monitor_v2"``: the
-        process awareness was preset by a manifest or another library, so only the
-        constructing thread was switched). Without it every other thread (an MCP
-        worker, the recorder) would see logical, differently scaled coordinates."""
-        local = getattr(self, "_dpi_local", None)
-        if getattr(self, "dpi_mode", None) != "thread_per_monitor_v2" or local is None or getattr(local, "done", False):
-            return
-        local.done = True
-        fn = getattr(self._api, "SetThreadDpiAwarenessContext", None)
-        if fn is not None:
-            try:
-                fn(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
-            except Exception:
-                pass
 
     # =================================================================== screen
     def virtual_screen(self) -> Rect:

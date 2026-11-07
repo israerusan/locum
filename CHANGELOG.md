@@ -22,9 +22,10 @@ before the policy saw it.
 
 These tighten safety behaviour, which docs/API.md allows in a patch release.
 
-- A flow's `exempt:` rules must name a specific control. `"*"`, a bare role
-  (`"button"`) or a wildcard name is rejected as "too broad". **Migration:**
-  name the control, e.g. `'button "Save"'`.
+- A flow's `exempt:` rules must name a specific control by an exact name,
+  text or automation id (`'button "Save"'`, `[automation_id="..."]`, `#id`).
+  `"*"`, a bare role, a wildcard, or a substring/prefix/regex/`:has-text`
+  test is rejected as "too broad". **Migration:** name the control exactly.
 - The shortcut tripwire counts modifiers that are already held:
   `hold("ctrl")` + `press("s")` is checked as Ctrl+S, and `key_down`/`hold`
   treat every Enter key (keypad Enter included) as Enter.
@@ -75,11 +76,20 @@ Secrets and the credential vault:
 - Windows: names differing only in case no longer create hidden duplicate
   credentials. Writes are read back and checked, and delete removes every
   variant.
-- Verification errors no longer show a near-copy of a typed secret.
-- Observations (what an LLM sees), `Element` repr, every tool/MCP result, and
-  `last_verification` mask typed secrets.
-- Robot log messages are scrubbed. `scrubbing_errors` also scrubs chained
-  exceptions and exceptions with a custom `__str__`.
+- Verification errors no longer show a near-copy of a typed secret (decided
+  by whether the typed text was a `Secret`, not by whether it contains one).
+- Observations (what an LLM sees), `Element` repr and tool/MCP results: a
+  field value equal to a secret is masked, and secrets of 8+ characters are
+  scrubbed from names, titles and tool results (JSON stays valid). Short
+  secrets such as PINs never change the numbers, titles or selectors the
+  model reads. `last_verification` masks secrets.
+- Robot log messages and step errors are scrubbed. `scrubbing_errors` scrubs
+  arguments and OSError filenames along the cause/context chain without
+  changing the exception's type. Traces, run reports, robot logs and CLI
+  errors scrub exceptions with a custom `__str__`.
+- Policy checks and confirmation prompts never run while the desktop input
+  lock is held. Input after a mid-action prompt stops with `TargetLost` if
+  the focus moved.
 - Traces scrub before truncating, so a cut can't leave part of a secret.
 - The env credential fallback also applies when keyring has no usable
   backend (headless CI).
@@ -91,9 +101,10 @@ Secrets and the credential vault:
 
 Windows:
 
-- Every thread calling the backend is per-monitor DPI aware, also when the
-  process awareness was set beforehand. DWM frame bounds are converted on
-  threads that are not.
+- Backend calls from any thread use per-monitor DPI coordinates, also when
+  the process awareness was set beforehand: the thread is switched for the
+  call and switched back afterwards. DWM frame bounds are converted on
+  threads that are not DPI aware.
 - `dpi_aware=False` is no longer undone by the first screenshot (mss made the
   process DPI aware); auto mode uses GDI there.
 - `Window.move()`/`resize()` on a minimized window keep its normal size and
@@ -122,7 +133,7 @@ MCP, agent and browser:
 RPA and tooling:
 
 - `WorkQueue.export_csv` neutralises cells starting with `=`, `+`, `-`, `@`,
-  tab or CR (CSV formula injection).
+  tab or CR (CSV formula injection), except plain numbers such as `-12.50`.
 - `locum run --dry-run` reports checks of simulated input as skipped instead
   of failing the run.
 - pytest traces of parametrized tests no longer overwrite each other.

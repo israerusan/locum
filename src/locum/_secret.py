@@ -15,29 +15,54 @@ replace any registered value with ``***`` -- also when it reaches them as
 plain text (an error message naming what was typed into a field). Values
 shorter than :data:`MIN_SCRUB` characters are masked as arguments but not
 scrubbed out of other text (that would garble every message).
+
+Two strengths of scrubbing:
+
+* For **humans** (traces, logs, run reports, CLI and exception messages):
+  every registered value of :data:`MIN_SCRUB` or more characters is replaced.
+  A 4-digit PIN also blanks ``1234`` out of an order number there -- a garbled
+  digit in a log is better than a leaked PIN.
+* For **the model** (observations, tool results): only what the model needs
+  to stay correct about is left alone. A field value that *equals* a
+  registered secret is masked whole; inside other text only secrets of
+  :data:`MODEL_MIN_SCRUB` or more characters (unambiguous ones) are replaced,
+  so a PIN never turns a coordinate, an amount or a window title into
+  ``***``. Use :func:`scrub_for_model` / :func:`mask_value` there.
 """
 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 import hmac
 import html
 import json
+import re
 import threading
-from typing import Any, Callable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Pattern, Tuple
 
-__all__ = ["Secret", "MASK", "MIN_SCRUB", "register", "known_secrets", "reveal", "is_secret", "scrub",
-           "scrub_data", "contains_secret", "scrubbing_errors", "accepts_secret", "forget_all"]
+__all__ = ["Secret", "MASK", "MIN_SCRUB", "MODEL_MIN_SCRUB", "register", "known_secrets", "reveal", "is_secret",
+           "scrub", "scrub_data", "scrub_for_model", "mask_value", "contains_secret", "typing_secret",
+           "scrubbing_errors", "accepts_secret", "forget_all"]
 
 #: Replacement text for a secret.
 MASK = "***"
-#: Shorter secrets are not scrubbed out of free text.
+#: Shorter secrets are not scrubbed out of free text (traces, logs, reports, errors: for humans).
 MIN_SCRUB = 3
+#: Shorter secrets are not scrubbed out of free text the *model* reads (observations, tool
+#: results): ``Secret("1234")`` must not turn ``(1234, 250)`` into ``(***, 250)``.
+MODEL_MIN_SCRUB = 8
 
 _lock = threading.Lock()
 _known: List[str] = []  # longest first
 _known_set: set = set()
+#: min_len -> (registry snapshot, compiled alternation of every form, shortest form length)
+_patterns: Dict[int, Tuple[Tuple[str, ...], Optional[Pattern[str]], int]] = {}
+#: Set while a Secret is being typed (inside ``scrubbing_errors(True)`` / ``accepts_secret``):
+#: verification code tells "the expected text was built from a Secret" from this, not by
+#: searching the text for registered values.
+_typing: contextvars.ContextVar = contextvars.ContextVar("locum_typing_secret", default=False)
 
 
 def register(value: str) -> None:
@@ -63,6 +88,8 @@ def forget_all() -> None:
     with _lock:
         _known.clear()
         _known_set.clear()
+        _patterns.clear()
+    _forms.cache_clear()
 
 
 class Secret:
@@ -130,6 +157,7 @@ def reveal(value: Any) -> Any:
     return value.reveal() if isinstance(value, Secret) else value
 
 
+@functools.lru_cache(maxsize=4096)
 def _forms(s: str) -> Tuple[str, ...]:
     """The ways a secret can appear in text: as is, quoted by repr/JSON, HTML-escaped."""
     out = [s]
@@ -139,46 +167,103 @@ def _forms(s: str) -> Tuple[str, ...]:
     return tuple(out)
 
 
+def _compile(secrets: Any, min_len: int) -> Tuple[Optional[Pattern[str]], int]:
+    """One alternation of every form of every secret of ``min_len`` or more characters
+    (longest first, so the longest match wins at a position) and the shortest form's length."""
+    forms = sorted({f for s in secrets if len(s) >= min_len for f in _forms(s)}, key=len, reverse=True)
+    if not forms:
+        return None, 0
+    return re.compile("|".join(map(re.escape, forms))), len(forms[-1])
+
+
+def _pattern(min_len: int) -> Tuple[Optional[Pattern[str]], int]:
+    """The compiled scrub pattern for the current registry (rebuilt only when it changed)."""
+    snap = known_secrets()
+    cached = _patterns.get(min_len)
+    if cached is not None and cached[0] == snap:
+        return cached[1], cached[2]
+    pat, shortest = _compile(snap, min_len)
+    with _lock:
+        _patterns[min_len] = (snap, pat, shortest)
+    return pat, shortest
+
+
 def contains_secret(text: Any) -> bool:
-    """Whether ``text`` (a string) contains a registered secret."""
+    """Whether ``text`` (a string) contains a registered secret (of :data:`MIN_SCRUB` or more characters)."""
     if isinstance(text, Secret):
         return True
     if not isinstance(text, str) or not text:
         return False
-    return any(len(s) >= MIN_SCRUB and any(f in text for f in _forms(s)) for s in known_secrets())
+    pat, shortest = _pattern(MIN_SCRUB)
+    return pat is not None and len(text) >= shortest and pat.search(text) is not None
 
 
-def scrub(text: Optional[str], extra: Any = ()) -> Optional[str]:
-    """``text`` with every registered secret (and every string in ``extra``) replaced by ``***``."""
+def scrub(text: Optional[str], extra: Any = (), *, min_len: int = MIN_SCRUB) -> Optional[str]:
+    """``text`` with every registered secret (and every string in ``extra``) of ``min_len`` or
+    more characters replaced by ``***``.
+
+    The default strength is for text humans read (traces, logs, reports, errors); text the
+    model reads goes through :func:`scrub_for_model`."""
     if not isinstance(text, str) or not text:
         return text
-    secrets = list(known_secrets())
     if extra:
-        secrets = sorted(set(secrets) | {str(s) for s in extra if s}, key=len, reverse=True)
-    for s in secrets:
-        if len(s) < MIN_SCRUB:
-            continue
-        for form in _forms(s):
-            if form in text:
-                text = text.replace(form, MASK)
-    return text
+        pat, shortest = _compile(set(known_secrets()) | {str(s) for s in extra if s}, min_len)
+    else:
+        pat, shortest = _pattern(min_len)
+    if pat is None or len(text) < shortest:
+        return text
+    return pat.sub(MASK, text)
 
 
-def scrub_data(value: Any, _depth: int = 0) -> Any:
+def scrub_for_model(text: Optional[str]) -> Optional[str]:
+    """``text`` with only the unambiguous (:data:`MODEL_MIN_SCRUB`\\ +) secrets replaced: for
+    observations and tool results, where a short PIN must not garble digits the model acts on."""
+    return scrub(text, min_len=MODEL_MIN_SCRUB)
+
+
+def mask_value(value: Any) -> Any:
+    """A field value for the model: ``***`` when it *is* a registered secret (any length),
+    else :func:`scrub_for_model`. Non-strings pass through (a :class:`Secret` gives ``***``)."""
+    if isinstance(value, Secret):
+        return MASK
+    if not isinstance(value, str) or not value:
+        return value
+    if value in _known_set:
+        return MASK
+    return scrub_for_model(value)
+
+
+def scrub_data(value: Any, _depth: int = 0, *, min_len: int = MIN_SCRUB) -> Any:
     """A copy of JSON-like ``value`` (dicts, lists, strings) with secrets scrubbed; :class:`Secret` -> ``***``."""
+    pat, shortest = _pattern(min_len)
+
+    def sub(text: str) -> str:
+        if pat is None or len(text) < shortest:
+            return text
+        return pat.sub(MASK, text)
+
+    return _scrub_data(value, sub, _depth)
+
+
+def _scrub_data(value: Any, sub: Callable[[str], str], depth: int) -> Any:
     if isinstance(value, Secret):
         return MASK
     if isinstance(value, str):
-        return scrub(value)
-    if _depth > 32:
+        return sub(value) if value else value
+    if depth > 32:
         return value
     if isinstance(value, dict):
-        return {k: scrub_data(v, _depth + 1) for k, v in value.items()}
+        return {k: _scrub_data(v, sub, depth + 1) for k, v in value.items()}
     if isinstance(value, list):
-        return [scrub_data(v, _depth + 1) for v in value]
+        return [_scrub_data(v, sub, depth + 1) for v in value]
     if isinstance(value, tuple):
-        return tuple(scrub_data(v, _depth + 1) for v in value)
+        return tuple(_scrub_data(v, sub, depth + 1) for v in value)
     return value
+
+
+def typing_secret() -> bool:
+    """Whether the current call is typing a :class:`Secret` (inside :func:`scrubbing_errors`)."""
+    return bool(_typing.get())
 
 
 def accepts_secret(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -200,23 +285,29 @@ def scrubbing_errors(active: bool = True) -> Iterator[None]:
     """Scrub registered secrets out of the message of an exception leaving the block.
 
     Used around typing a :class:`Secret`: a verification error names what the field
-    holds, which is the password."""
+    holds, which is the password. While the block runs, :func:`typing_secret` is true."""
     if not active:
         yield
         return
+    token = _typing.set(True)
     try:
         yield
     except BaseException as exc:
         scrub_exception(exc)
         raise
+    finally:
+        _typing.reset(token)
 
 
 def scrub_exception(exc: BaseException) -> BaseException:
     """Scrub registered secrets out of ``exc`` and its ``__cause__`` / ``__context__`` chain, in place.
 
-    String ``args`` are rewritten; an exception whose ``str()`` still shows a secret
-    (a custom ``__str__``) gets a scrubbed ``__str__`` through a same-named subclass,
-    so ``isinstance`` checks and ``except`` clauses keep working."""
+    String ``args`` are rewritten, and so are an ``OSError``'s ``filename``,
+    ``filename2`` and ``strerror``. The exception's type is never changed (``type(e)
+    is X``, pickling and ``except`` clauses keep working), so an exception with a
+    custom ``__str__`` built from other attributes can still show a secret in
+    ``str(e)``: the renderers (traces, run reports, robot logs, CLI errors) scrub
+    ``str(e)`` and the traceback text themselves."""
     seen: set = set()
     stack: List[Optional[BaseException]] = [exc]
     while stack and len(seen) < 64:
@@ -235,14 +326,21 @@ def scrub_exception(exc: BaseException) -> BaseException:
 def _scrub_one(exc: BaseException) -> None:
     if any(isinstance(a, str) and contains_secret(a) for a in exc.args):
         exc.args = tuple(scrub(a) if isinstance(a, str) else a for a in exc.args)
+    if isinstance(exc, OSError):  # str() is built from these, not from args
+        for attr in ("filename", "filename2", "strerror"):
+            v = getattr(exc, attr, None)
+            if v is None or isinstance(v, (bytes, int)):
+                continue
+            text = v if isinstance(v, str) else _fspath(v)
+            if text is not None and contains_secret(text):
+                setattr(exc, attr, scrub(text))
+
+
+def _fspath(v: Any) -> Optional[str]:
+    import os
+
     try:
-        text = str(exc)
-    except Exception:
-        return
-    if not contains_secret(text):
-        return
-    masked = scrub(text) or ""
-    cls = type(exc)
-    sub = type(cls.__name__, (cls,), {"__str__": lambda self, _m=masked: _m,
-                                      "__module__": cls.__module__, "__qualname__": cls.__qualname__})
-    exc.__class__ = sub
+        p = os.fspath(v)
+    except TypeError:
+        return None
+    return p if isinstance(p, str) else None

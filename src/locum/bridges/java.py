@@ -519,11 +519,12 @@ class JavaNode(AccessibleNode):
         Names, states, values and bounds are read again. The child lists are
         checked against the JVM: unchanged children keep their node (so
         elements already handed out stay valid), new ones are added, and the
-        ones that went away are dropped from the tree and their references
-        released. Cells, list items and tree nodes below a table, list or tree
-        are kept by index (Swing hands out a new proxy object on every read):
-        a held cell element stays valid and reads whatever is at its position
-        now. A refresh leaks no reference.
+        ones that went away are dropped from the tree (their references are
+        released on :meth:`JavaBridge.close`). Cells, list items and tree nodes
+        below a table, list or tree are kept by index (Swing hands out a new
+        proxy object on every read): a held cell element stays valid and reads
+        whatever is at its position now; the swapped-out references are
+        released at once.
         """
         self._info = None
         if self._kids is not None:
@@ -622,11 +623,18 @@ class JavaNode(AccessibleNode):
             info = self.info
             count = min(int(info.childrenCount), self.bridge.max_children) if info is not None else 0
             prev = list(self._kids or ())
-            kids = self._read_indexed(count, prev) if self._index_addressed() else self._read_matched(count, prev)
-            kept = {id(k) for k in kids}
-            for old in prev:  # gone from the JVM (or replaced by a new proxy): free it now, not on close
-                if id(old) not in kept:
-                    old.release()
+            if self._index_addressed():
+                kids = self._read_indexed(count, prev)
+                kept = {id(k) for k in kids}
+                for old in prev:  # replaced by a new proxy or past the last index: free it now
+                    if id(old) not in kept:
+                        old.release()
+            else:
+                # An unmatched old child may still exist (moved beyond the match window, or held
+                # by the caller): the bridge has no reliable "gone" signal, so its reference stays
+                # tracked and JavaBridge.close() releases it. Freeing it here would kill a held
+                # element that a fresh lookup still finds.
+                kids = self._read_matched(count, prev)
             self._kids = kids
             self._kids_stale = False
         return self._kids
@@ -685,27 +693,23 @@ class JavaNode(AccessibleNode):
     def _read_matched(self, count: int, prev: List["JavaNode"]) -> List["JavaNode"]:
         used: set = set()
         shift = 0  # rows inserted/removed above: the old index of child i is i - shift
-        matching = bool(prev)
         kids: List[JavaNode] = []
         for i in range(max(0, count)):
             child = self._child(i)
             if not child:
                 continue
             # Same position first, then a few neighbours: a bounded number of isSameObject
-            # calls per child, not a scan of every cached child (a JTable has thousands).
+            # calls per child (at most 2 * _MATCH_WINDOW + 1), not a scan of every cached child.
+            # No cut-off after a run of misses: a rebuilt top of a panel must not stop the
+            # unchanged children below it from matching (and held elements from staying valid).
             same = None
-            if matching:
-                for j in sorted(range(i - shift - _MATCH_WINDOW, i - shift + _MATCH_WINDOW + 1),
-                                key=lambda j: abs(j - (i - shift))):
-                    if 0 <= j < len(prev) and j not in used and not prev[j]._released \
-                            and self._same_ref(prev[j].ac, child):
-                        same, shift = prev[j], i - j
-                        used.add(j)
-                        break
-                if same is None and not used and i >= 2 * _MATCH_WINDOW:
-                    # Not one of the first children matched: a new generation of objects (a
-                    # component that hands out fresh proxies). Stop paying isSameObject calls.
-                    matching = False
+            for j in sorted(range(i - shift - _MATCH_WINDOW, i - shift + _MATCH_WINDOW + 1),
+                            key=lambda j: abs(j - (i - shift))):
+                if 0 <= j < len(prev) and j not in used and not prev[j]._released \
+                        and self._same_ref(prev[j].ac, child):
+                    same, shift = prev[j], i - j
+                    used.add(j)
+                    break
             if same is not None:
                 # A second reference to a child we already hold: keep the node, drop the new reference.
                 if child != same.ac:

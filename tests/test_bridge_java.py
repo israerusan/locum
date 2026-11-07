@@ -623,37 +623,40 @@ def test_tree_nodes_below_a_tree_are_kept_by_index(fake):
 
 
 def test_unmatched_children_of_an_ordinary_container_are_released(fake):
-    # A custom component that also hands out fresh objects: no match, so the old nodes are freed
-    # (they used to stay pinned until close) and matching stops after a few misses.
+    # A custom component that also hands out fresh objects: nothing matches. Matching costs
+    # O(n) isSameObject calls (at most 2 * _MATCH_WINDOW + 1 per child, no cut-off), and the
+    # unmatched old nodes are not freed mid-session (no reliable "gone" signal: one may be a
+    # held element that still exists) but on close.
     panel = fake.roots[HWND].kids[0]
     panel.kids[:] = _cells(300)
     panel.fresh_kids = True
     calls = []
     same = fake.isSameObject
     fake.isSameObject = lambda vm, a, b: calls.append(1) or same(vm, a, b)
-    with bridge() as jab:
-        win = jab.from_hwnd(HWND)
-        win.find_all("text")
-        held = jab.live_references
-        del calls[:]
-        for _ in range(5):
-            assert len(win.find_all("text")) == 300
-        assert jab.live_references == held and len(fake.refs) == held
-        assert len(calls) <= 5 * 9 * 9
-        del panel.kids[100:]
-        assert len(win.find_all("text")) == 100
-        assert jab.live_references == held - 200 and len(fake.refs) == held - 200
+    jab = bridge()
+    win = jab.from_hwnd(HWND)
+    win.find_all("text")
+    del calls[:]
+    for _ in range(5):
+        assert len(win.find_all("text")) == 300
+    assert len(calls) <= 5 * 300 * (2 * java._MATCH_WINDOW + 1)
+    del panel.kids[100:]
+    assert len(win.find_all("text")) == 100
+    jab.close()
+    assert fake.refs == {} and jab.live_references == 0
 
 
-def test_removed_child_reference_is_released_at_once(fake):
+def test_removed_child_reference_is_released_on_close(fake):
     panel = fake.roots[HWND].kids[0]
-    with bridge() as jab:
-        win = jab.from_hwnd(HWND)
-        win.find_all("*")
-        held = jab.live_references
-        del panel.kids[0]
-        assert not win.exists('text "Customer:"')
-        assert jab.live_references == held - 1 and len(fake.refs) == held - 1
+    jab = bridge()
+    win = jab.from_hwnd(HWND)
+    win.find_all("*")
+    held = jab.live_references
+    del panel.kids[0]
+    assert not win.exists('text "Customer:"')
+    assert jab.live_references == held  # dropped from the tree, freed on close
+    jab.close()
+    assert fake.refs == {} and jab.live_references == 0
 
 
 # ---------------------------------------------------------------------- localised click action

@@ -27,7 +27,7 @@ from ..backends.base import AccessibleNode
 from ..errors import ElementNotFound, NotSupported
 from ..types import Point, Rect, WindowInfo
 from .._nodeinfo import is_password
-from .._secret import scrub, scrub_data
+from .._secret import MODEL_MIN_SCRUB, mask_value, scrub_data, scrub_for_model
 
 if TYPE_CHECKING:  # pragma: no cover
     from PIL.Image import Image
@@ -132,8 +132,9 @@ def _node_value(node: Any) -> Optional[str]:
     value = _safe(lambda: node.value)
     if value not in (None, "") and is_password(node):
         return "***"
-    # A secret typed into an ordinary field: masked like a password field.
-    return scrub(value) if isinstance(value, str) else value
+    # A secret typed into an ordinary field: masked like a password field. Only a value that
+    # *is* a secret, or holds an unambiguous (long) one: a PIN must not turn 1234.50 into ***.50.
+    return mask_value(value)
 
 
 def _quote(text: str, limit: int = 80) -> str:
@@ -205,17 +206,27 @@ class ObservedElement:
         return "occluded" in self.states
 
     def to_dict(self) -> Dict[str, Any]:
-        return scrub_data({
+        return _for_model(self._dict())
+
+    def _dict(self) -> Dict[str, Any]:
+        """:meth:`to_dict` before scrubbing (the caller scrubs once)."""
+        value = mask_value(self.value)  # a secret registered after the observation
+        selector = self.selector
+        if selector and scrub_for_model(selector) != selector:
+            # A name holding a secret: a selector with *** in it would find nothing (or
+            # something else). The model acts on the id instead.
+            selector = ""
+        return {
             "id": self.id,
             "role": self.role,
             "name": self.name,
-            "value": self.value,
+            "value": value,
             "bounds": self.bounds.to_dict(),
             "states": sorted(self.states),
-            "selector": self.selector,
+            "selector": selector,
             "window": self.window_title,
             "app": self.app,
-        })
+        }
 
 
 @dataclass
@@ -447,7 +458,8 @@ class Observation:
         else:
             lines.append("No accessible interactive elements were found (use coordinates from the screenshot).")
         lines.extend(f"Note: {n}" for n in self.notes)
-        return scrub("\n".join(lines)) or ""
+        # Values were masked when observed; names/titles holding a long secret are masked here.
+        return scrub_for_model("\n".join(lines)) or ""
 
     def image_base64(self, annotated: bool = True) -> str:
         """Base64 PNG of the (annotated) screenshot; raises ``ValueError`` if none was captured."""
@@ -460,7 +472,7 @@ class Observation:
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-friendly summary (no images)."""
-        return scrub_data({
+        return _for_model({
             "region": self.region.to_dict(),
             "screen_size": list(self.screen_size),
             "image_size": list(self.image_size),
@@ -468,9 +480,15 @@ class Observation:
             "cursor": self.cursor.to_dict(),
             "active_window": self.active_window.to_dict() if self.active_window else None,
             "windows": [w.to_dict() for w in self.windows],
-            "elements": [e.to_dict() for e in self.elements],
+            "elements": [e._dict() for e in self.elements],
             "notes": list(self.notes),
         })
+
+
+def _for_model(data: Dict[str, Any]) -> Dict[str, Any]:
+    """``data`` with the unambiguous (long) secrets scrubbed out of its strings: what the model
+    reads must stay correct, so short secrets (PINs) never alter names, titles or numbers."""
+    return scrub_data(data, min_len=MODEL_MIN_SCRUB)
 
 
 def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
@@ -502,7 +520,7 @@ def _refresh(el: ObservedElement, node: AccessibleNode, ctx: Optional["_Selector
         el.name = name
     raw = _safe(lambda: node.value, missing)
     if raw is not missing:
-        el.value = "***" if raw not in (None, "") and is_password(node) else (scrub(raw) if isinstance(raw, str) else raw)
+        el.value = "***" if raw not in (None, "") and is_password(node) else mask_value(raw)
     b = _safe(lambda: node.bounds)
     if b is not None:
         el.bounds = b

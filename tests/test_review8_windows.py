@@ -59,13 +59,14 @@ def test_every_calling_thread_is_switched_to_per_monitor_v2():
     def worker():
         seen.append(threading.get_ident())
         be.virtual_screen()
-        be.monitors()  # once per thread, not per call
+        be.monitors()
 
     t = threading.Thread(target=worker)
     t.start()
     t.join()
-    worker_calls = [c for c in api.thread_switches if c[0] == seen[0]]
-    assert worker_calls == [(seen[0], PMV2)]
+    worker_calls = [c[1] for c in api.thread_switches if c[0] == seen[0]]
+    # Switched for each call and switched back afterwards (review 9: not permanently).
+    assert worker_calls == [PMV2, 0x11, PMV2, 0x11]
 
 
 def test_preset_awareness_is_not_switched_when_backend_is_not_dpi_aware():

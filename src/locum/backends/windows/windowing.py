@@ -113,16 +113,20 @@ class _WindowsMixin:
             return rc.to_rect()
         return None
 
-    def _frame_rect(self, hwnd: int) -> Rect:
+    def _frame_rect(self, hwnd: int, aware: Any = ...) -> Rect:
         """Visible window bounds (DWM extended frame bounds, without invisible resize borders).
 
         DWM always reports physical pixels; on a thread that is not per-monitor
         DPI aware (``dpi_aware=False``, or a preset process awareness) the
         window rect is logical, so the DWM insets are measured in physical
-        pixels and scaled onto the logical window rect instead.
+        pixels and scaled onto the logical window rect instead. ``aware`` is the
+        thread's :func:`thread_is_per_monitor_aware` when the caller already knows it
+        (a loop over many windows asks once).
         """
         a = self._api
-        if thread_is_per_monitor_aware(a) is False:
+        if aware is ...:
+            aware = thread_is_per_monitor_aware(a)
+        if aware is False:
             outer = self._outer_rect(hwnd)
             set_ctx = getattr(a, "SetThreadDpiAwarenessContext", None)
             old = None
@@ -161,7 +165,8 @@ class _WindowsMixin:
             return False
         return not self._is_cloaked(hwnd)
 
-    def _info(self, hwnd: int, foreground: Any, names: Optional[Dict[int, str]] = None) -> WindowInfo:
+    def _info(self, hwnd: int, foreground: Any, names: Optional[Dict[int, str]] = None,
+              aware: Any = ...) -> WindowInfo:
         a = self._api
         pid = self._pid(hwnd)
         if names is not None and pid in names:
@@ -173,7 +178,7 @@ class _WindowsMixin:
         return WindowInfo(
             handle=hwnd,
             title=self._text(hwnd),
-            rect=self._frame_rect(hwnd),
+            rect=self._frame_rect(hwnd, aware),
             app=app,
             pid=pid or None,
             is_active=bool(foreground) and int(foreground) == hwnd,
@@ -200,11 +205,12 @@ class _WindowsMixin:
 
     def _windows_from(self, hwnds: Sequence[int], names: Dict[int, str]) -> List[WindowInfo]:
         fg = self._api.GetForegroundWindow()
+        aware = thread_is_per_monitor_aware(self._api)  # once, not per window
         out: List[WindowInfo] = []
         for hwnd in hwnds:
             try:
                 if self._is_candidate(hwnd):
-                    out.append(self._info(hwnd, fg, names))
+                    out.append(self._info(hwnd, fg, names, aware))
             except BackendError:
                 continue  # window vanished while enumerating
         return out
@@ -220,7 +226,6 @@ class _WindowsMixin:
         return int(fg) if fg else None
 
     def window_handle_at(self, x: int, y: int) -> Any:
-        self._ensure_thread_dpi()
         a = self._api
         wfp, anc = getattr(a, "WindowFromPoint", None), getattr(a, "GetAncestor", None)
         if wfp is None or anc is None:
@@ -259,17 +264,17 @@ class _WindowsMixin:
     def windows_above(self, handle: Any) -> List[Rect]:
         """Every visible, uncloaked top-level window in front of ``handle`` (titled or not:
         notifications and tool windows too) that is not part of it."""
-        self._ensure_thread_dpi()
         target = int(handle)
         out: List[Rect] = []
         a = self._api
+        aware = thread_is_per_monitor_aware(a)  # once, not per window
         for h in self._toplevel_hwnds():
             if h == target:
                 return out
             try:
                 if not a.IsWindowVisible(h) or a.IsIconic(h) or self._is_cloaked(h) or self.window_belongs_to(h, target):
                     continue
-                r = self._frame_rect(h)
+                r = self._frame_rect(h, aware)
             except Exception:
                 continue
             if r.width > 0 and r.height > 0:

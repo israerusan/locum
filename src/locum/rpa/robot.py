@@ -134,11 +134,14 @@ def _new_run_id(name: str) -> str:
 
 
 def _exc_text(exc: BaseException) -> str:
-    return str(exc) or type(exc).__name__
+    # Scrubbed here, not only by the report: scrub_exception() leaves an exception with a
+    # custom __str__ as it is, so str(exc) may still name a secret. Reports and logs are for
+    # humans: the strict (MIN_SCRUB) scrubbing applies, a garbled digit beats a leaked PIN.
+    return scrub(str(exc)) or type(exc).__name__
 
 
 def _format_tb(exc: BaseException) -> str:
-    return "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+    return scrub("".join(_tb.format_exception(type(exc), exc, exc.__traceback__))) or ""
 
 
 def save_error_screenshot(desktop: Any, directory: Union[str, "os.PathLike[str]"], name: str) -> str:

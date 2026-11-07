@@ -1863,7 +1863,10 @@ class GuardedDesktop(_GuardedProxy):
         logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in shown.items()}
         policy = self.policy
         try:
-            policy.check(tool, clean, context=ctx, count=count, confirm=self.confirm)
+            # Never judge (or ask a human) while holding the desktop input lock: a confirmation
+            # prompt would block every other worker, and one that needs the desktop would deadlock.
+            with _unlocked_for_gate(self._raw):
+                policy.check(tool, clean, context=ctx, count=count, confirm=self.confirm)
         except PolicyViolation as exc:
             msg = str(exc)
             if getattr(exc, "needs_confirmation", None):
@@ -2217,10 +2220,27 @@ class GuardedDesktop(_GuardedProxy):
                 ctx, secret = self._focus_ctx(activating=typed_text_activates(piece), enter="\n" in piece or "\r" in piece,
                                               keys=self._held_text_keys(piece))
                 secret = secret or forced
+                judged = _safe_get(lambda: raw.backend.focused_element())
                 self._gate("type_text", {"text": piece}, ctx,
                            f"type {'***' if secret else piece!r} (part {i + 1} of {len(pieces)})",
                            count=False, secret=secret)
+                self._recheck_focus(judged, f"part {i + 1} of the typed text")
             raw.type(piece, interval=interval, mode=mode)
+
+    def _recheck_focus(self, judged: Any, what: str) -> None:
+        """After a gate in the middle of a key sequence (run without the input lock): refuse to
+        go on if the focus moved away from the control the gate judged."""
+        if judged is None:
+            return
+        now = _safe_get(lambda: self._raw.backend.focused_element())
+        if now is None or now is judged:
+            return
+        same = _safe_get(lambda: judged.same_as(now), None)
+        if same is False:
+            from ..errors import TargetLost  # noqa: PLC0415
+
+            raise TargetLost(f"{what} was not sent: the keyboard focus moved to another control while the "
+                             "action was being checked (the input before it in this call was already sent)")
 
     def press(self, *keys: Any, presses: int = 1, interval: float = 0.0) -> None:
         parsed = self._press_gate(keys, presses)
@@ -2265,7 +2285,9 @@ class GuardedDesktop(_GuardedProxy):
                     judged = self._with_held(parts)
                     c, _ = self._focus_ctx(activating=keys_activate([judged]),
                                            enter=any(p in ("enter", "num_enter") for p in judged), step_keys=k)
+                    focused = _safe_get(lambda: raw.backend.focused_element())
                     self._gate("press_keys", {"keys": [k]}, c, f"press {k} (part of {combos!r})", count=False)
+                    self._recheck_focus(focused, f"key {k!r}")
                 if not first and interval:
                     raw.sleep(interval)
                 raw.press(parts)
@@ -2426,6 +2448,29 @@ class _GuardedKeyboard(_GuardedProxy):
 
     def hold(self, *keys: Any) -> Any:
         return object.__getattribute__(self, "_g_guard").hold(*keys)
+
+
+@contextlib.contextmanager
+def _unlocked_for_gate(desktop: Any) -> Any:
+    """Suspend this thread's desktop input lock and input bindings around a policy gate.
+
+    A gate can run in the middle of a bound, locked action (after a Tab, before a
+    focusing click). The lock is re-taken and the bindings restored afterwards, so the
+    input that follows is checked against the element's window again; the caller
+    re-checks what may have changed meanwhile (:meth:`GuardedDesktop._recheck_focus`).
+    """
+    from .. import _inputlock, _target  # noqa: PLC0415
+
+    stack = getattr(_target._local, "stack", None)
+    saved = list(stack) if stack else []
+    if saved:
+        del stack[:]
+    try:
+        with _inputlock.released(desktop):
+            yield
+    finally:
+        if saved:
+            stack[0:0] = saved
 
 
 @contextlib.contextmanager

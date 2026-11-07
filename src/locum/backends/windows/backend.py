@@ -30,11 +30,14 @@ from .capture import _CaptureMixin
 from .clipboard import _ClipboardMixin
 from .input import _Held, _InputMixin
 from .process import _ProcessMixin
-from .screen import _ScreenMixin, enable_dpi_awareness
+from .screen import _ScreenMixin, _scope_public_methods, enable_dpi_awareness
 from .windowing import _WindowsMixin
 
 
 # =========================================================================== backend
+# Every public method runs with the thread per-monitor DPI aware when dpi_mode is
+# "thread_per_monitor_v2", and restores the thread's own awareness on return.
+@_scope_public_methods
 class WindowsBackend(
     _InputMixin,
     _ScreenMixin,
@@ -189,7 +192,6 @@ class WindowsBackend(
     def _check(self) -> None:
         if self._closed:
             raise BackendError("Windows backend has been closed")
-        self._ensure_thread_dpi()  # every public entry point calls _check first
 
     def _error(self, what: str) -> BackendError:
         code = self._api.get_last_error()
