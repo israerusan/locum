@@ -74,13 +74,29 @@ def test_wide_string_round_trip():
 # ---------------------------------------------------------------------- fake DLL
 class Obj:
     def __init__(self, name: str, role: str, states: str, rect=(0, 0, 0, 0), kids=None, actions=(),
-                 text: Optional[str] = None, editable_text: bool = False) -> None:
+                 text: Optional[str] = None, editable_text: bool = False, fresh_kids: bool = False) -> None:
         self.name, self.role, self.states, self.rect = name, role, states, rect
         self.kids: List[Obj] = list(kids or [])
         self.actions = list(actions)
         self.text = text
         self.editable_text = editable_text
         self.done: List[str] = []
+        #: Like Swing's AccessibleJTable/JList/JTree: every getAccessibleChildFromContext returns a NEW
+        #: proxy object (isSameObject never matches an earlier read of the same cell).
+        self.fresh_kids = fresh_kids
+
+
+class Proxy:
+    """A fresh accessible object standing for ``target`` (an ``AccessibleJTableCell``)."""
+
+    def __init__(self, target: Obj) -> None:
+        self.__dict__["_target"] = target
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._target, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._target, name, value)
 
 
 class FakeDll:
@@ -145,7 +161,9 @@ class FakeDll:
 
     def getAccessibleChildFromContext(self, vm, ac, i) -> int:
         o = self._obj(ac)
-        return self._ref(o.kids[i]) if 0 <= i < len(o.kids) else 0
+        if not 0 <= i < len(o.kids):
+            return 0
+        return self._ref(Proxy(o.kids[i]) if o.fresh_kids else o.kids[i])
 
     def getAccessibleActions(self, vm, ac, acts_ref) -> int:
         o = self._obj(ac)
@@ -523,3 +541,148 @@ def test_re_reading_a_big_container_costs_a_bounded_number_of_bridge_calls(fake)
         rows = win.find_all("text")
         assert len(rows) == 499 and rows[0].name == "row 1"
         assert len(calls) <= 3 * 500  # index-aligned matching, not 500 x 500
+
+
+# ---------------------------------------------------------------------- Swing proxies (JTable/JList/JTree)
+def _cells(n: int) -> List[Obj]:
+    return [Obj(f"cell {i}", "label", "enabled,visible,showing", (0, 0, 1, 1)) for i in range(n)]
+
+
+def test_table_cells_are_fresh_proxies_and_references_stay_bounded(fake):
+    panel = fake.roots[HWND].kids[0]
+    table = Obj("Orders", "table", "enabled,visible,showing", (0, 0, 300, 300), kids=_cells(500), fresh_kids=True)
+    panel.kids.append(table)
+    calls = []
+    same = fake.isSameObject
+    fake.isSameObject = lambda vm, a, b: calls.append(1) or same(vm, a, b)
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        assert len(win.find_all("table text")) == 500
+        held = jab.live_references
+        cell = win.find('table text "cell 7"')
+        del calls[:]
+        for _ in range(5):
+            assert len(win.find_all("table text")) == 500
+            win.tree()
+        assert jab.live_references == held  # each re-read swaps a cell's reference, it does not add one
+        assert len(fake.refs) == held  # and the swapped-out ones were released in the JVM
+        # no isSameObject matching of cells that can never match: only the window's dozen other
+        # controls are matched, once per re-read (10 re-reads), never the 500 cells
+        assert len(calls) <= 10 * 12
+        assert cell.name == "cell 7"  # a held cell element stays valid (it is kept by index)
+        table.kids[7].name = "cell 7 (edited)"
+        assert cell.name == "cell 7 (edited)"
+    assert fake.refs == {}
+
+
+def test_tree_nodes_below_a_tree_are_kept_by_index(fake):
+    leaves = [Obj("Invoices", "label", "enabled,visible,showing", (0, 0, 1, 1)),
+              Obj("Orders", "label", "enabled,visible,showing", (0, 0, 1, 1))]
+    node = Obj("Sales", "label", "enabled,visible,showing", (0, 0, 1, 1), kids=leaves, fresh_kids=True)
+    tree = Obj("Folders", "tree", "enabled,visible,showing", (0, 0, 100, 100), kids=[node], fresh_kids=True)
+    fake.roots[HWND].kids[0].kids.append(tree)
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        assert win.find('tree text "Orders"').name == "Orders"
+        held = jab.live_references
+        for _ in range(3):
+            assert win.exists('tree text "Invoices"')
+        assert jab.live_references == held and len(fake.refs) == held
+
+
+def test_unmatched_children_of_an_ordinary_container_are_released(fake):
+    # A custom component that also hands out fresh objects: no match, so the old nodes are freed
+    # (they used to stay pinned until close) and matching stops after a few misses.
+    panel = fake.roots[HWND].kids[0]
+    panel.kids[:] = _cells(300)
+    panel.fresh_kids = True
+    calls = []
+    same = fake.isSameObject
+    fake.isSameObject = lambda vm, a, b: calls.append(1) or same(vm, a, b)
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        win.find_all("text")
+        held = jab.live_references
+        del calls[:]
+        for _ in range(5):
+            assert len(win.find_all("text")) == 300
+        assert jab.live_references == held and len(fake.refs) == held
+        assert len(calls) <= 5 * 9 * 9
+        del panel.kids[100:]
+        assert len(win.find_all("text")) == 100
+        assert jab.live_references == held - 200 and len(fake.refs) == held - 200
+
+
+def test_removed_child_reference_is_released_at_once(fake):
+    panel = fake.roots[HWND].kids[0]
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        win.find_all("*")
+        held = jab.live_references
+        del panel.kids[0]
+        assert not win.exists('text "Customer:"')
+        assert jab.live_references == held - 1 and len(fake.refs) == held - 1
+
+
+# ---------------------------------------------------------------------- localised click action
+@pytest.mark.parametrize("name", ["Klicken", "cliquer", "hacer clic"])
+def test_click_uses_a_localised_single_action(fake, name):
+    panel = fake.roots[HWND].kids[0]
+    panel.kids[4].actions = [name]  # Save
+    panel.kids[2].actions = [name]  # Rush order
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        win.find('button "Save"').click(native=True)
+        win.find('checkbox "Rush order"').click(native=True)
+    assert panel.kids[4].done == [name] and panel.kids[2].done == [name]
+
+
+def test_english_click_is_preferred_and_other_roles_need_an_english_name(fake):
+    panel = fake.roots[HWND].kids[0]
+    panel.kids[4].actions = ["Fokus", "click"]
+    panel.kids.append(Obj("Country", "combo box", "enabled,visible,showing", (0, 0, 10, 10),
+                          actions=["togglePopup"]))
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        win.find('button "Save"').click(native=True)
+        with pytest.raises(NotSupported, match="no click action"):
+            win.find('combobox "Country"').click(native=True)
+    assert panel.kids[4].done == ["click"]
+
+
+# ---------------------------------------------------------------------- DLL search / window / set_text limits
+def test_dll_candidates_search_path(monkeypatch, tmp_path):
+    (tmp_path / java.dll_name()).write_bytes(b"")
+    monkeypatch.delenv("LOCUM_JAB_DLL", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(java.shutil, "which", lambda name: None)
+    assert str(tmp_path / java.dll_name()) in java._candidates(None)
+
+
+def test_window_with_timeout_raises_window_not_found(monkeypatch, mock_backend):
+    from locum import Desktop
+    from locum.errors import WindowNotFound
+
+    w = mock_backend.add_window("Order Entry", (100, 100, 640, 480), app="javaw.exe")
+    dll = FakeDll(make_tree(w.handle))
+    monkeypatch.setattr(java, "_dll_loader", lambda path=None: dll)
+    now = [0.0]
+
+    def sleep(s):
+        now[0] += s
+
+    with bridge(desktop=Desktop(mock_backend, failsafe=False), sleep=sleep, clock=lambda: now[0]) as jab:
+        with pytest.raises(WindowNotFound) as ei:
+            jab.window("SAP", timeout=1.0)
+        assert isinstance(ei.value.__cause__, ActionTimeout)
+
+
+def test_set_text_longer_than_the_bridge_limit_is_refused_up_front(fake):
+    audit = AuditLog()
+    with bridge(policy=Policy(confirm_patterns=()), audit=audit) as jab:
+        el = jab.from_hwnd(HWND).find('edit "Customer"')
+        el.set_text("y" * (java.MAX_STRING_SIZE - 1))  # the limit itself fits
+        with pytest.raises(ValueError, match="limit"):
+            el.set_text("x" * java.MAX_STRING_SIZE)
+    assert fake.roots[HWND].kids[0].kids[1].text == "y" * (java.MAX_STRING_SIZE - 1)
+    assert len(audit.read()) == 1

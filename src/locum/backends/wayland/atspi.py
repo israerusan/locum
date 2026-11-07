@@ -104,7 +104,11 @@ class WaylandAtspiNode(AtspiNode):
         """A stable handle string for a top-level window node (``None`` for other nodes).
 
         Uses the accessible's D-Bus identity (application bus name + object path)
-        when the AT-SPI binding exposes it, else ``pid`` + index in the application.
+        when the AT-SPI binding exposes it, else ``pid`` + index in the application
+        + role + name. The index shifts when a sibling window opens or closes, so the
+        role and name are part of the key: a stored handle then matches no window
+        (the target is reported lost) instead of naming the window that moved into
+        its place. (A fallback handle also changes when the window's title does.)
         """
         if not self.is_top_level():
             return None
@@ -119,7 +123,7 @@ class WaylandAtspiNode(AtspiNode):
             idx = int(idx)
         except (TypeError, ValueError):
             idx = -1
-        return f"atspi:pid{self.pid or 0}:{self.app_name()}:{idx}"
+        return f"atspi:pid{self.pid or 0}:{self.app_name()}:{idx}:{self.native_role.lower()}:{self.name}"
 
     @property
     def handle(self) -> Any:

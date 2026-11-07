@@ -536,7 +536,19 @@ What Wayland does not allow is refused, not faked:
   is refused when its destination cannot be verified;
 * element bounds are hidden by default, because toolkits report
   window-relative extents, so elements are driven with native actions;
-* the corner fail-safe cannot see you move the mouse, so use the kill hotkey;
+* there is no reliable emergency stop: the corner fail-safe cannot see you
+  move the mouse, and the kill hotkey (pynput, X11) only sees keys while an
+  XWayland window has focus (`install_kill_hotkey()` warns about this). Stop a
+  run with Ctrl+C in its terminal, `locum.abort()`, or by ending the screen
+  sharing in the compositor (its remote-desktop indicator), which closes the
+  portal session;
+* on GNOME every screenshot may flash the screen, and the portal writes it to a
+  file (usually `~/Pictures/Screenshots`); locum deletes that file after
+  reading it, but only a file in the Pictures or temporary directory written by
+  that request (`keep_screenshots=True` keeps them);
+* pointer positions are converted to each monitor's scale (GNOME with
+  fractional scaling reads them in physical pixels); when the scale cannot be
+  determined, absolute moves are refused rather than misplaced;
 * typing is limited to characters on the active keyboard layout; others are
   pasted when wl-clipboard is installed.
 

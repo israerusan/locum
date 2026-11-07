@@ -190,6 +190,20 @@ class Window:
 
     # ---------------------------------------------------------------- state
     def _lookup(self) -> Optional[WindowInfo]:
+        # By handle where the backend can: list_windows() leaves out windows that
+        # still exist (untitled, tool windows, cloaked / on another virtual
+        # desktop), which would read as closed. A hidden window counts as gone,
+        # as it did in the listing.
+        info_of = getattr(self.backend, "window_info", None)
+        if callable(info_of):
+            try:
+                info = info_of(self.handle)
+            except WindowNotFound:
+                return None
+            except BackendError:
+                info = None  # vanished mid-read / unsupported: fall back to the listing
+            else:
+                return info if info.is_visible else None
         for w in self.backend.list_windows():
             if w.handle == self.handle:
                 return w
@@ -197,7 +211,7 @@ class Window:
 
     @property
     def exists(self) -> bool:
-        """Whether the window is still listed by the backend."""
+        """Whether the window still exists (and is not hidden)."""
         try:
             return self._lookup() is not None
         except Exception:
@@ -275,12 +289,26 @@ class Window:
         self.backend.move_window(self.handle, r)
         return self._after()
 
+    def _current_rect(self) -> Rect:
+        """The window's current rect (not the possibly stale snapshot's).
+
+        A minimized window only has its parked placeholder rect (off-screen at
+        -32000, caption sized), which must not become the new position / size:
+        it is restored first -- :meth:`set_rect` restores it anyway -- and its
+        normal rect is read then.
+        """
+        if self._after().is_minimized:
+            self._guard()
+            self.backend.set_window_state(self.handle, "normal")
+            self._after()
+        return self.rect
+
     def move(self, x: int, y: int) -> "Window":
-        r = self._after().rect  # current size, not the (possibly stale) snapshot's
+        r = self._current_rect()  # keeps the current size
         return self.set_rect(Rect(int(x), int(y), r.width, r.height))
 
     def resize(self, width: int, height: int) -> "Window":
-        r = self._after().rect  # current position, not the (possibly stale) snapshot's
+        r = self._current_rect()  # keeps the current position
         return self.set_rect(Rect(r.left, r.top, int(width), int(height)))
 
     #: Accepted values of :meth:`screenshot`'s ``mode``.

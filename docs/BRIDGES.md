@@ -44,7 +44,7 @@ acting bridge call therefore goes through the same checks itself:
 | SAP combo `key`, radio/tab `select()`, grid `select_rows()` | `select` |
 | SAP check box `check()`/`uncheck()` | `toggle` |
 | SAP `set_focus()`, grid `set_current_cell()`, Java `focus()` | `focus` |
-| SAP table `scroll_to()` (also on reads of off-screen rows) | `scroll` |
+| SAP table `scroll_to()` (also before a cell write on an off-screen row) | `scroll` |
 | SAP `send_vkey(n)` | `press_keys`, with `keys` set to the key combination (`11` is `ctrl+s`, so the default `confirm_keys` apply) |
 | SAP `start_transaction(tcode)` | `sap_start_transaction` (target `transaction <tcode>`) |
 | SAP window `close()` | `close_window` |
@@ -124,12 +124,17 @@ be a person's unsaved work. Narrow the filters with `connection=` and
   `visible_row_count`, `columns`, `cell(row, col)`, `read(row, col)` and
   `write(row, col, text)`. Rows are **absolute**. When a row is off-screen, the
   table is scrolled to it first. That is a server round trip, and the screen's
-  PAI logic runs just as when you scroll by hand. Columns can be given as an
-  index, a technical name or a title.
+  PAI logic runs just as when you scroll by hand. A scroll that only positions
+  the table for `cell()`/`read()` is a read and is not gated (it also runs under
+  `dry_run`); the scroll before a `write()` is gated as `scroll`. The table is
+  found again by its id after each scroll, because SAP GUI rebuilds it. Columns
+  can be given as an index, a technical name or a title; a column without a
+  `Name` takes the name of its first cell.
 * `SapGridView` (ALV grid, a `GuiShell` with subtype `GridView`) has
   `row_count`, `columns`, `cell(row, col)`/`read`, and `rows(columns,
   limit=)`. The grid loads rows on demand, so `FirstVisibleRow` is moved before
-  each read. It also has `write()` (`ModifyCell`), `set_current_cell()`,
+  a read of a row outside the visible page (`rows()` moves it once per page).
+  It also has `write()` (`ModifyCell`), `set_current_cell()`,
   `select_rows()`, `double_click_cell()` and `press_toolbar_button("&MB_EXPORT")`.
 * `SapStatusbar` (`session.statusbar`) has `.text`, `.message_type`
   (`S`/`W`/`E`/`A`/`I`), `.message_id`, `.message_number` and `.is_error`.
@@ -188,8 +193,9 @@ with JavaBridge(Desktop()) as jab:
   loads the bridge only at startup.
 * locum loads `WindowsAccessBridge-64.dll` (64-bit Python) or
   `WindowsAccessBridge-32.dll` (32-bit Python). It looks for the DLL in this
-  order: `JavaBridge(dll_path=...)`, `LOCUM_JAB_DLL`, `PATH` and System32,
-  `%JAVA_HOME%\bin`, `%JRE_HOME%\bin`, then next to `java.exe` on `PATH`. The
+  order: `JavaBridge(dll_path=...)`, `LOCUM_JAB_DLL`, System32, every
+  directory on `PATH` (searched explicitly: Python 3.8+ no longer loads DLLs
+  from `PATH`), `%JAVA_HOME%\bin`, `%JRE_HOME%\bin`, then next to `java.exe` on `PATH`. The
   bitness of the DLL must match Python. It does not have to match the Java
   application. The legacy `WindowsAccessBridge.dll` (JRE 6 and older, 32-bit
   object handles) is not supported.
@@ -221,6 +227,10 @@ with JavaBridge(Desktop()) as jab:
   is readonly, and `password text` gets the `password` state.
 * `click(native="auto")` runs the element's `click` AccessibleAction (Swing
   buttons, check boxes and menu items have one) through `doAccessibleActions`.
+  Swing localises that action's name (`AbstractButton.clickText`: "Klicken",
+  "cliquer", "hacer clic"...), so for a push button, toggle button, check box,
+  radio button or menu item without an English click name, its first action is
+  used.
   If the element has no click action, locum clicks with the mouse at the
   element's center. That click goes through `Desktop.mouse` with a **strict
   input-target binding** to the Java window. If another window covers the
@@ -229,17 +239,24 @@ with JavaBridge(Desktop()) as jab:
   `native=False` uses only the mouse.
 * `set_text(text)` calls `setTextContents` and then reads the text back with
   `getAccessibleTextInfo` and `getAccessibleTextRange`. If the read-back
-  differs, it raises `ActionTimeout`. A component the bridge cannot edit raises
+  differs, it raises `ActionTimeout`. The bridge copies the text into a
+  1024-`wchar_t` buffer, so text longer than 1023 UTF-16 code units is refused
+  with `ValueError` before anything is sent. A component the bridge cannot edit raises
   `NotSupported`; for those, click the field and type instead.
 * `.text` reads the accessible text in chunks of 1000 characters, or the name
   when the component has no text interface. `do_action(name)` runs any named
   action, and `focus()` calls `requestFocus`.
 * **References.** Every context the bridge hands out pins an object in the JVM.
   `JavaBridge` records each one, and `close()` releases them all (or use
-  `with JavaBridge() as jab:`). `element.release()` frees one subtree early. A
-  polling `find(..., timeout=)` re-reads the tree, which takes new references
-  that are freed when the bridge closes. A long-running robot should therefore
-  open one bridge per unit of work rather than keep one open forever.
+  `with JavaBridge() as jab:`). `element.release()` frees one subtree early.
+  Lookups re-read the tree: unchanged children keep their node, and children
+  that went away are released at once. Below a `JTable`, `JList` or `JTree`
+  Swing returns a new proxy object (`AccessibleJTableCell`...) on every read,
+  so those children are kept by index: the node stays (a held cell element
+  stays valid and reads the cell now at its position) and its old reference is
+  released, so repeated lookups keep the reference count flat. A long-running
+  robot should still open one bridge per unit of work rather than keep one
+  open forever.
   `max_children` (2000 by default) caps the children read per node, because a
   `JTable` can report millions of cells.
 
@@ -294,7 +311,7 @@ Against the real thing:
 
 | Bridge | Real-system test | Status |
 | --- | --- | --- |
-| `locum.bridges.java` | CI job `windows-java-bridge` on every push: a Temurin JDK with the Access Bridge enabled, a Swing window (`tests/helpers/JabProbe.java`), and `tests/test_real_java_bridge.py` (tree, selectors, `set_text` read-back, AccessibleAction and mouse clicks, checkbox state, reference release) | **experimental**: verified on one small Swing window, not on a business application |
+| `locum.bridges.java` | CI job `windows-java-bridge` on every push: a Temurin JDK with the Access Bridge enabled, a Swing window (`tests/helpers/JabProbe.java`), and `tests/test_real_java_bridge.py` (tree, selectors, `set_text` read-back, AccessibleAction and mouse clicks, checkbox state, reference release, `JTable`/`JList`/`JTree` items with a flat reference count) | **experimental**: verified on one small Swing window, not on a business application |
 | `locum.bridges.sap` | none. The on-demand acceptance job needs a self-hosted runner with SAP GUI and has never run; its SAP scenario does not use this module yet | **experimental, unverified**: emits `ExperimentalWarning` |
 | `locum.bridges.remote` | none against Citrix/RDP; it is template matching and OCR over a window, the same code paths as the rest of locum's vision | tested on the mock desktop |
 

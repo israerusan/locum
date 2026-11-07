@@ -1,6 +1,7 @@
 """locum.pytest_plugin: fixtures, options and traces of failing tests (inner runs on the mock backend)."""
 
 import os
+import re
 import subprocess
 import sys
 
@@ -28,7 +29,7 @@ def test_importing_the_plugin_creates_no_desktop_and_loads_no_backend():
 def test_trace_path_is_sanitized(tmp_path):
     p = trace_path_for("tests/test_x.py::test_a[1-<b>/c]", str(tmp_path))
     assert os.path.dirname(p) == str(tmp_path)
-    assert os.path.basename(p) == "tests_test_x.py_test_a_1-_b_c.html"
+    assert re.fullmatch(r"tests_test_x\.py_test_a_1-_b_c-[0-9a-f]{10}\.html", os.path.basename(p))
     long = trace_path_for("t.py::" + "x" * 500, str(tmp_path))
     assert len(os.path.basename(long)) <= 160
     assert long != trace_path_for("t.py::" + "x" * 499, str(tmp_path))
@@ -57,9 +58,9 @@ def test_desktop_fixture_on_mock_and_failure_trace(pytester):
     )
     result = pytester.runpytest(*MOCK)
     result.assert_outcomes(passed=1, failed=1)
-    result.stdout.fnmatch_lines(["*locum trace*", "*trace saved:*test_fails.html*"])
+    result.stdout.fnmatch_lines(["*locum trace*", "*trace saved:*test_fails-*.html*"])
     traces = sorted(os.listdir(pytester.path / ".locum-traces"))
-    assert traces == ["test_desktop_fixture_on_mock_and_failure_trace.py_test_fails.html"]
+    assert traces == [os.path.basename(trace_path_for("test_desktop_fixture_on_mock_and_failure_trace.py::test_fails", "."))]
     page = (pytester.path / ".locum-traces" / traces[0]).read_text(encoding="utf-8")
     assert "ElementNotFound" in page and "button &quot;Missing&quot;" in page
 
@@ -75,7 +76,7 @@ def test_trace_path_in_user_properties_and_junit(pytester):
     result = pytester.runpytest(*MOCK, "--junitxml=out.xml")
     result.assert_outcomes(failed=1)
     xml = (pytester.path / "out.xml").read_text(encoding="utf-8")
-    assert 'name="locum_trace"' in xml and "test_fails.html" in xml
+    assert 'name="locum_trace"' in xml and "test_fails-" in xml
 
 
 def test_trace_modes_and_dir(pytester):
@@ -92,7 +93,7 @@ def test_trace_modes_and_dir(pytester):
     assert not (pytester.path / ".locum-traces").exists()  # failed mode: nothing failed
 
     pytester.runpytest(*MOCK, "--locum-trace", "on", "--locum-trace-dir", "out/tr").assert_outcomes(passed=2)
-    assert os.listdir(pytester.path / "out" / "tr") == ["test_trace_modes_and_dir.py_test_ok.html"]
+    assert os.listdir(pytester.path / "out" / "tr") == [os.path.basename(trace_path_for("test_trace_modes_and_dir.py::test_ok", "."))]
 
 
 def test_trace_off_and_tracer_fixture(pytester):
@@ -189,7 +190,7 @@ def test_app_fixture_timeout_fails_with_a_trace(pytester):
     result = pytester.runpytest(*MOCK)
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*WindowNotFound*", "*trace saved:*"])
-    page = (pytester.path / ".locum-traces" / "test_app_fixture_timeout_fails_with_a_trace.py_test_app.html").read_text(encoding="utf-8")
+    page = (pytester.path / ".locum-traces" / os.path.basename(trace_path_for("test_app_fixture_timeout_fails_with_a_trace.py::test_app", "."))).read_text(encoding="utf-8")
     assert "launch" in page and "WindowNotFound" in page
 
 

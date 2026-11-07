@@ -19,6 +19,7 @@ from ._win32api import (
     DIB_RGB_COLORS,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_PER_MONITOR_AWARE,
     ERROR_ACCESS_DENIED,
     E_ACCESSDENIED,
     LOGPIXELSX,
@@ -46,7 +47,8 @@ def enable_dpi_awareness(api: Any = None) -> str:
     ``SetProcessDPIAware`` (Vista+). If the awareness was already set (by a
     manifest or an earlier call, which makes later calls fail with
     access-denied) the calling *thread* is switched with
-    ``SetThreadDpiAwarenessContext`` when possible.
+    ``SetThreadDpiAwarenessContext`` when possible; :class:`WindowsBackend`
+    then switches every other thread that calls it the same way.
 
     Returns one of ``"per_monitor_v2"``, ``"per_monitor"``, ``"system"``,
     ``"thread_per_monitor_v2"``, ``"preset"`` (already set elsewhere) or
@@ -132,8 +134,39 @@ def _close_quietly(obj: Any) -> None:
         pass
 
 
+def thread_is_per_monitor_aware(api: Any) -> Optional[bool]:
+    """Whether the calling thread is per-monitor DPI aware (v1 or v2): its window,
+    cursor and metrics coordinates are then physical pixels, like DWM's.
+    ``None`` when Windows cannot tell (before Windows 10 1607)."""
+    get_ctx = getattr(api, "GetThreadDpiAwarenessContext", None)
+    get_aw = getattr(api, "GetAwarenessFromDpiAwarenessContext", None)
+    if get_ctx is None or get_aw is None:
+        return None
+    try:
+        return int(get_aw(get_ctx())) == DPI_AWARENESS_PER_MONITOR_AWARE
+    except Exception:
+        return None
+
+
 class _ScreenMixin:
     """Virtual screen, monitors and screenshots of :class:`WindowsBackend`."""
+
+    def _ensure_thread_dpi(self) -> None:
+        """Make the calling thread per-monitor (v2) DPI aware once, when that is how the
+        backend obtained its awareness (``dpi_mode == "thread_per_monitor_v2"``: the
+        process awareness was preset by a manifest or another library, so only the
+        constructing thread was switched). Without it every other thread (an MCP
+        worker, the recorder) would see logical, differently scaled coordinates."""
+        local = getattr(self, "_dpi_local", None)
+        if getattr(self, "dpi_mode", None) != "thread_per_monitor_v2" or local is None or getattr(local, "done", False):
+            return
+        local.done = True
+        fn = getattr(self._api, "SetThreadDpiAwarenessContext", None)
+        if fn is not None:
+            try:
+                fn(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+            except Exception:
+                pass
 
     # =================================================================== screen
     def virtual_screen(self) -> Rect:

@@ -21,6 +21,11 @@ Semantics follow PyAutoGUI 0.9.5x:
   :data:`FAILSAFE_POINTS` while :data:`FAILSAFE` is true raises
   :class:`FailSafeException`) and sleeps :data:`PAUSE` seconds afterwards
   (pass ``_pause=False`` to skip);
+* on a desktop handed in with :func:`set_desktop` those two settings never
+  weaken its own fail-safe: its trigger points stay active and
+  :data:`FAILSAFE_POINTS` are added to them (``FAILSAFE = False`` removes only
+  the added points), and the desktop's fail-safe is restored when another
+  desktop replaces it. They fully control only the desktop this module creates;
 * ``x``/``y`` arguments accept numbers, ``None`` (keep the current coordinate),
   ``(x, y)`` tuples, 4-tuples / ``Box`` (their center) and image file names
   (located on screen first);
@@ -146,19 +151,24 @@ Box = collections.namedtuple("Box", "left top width height")
 # ================================================================ desktop
 _desktop: Any = None
 _desktop_lock = threading.Lock()
+#: Whether :data:`_desktop` was created by this module (``False``: handed in with :func:`set_desktop`).
+_desktop_owned = False
+#: The fail-safe a :func:`set_desktop` desktop came with: ``(enabled, explicit corners, effective corners)``.
+_user_failsafe: Any = None
 #: Sleep function used for :data:`PAUSE` (replace in tests).
 _SLEEP: Callable[[float], Any] = time.sleep
 
 
 def get_desktop() -> Any:
     """The :class:`locum.Desktop` driving this module (created on first use over the default backend)."""
-    global _desktop
+    global _desktop, _desktop_owned
     if _desktop is None:
         with _desktop_lock:
             if _desktop is None:
                 from ..desktop import Desktop
 
                 _desktop = Desktop(failsafe=True, pause=0.0, humanize=False, default_timeout=0.0)
+                _desktop_owned = True
     return _desktop
 
 
@@ -166,20 +176,48 @@ def set_desktop(desktop: Any) -> Any:
     """Use ``desktop`` (a :class:`locum.Desktop`) for every call; ``None`` = recreate lazily.
 
     The desktop's own ``pause`` should be 0: this module applies :data:`PAUSE` itself.
+    :data:`FAILSAFE` / :data:`FAILSAFE_POINTS` only add trigger points to its own
+    fail-safe while it is in use, and its fail-safe is restored as it was when it is
+    replaced (by another :func:`set_desktop` call).
     Returns the previous desktop.
     """
-    global _desktop
+    global _desktop, _desktop_owned, _user_failsafe
     with _desktop_lock:
-        old, _desktop = _desktop, desktop
+        old = _desktop
+        if old is not None and not _desktop_owned and _user_failsafe is not None:
+            fs = old.failsafe
+            fs.enabled = _user_failsafe[0]
+            fs.corners = _user_failsafe[1]
+        _desktop, _desktop_owned, _user_failsafe = desktop, False, None
+        if desktop is not None:
+            fs = desktop.failsafe
+            explicit = getattr(fs, "_explicit", None)
+            _user_failsafe = (bool(fs.enabled), None if explicit is None else list(explicit),
+                              [tuple(c) for c in fs.corners] if fs.enabled else [])
     return old
 
 
 def _d() -> Any:
-    """The desktop with its fail-safe synchronized to :data:`FAILSAFE` / :data:`FAILSAFE_POINTS`."""
+    """The desktop with its fail-safe synchronized to :data:`FAILSAFE` / :data:`FAILSAFE_POINTS`.
+
+    On a desktop this module created the two settings are its fail-safe. On one handed
+    in with :func:`set_desktop` they never weaken what its owner configured: its own
+    trigger points stay active (``FAILSAFE = False`` turns off only the compat points).
+    """
     d = get_desktop()
     fs = d.failsafe
-    fs.enabled = bool(FAILSAFE)
-    points = [tuple(p) for p in FAILSAFE_POINTS]
+    points = [tuple(p) for p in FAILSAFE_POINTS] if FAILSAFE else []
+    with _desktop_lock:
+        user = _user_failsafe if (d is _desktop and not _desktop_owned) else None
+    if user is not None:
+        base_enabled, base_explicit, base_points = user
+        if not FAILSAFE:
+            if fs.enabled != base_enabled or getattr(fs, "_explicit", None) != base_explicit:
+                fs.enabled = base_enabled
+                fs.corners = base_explicit
+            return d
+        points = list(base_points) + [p for p in points if p not in base_points]
+    fs.enabled = bool(FAILSAFE) or (user is not None and user[0])
     if [tuple(c) for c in fs.corners] != points:
         fs.corners = points
     return d

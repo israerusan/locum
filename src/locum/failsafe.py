@@ -71,17 +71,30 @@ def abortable_sleep(seconds: float, sleep: Callable[[float], Any] = time.sleep) 
     With the default ``time.sleep`` this waits on the abort event itself (the
     wake-up is immediate); a custom ``sleep`` function is called in slices of
     at most :data:`ABORT_POLL_INTERVAL` seconds with the flag checked between them.
+    Inside a :class:`~locum._cancel.CancelScope` (an MCP tool call) a cancelled or
+    timed-out call raises :class:`~locum._cancel.CallCancelled` within a slice.
     """
+    from . import _cancel
+
     seconds = float(seconds)
     if seconds <= 0 or _abort_event.is_set():
         return _abort_event.is_set()
+    _cancel.check()  # inside an MCP call: a cancelled or timed-out call stops sleeping too
     if sleep is time.sleep:
-        return _abort_event.wait(seconds)
+        end = time.monotonic() + seconds
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            if _abort_event.wait(min(left, ABORT_POLL_INTERVAL)):
+                return True
+            _cancel.check()
     slices = max(1, math.ceil(seconds / ABORT_POLL_INTERVAL - 1e-9))
     for _ in range(slices):  # equal slices: they add up to ``seconds``
         sleep(seconds / slices)
         if _abort_event.is_set():
             return True
+        _cancel.check()
     return False
 
 
@@ -134,6 +147,20 @@ def _pynput_combo(combo: str) -> str:
     return "+".join(parts)
 
 
+def _is_wayland_session(env: Any = None, platform: Optional[str] = None) -> bool:
+    """A Linux/BSD desktop session that runs Wayland (pynput then only reaches XWayland)."""
+    import os
+
+    env = os.environ if env is None else env
+    platform = sys.platform if platform is None else platform
+    if platform.startswith(("win", "darwin", "cygwin")):
+        return False
+    kind = (env.get("XDG_SESSION_TYPE") or "").strip().lower()
+    if kind:
+        return kind == "wayland"
+    return bool(env.get("WAYLAND_DISPLAY"))
+
+
 def install_kill_hotkey(combo: str = "ctrl+alt+shift+q") -> bool:
     """Install a global hotkey that calls :func:`abort` when pressed.
 
@@ -147,9 +174,26 @@ def install_kill_hotkey(combo: str = "ctrl+alt+shift+q") -> bool:
     Raises ``ValueError`` for combinations that could never fire: unknown keys,
     Shift with a non-letter character (``ctrl+shift+1`` arrives as ``!``), AltGr
     with a character, and Ctrl+Alt+F<n> on Linux (the VT switch).
+
+    In a Wayland session pynput listens through XWayland and only sees keys
+    while an XWayland window has focus: it is no reliable emergency stop there.
+    The hotkey is still installed, with a :class:`RuntimeWarning` saying so;
+    stop Wayland automation with Ctrl+C in its terminal, :func:`abort`, or by
+    ending the screen sharing in the compositor.
     """
     global _hotkey_listener
     hotkey = _pynput_combo(combo)  # ValueError for unusable combos, before touching pynput
+    if _is_wayland_session():
+        import warnings
+
+        warnings.warn(
+            f"Kill hotkey {combo}: this is a Wayland session, where the hotkey only works while an "
+            "XWayland (X11) window has focus; it is NOT a reliable emergency stop. Stop automation "
+            "with Ctrl+C in its terminal, locum.abort(), or by ending the screen sharing (the "
+            "compositor's remote-desktop indicator).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     try:
         from pynput import keyboard as pkb  # type: ignore[import-not-found]
     except Exception:

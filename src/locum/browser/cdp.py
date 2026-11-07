@@ -367,6 +367,12 @@ _ENTER_TARGET_JS = r"""
 """
 
 
+def _check_navigate(res: Dict[str, Any], url: str, where: str = "") -> None:
+    """Raise :class:`CDPError` for a failed ``Page.navigate`` (its ``errorText``)."""
+    if res.get("errorText"):
+        raise CDPError(f"could not open {url!r}{where}: {res['errorText']}")
+
+
 class Page:
     """One tab, over its own DevTools session."""
 
@@ -397,8 +403,31 @@ class Page:
         return str(self.evaluate("location.href") or "")
 
     def navigate(self, url: str, *, timeout: float = 30.0) -> None:
-        self.session.call("Page.navigate", {"url": url}, timeout=timeout)
-        self.wait_ready(timeout)
+        """Load ``url`` and wait until the *new* document has finished loading.
+
+        Raises :class:`CDPError` when the navigation fails (DNS error, refused
+        connection, ...). A same-document navigation (``#fragment`` only) has no
+        new document to wait for."""
+        end = time.monotonic() + timeout
+        try:  # identifies the current document: a new one has a new time origin
+            old_origin = self.evaluate("performance.timeOrigin", timeout=min(5.0, timeout))
+        except CDPError:
+            old_origin = None
+        res = self.session.call("Page.navigate", {"url": url}, timeout=timeout) or {}
+        _check_navigate(res, url)
+        if res.get("loaderId") and old_origin is not None:
+            # The old document still reports readyState "complete" until the new one
+            # replaces it (a same-URL reload included): wait for the replacement first.
+            while True:
+                try:
+                    if self.evaluate("performance.timeOrigin", timeout=2) != old_origin:
+                        break
+                except CDPError:
+                    pass  # between documents
+                if time.monotonic() >= end:
+                    raise CDPError(f"{url!r} did not start loading within {timeout:g}s")
+                time.sleep(0.05)
+        self.wait_ready(max(0.1, end - time.monotonic()))
 
     def wait_ready(self, timeout: float = 30.0) -> None:
         end = time.monotonic() + timeout
@@ -632,8 +661,7 @@ class Browser:
         self._pages[info.id] = page
         if url and url != "about:blank":
             res = page.session.call("Page.navigate", {"url": url}) or {}
-            if res.get("errorText"):
-                raise CDPError(f"could not open {url!r} in the new tab: {res['errorText']}")
+            _check_navigate(res, url, " in the new tab")
             info.url = url
             if not res.get("loaderId"):
                 return page  # no new document (a download, a same-document navigation): nothing to wait for

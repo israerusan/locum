@@ -99,7 +99,8 @@ def _backend_name(config: Any) -> str:
         from .backends import platform_backend_name
 
         name = platform_backend_name()
-    return str(name).strip().lower()
+    name = str(name).strip().lower()
+    return "mock" if name == "demo" else name  # "demo" is the CLI's alias of the mock backend
 
 
 def _trace_mode(config: Any) -> str:
@@ -125,16 +126,16 @@ def _trace_dir(config: Any) -> str:
 
 
 def trace_path_for(nodeid: str, directory: str) -> str:
-    """Where the trace of test ``nodeid`` is saved: ``<directory>/<sanitized nodeid>.html``.
+    """Where the trace of test ``nodeid`` is saved: ``<directory>/<sanitized nodeid>-<hash>.html``.
 
-    Characters other than letters, digits, ``.``, ``_`` and ``-`` become ``_``;
-    very long ids are shortened and made unique with a hash.
+    Characters other than letters, digits, ``.``, ``_`` and ``-`` become ``_``
+    and very long ids are shortened; the short hash of the full id keeps ids that
+    sanitize alike (``t[a/b]`` / ``t[a b]``, or differ only in case on a
+    case-insensitive file system) in separate files.
     """
     name = _UNSAFE.sub("_", nodeid).strip("._") or "test"
-    if len(name) > 150:
-        digest = hashlib.sha1(nodeid.encode("utf-8")).hexdigest()[:10]
-        name = name[:139] + "-" + digest
-    return os.path.join(directory, name + ".html")
+    digest = hashlib.sha1(nodeid.encode("utf-8")).hexdigest()[:10]
+    return os.path.join(directory, name[:139] + "-" + digest + ".html")
 
 
 # ---------------------------------------------------------------- fixtures

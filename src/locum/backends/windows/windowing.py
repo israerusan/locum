@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from ...errors import BackendError, NotSupported, WindowNotFound
 from ...types import Rect, WindowInfo
 from ._win32api import (
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     DWMWA_CLOAKED,
     DWMWA_EXTENDED_FRAME_BOUNDS,
     DWORD,
@@ -29,6 +30,7 @@ from ._win32api import (
     WS_POPUP,
 )
 from .keys import VK_MENU
+from .screen import thread_is_per_monitor_aware
 
 
 class _WindowsMixin:
@@ -98,18 +100,55 @@ class _WindowsMixin:
             raise self._error("GetWindowRect")
         return rc.to_rect()
 
-    def _frame_rect(self, hwnd: int) -> Rect:
-        """Visible window bounds (DWM extended frame bounds, without invisible resize borders)."""
+    def _dwm_bounds(self, hwnd: int) -> Optional[Rect]:
         fn = getattr(self._api, "DwmGetWindowAttribute", None)
-        if fn is not None:
-            rc = RECT()
+        if fn is None:
+            return None
+        rc = RECT()
+        try:
+            hr = int(fn(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rc), ctypes.sizeof(rc)))
+        except Exception:
+            return None
+        if hr == 0 and rc.right > rc.left and rc.bottom > rc.top:
+            return rc.to_rect()
+        return None
+
+    def _frame_rect(self, hwnd: int) -> Rect:
+        """Visible window bounds (DWM extended frame bounds, without invisible resize borders).
+
+        DWM always reports physical pixels; on a thread that is not per-monitor
+        DPI aware (``dpi_aware=False``, or a preset process awareness) the
+        window rect is logical, so the DWM insets are measured in physical
+        pixels and scaled onto the logical window rect instead.
+        """
+        a = self._api
+        if thread_is_per_monitor_aware(a) is False:
+            outer = self._outer_rect(hwnd)
+            set_ctx = getattr(a, "SetThreadDpiAwarenessContext", None)
+            old = None
+            if set_ctx is not None:
+                try:
+                    old = set_ctx(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+                except Exception:
+                    old = None
+            if not old:
+                return outer  # cannot measure the physical insets: the logical rect, unmixed
             try:
-                hr = int(fn(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rc), ctypes.sizeof(rc)))
-            except Exception:
-                hr = -1
-            if hr == 0 and rc.right > rc.left and rc.bottom > rc.top:
-                return rc.to_rect()
-        return self._outer_rect(hwnd)
+                phys_outer = self._outer_rect(hwnd)
+                phys = self._dwm_bounds(hwnd)
+            finally:
+                set_ctx(old if isinstance(old, ctypes.c_void_p) else ctypes.c_void_p(int(old)))
+            if phys is None or phys_outer.width <= 0 or phys_outer.height <= 0:
+                return outer
+            sx, sy = outer.width / phys_outer.width, outer.height / phys_outer.height
+            return Rect.from_ltrb(
+                outer.left + int(round((phys.left - phys_outer.left) * sx)),
+                outer.top + int(round((phys.top - phys_outer.top) * sy)),
+                outer.right - int(round((phys_outer.right - phys.right) * sx)),
+                outer.bottom - int(round((phys_outer.bottom - phys.bottom) * sy)),
+            )
+        phys = self._dwm_bounds(hwnd)
+        return phys if phys is not None else self._outer_rect(hwnd)
 
     def _is_candidate(self, hwnd: int) -> bool:
         a = self._api
@@ -181,6 +220,7 @@ class _WindowsMixin:
         return int(fg) if fg else None
 
     def window_handle_at(self, x: int, y: int) -> Any:
+        self._ensure_thread_dpi()
         a = self._api
         wfp, anc = getattr(a, "WindowFromPoint", None), getattr(a, "GetAncestor", None)
         if wfp is None or anc is None:
@@ -219,6 +259,7 @@ class _WindowsMixin:
     def windows_above(self, handle: Any) -> List[Rect]:
         """Every visible, uncloaked top-level window in front of ``handle`` (titled or not:
         notifications and tool windows too) that is not part of it."""
+        self._ensure_thread_dpi()
         target = int(handle)
         out: List[Rect] = []
         a = self._api

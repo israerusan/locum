@@ -43,6 +43,10 @@ DEFAULT_CLIPBOARD_TIMEOUT = 2.0
 # shift handling, ("key", name) canonical key tap, ("paste", s) clipboard paste.
 _Unit = Tuple[str, str]
 
+#: Longest run of text injected with one ``type_text`` call in unicode mode: the
+#: target window and the fail-safe/abort are checked again before every chunk.
+_UNICODE_CHUNK = 32
+
 
 def _is_key_typable(ch: str) -> bool:
     """Characters that are typed with key taps by ``auto`` mode on backends without unicode typing."""
@@ -336,6 +340,9 @@ class Keyboard:
                     units.append(("text", tok))
                 else:
                     buf.append(tok)
+                    if len(buf) >= _UNICODE_CHUNK:
+                        units.append(("text", "".join(buf)))
+                        buf = []
             if buf:
                 units.append(("text", "".join(buf)))
             return units

@@ -150,9 +150,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, 
 
 from .._policy import DEFAULT_POLICY, resolve_policy
 from .._secret import Secret
-from ..errors import FailSafeTriggered, PolicyViolation, WorkflowError
+from ..errors import ActionTimeout, ElementNotFound, FailSafeTriggered, ImageNotFound, PolicyViolation, WorkflowError
 from ..types import Point, Rect
-from .report import FAILED, PASSED, RunReport, StepResult
+from .report import FAILED, PASSED, SKIPPED, RunReport, StepResult
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..desktop import Desktop
@@ -173,6 +173,13 @@ PathLike = Union[str, "os.PathLike[str]"]
 
 COMMON_KEYS = frozenset({"name", "retries", "retry_delay", "timeout", "continue_on_error", "description", "heal", "fingerprint"})
 CONTROL_STEPS = frozenset({"if_exists", "for_each", "try", "repeat", "call"})
+# Under a dry-run policy these steps only simulate their input; a verification step
+# after one of them checks a desktop the flow never changed.
+_DRY_RUN_INPUT_STEPS = frozenset({
+    "click", "double_click", "right_click", "middle_click", "drag", "scroll", "type", "press", "hotkey",
+    "set_text", "invoke", "toggle", "select", "expand", "collapse", "check", "uncheck", "click_image",
+    "click_text", "launch", "activate_window", "clipboard_set"})
+_DRY_RUN_VERIFY_STEPS = frozenset({"assert_exists", "read_value", "wait", "wait_gone", "wait_image"})
 _NESTED_KEYS = {"if_exists": ("then", "else"), "for_each": ("steps",), "try": ("steps", "catch", "finally"), "repeat": ("steps",), "call": ()}
 
 _TARGET_KEYS = {"target", "selector", "image", "x", "y", "timeout", "confidence"}
@@ -260,6 +267,10 @@ class _Undefined(LookupError):
     pass
 
 
+class _StoreError(_Undefined):
+    """The credential store failed (not "no such credential"): a ``:-default`` does not hide it."""
+
+
 # ============================================================ interpolation
 
 _CREDENTIAL_RE = re.compile(r"^credential:\s*(.+?)\s*\.\s*(username|password)$")
@@ -279,7 +290,7 @@ def _credential(variables: Mapping[str, Any], expr: str) -> Any:
     except LookupError as exc:  # CredentialNotFound
         raise _Undefined(str(exc)) from None
     except Exception as exc:  # no credential store, access denied...
-        raise _Undefined(f"credential {name!r}: {type(exc).__name__}: {exc}") from None
+        raise _StoreError(f"credential {name!r}: {type(exc).__name__}: {exc}") from None
     return cred.password if part == "password" else cred.username
 
 
@@ -338,6 +349,8 @@ def _resolve_expr(expr: str, variables: Mapping[str, Any]) -> Any:
         name, default = expr.split(":-", 1)
         try:
             return _lookup(variables, name.strip())
+        except _StoreError:
+            raise  # a broken / locked store is an error, not a missing value
         except _Undefined:
             return default
     return _lookup(variables, expr.strip())
@@ -573,8 +586,54 @@ def flow_exempt_rules(doc: Mapping[str, Any]) -> list:
         if not (rule.selector or rule.keys or rule.command):
             raise ValueError(f"rule {i} ({rule}) is too broad: a flow's exempt rule must name a selector, "
                              "keys or a launch command (a window/app/tool rule alone would exempt everything there)")
+        if rule.selector is not None and not _selector_names_target(rule.selector):
+            raise ValueError(f"rule {i} ({rule}) is too broad: a flow's exempt selector must name its target "
+                             "by name, text or automation id (e.g. 'button \"Delete row\"'); a bare role, '*' "
+                             "or a wildcard would switch the tripwire off for every such control")
+        if rule.command is not None and not rule.command.strip("*? "):
+            raise ValueError(f"rule {i} ({rule}) is too broad: a flow's exempt launch command must name a program")
         rules.append(rule)
     return rules
+
+
+#: Selector attributes that pin down *which* control a flow's exempt rule means.
+_IDENTIFYING_ATTRS = frozenset({"name", "text", "automation_id"})
+
+
+def _selector_names_target(selector: str) -> bool:
+    """Whether every branch of ``selector`` constrains its target (last compound) by a
+    non-wildcard name, text or automation id (``:has-text(...)`` included)."""
+    import re
+
+    from ..selectors import _AttrCond, _HasTextCond, parse
+
+    def identifies(cond: Any) -> bool:
+        if isinstance(cond, _HasTextCond):
+            return bool(cond.text.strip())
+        if not isinstance(cond, _AttrCond) or cond.key not in _IDENTIFYING_ATTRS:
+            return False
+        value = cond.value or ""
+        if cond.op in ("=", "^=", "$=", "*="):
+            return bool(value.strip())
+        if cond.op == "%=":
+            return bool(value.strip("*? "))
+        if cond.op == "~=":
+            # A regex must not match the empty string and must spell some literal text.
+            literal = re.sub(r"\\.|\[[^\]]*\]", "", value)
+            try:
+                return re.search(value, "") is None and re.search(r"[^\W_]", literal) is not None
+            except re.error:
+                return False
+        return False  # presence test or "!=": matches (almost) everything
+
+    try:
+        sel = parse(selector)
+    except Exception:
+        return False
+    for branch in sel.branches:
+        if not branch.steps or not any(identifies(c) for c in branch.steps[-1][1].conds):
+            return False
+    return True
 
 
 def validate_flow(doc: Mapping[str, Any], *, prefix: str = "") -> List[str]:
@@ -845,6 +904,8 @@ class FlowRunner:
         # One entry per running step: its explicit ``heal:``, the resolved value, its fingerprint, its result.
         self._heal_stack: List[Dict[str, Any]] = []
         self._shots = 0
+        #: Whether a dry-run policy has simulated (not sent) an input step yet.
+        self._simulated_input = False
 
     # ---------------------------------------------------------------- helpers
     def log(self, message: str, level: str = "info", path: str = "", **fields: Any) -> None:
@@ -1566,6 +1627,8 @@ class FlowRunner:
                     out = self._act(kind, args, step, scope, path)
                 if out is not None:
                     result.data["result"] = out
+                if kind in _DRY_RUN_INPUT_STEPS and self._dry_run():
+                    self._simulated_input = True
                 result.status = PASSED
                 result.finished_at = time.time()
                 result.duration = time.monotonic() - t0
@@ -1574,6 +1637,18 @@ class FlowRunner:
                 self._finalize_failure(result, exc, t0, screenshot=False)
                 raise
             except Exception as exc:
+                if self._simulated_input and kind in _DRY_RUN_VERIFY_STEPS and self._dry_run() and isinstance(
+                        exc, (FlowAssertionError, ElementNotFound, ImageNotFound, ActionTimeout)):
+                    # The desktop never received the simulated input this step verifies:
+                    # its outcome is unknown, not a failure of the flow.
+                    result.status = SKIPPED
+                    result.data["skipped"] = (f"dry-run: not verified (depends on simulated input): "
+                                              f"{type(exc).__name__}: {exc}")
+                    result.finished_at = time.time()
+                    result.duration = time.monotonic() - t0
+                    self.log(f"dry-run: {kind} skipped, it verifies simulated input ({type(exc).__name__}: {exc})",
+                             level="warning", path=path)
+                    return result
                 last = exc
                 if attempt < attempts and not _is_refusal(exc):  # a refusal is never retried, even nested
                     for s in self.report.steps[mark:]:
@@ -1600,6 +1675,10 @@ class FlowRunner:
             self.log(f"step failed, continuing: {err}", level="warning", path=path)
             return result
         raise err
+
+    def _dry_run(self) -> bool:
+        """Whether the steps act through a dry-run policy (input is simulated, not sent)."""
+        return bool(getattr(getattr(self.desktop, "policy", None), "dry_run", False))
 
     def _finalize_failure(self, result: StepResult, exc: BaseException, t0: float, *, screenshot: bool) -> None:
         original = exc.original if isinstance(exc, FlowStepError) and exc.original is not None else exc

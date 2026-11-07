@@ -103,6 +103,48 @@ def test_install_kill_hotkey_without_pynput(monkeypatch):
     assert install_kill_hotkey() is False
 
 
+def test_wayland_session_detection():
+    wl = fs_mod._is_wayland_session
+    assert wl({"XDG_SESSION_TYPE": "wayland"}, "linux")
+    assert wl({"WAYLAND_DISPLAY": "wayland-0"}, "linux")
+    assert not wl({"XDG_SESSION_TYPE": "x11", "WAYLAND_DISPLAY": "wayland-0"}, "linux")  # nested compositor
+    assert not wl({"DISPLAY": ":0"}, "linux")
+    assert not wl({"XDG_SESSION_TYPE": "wayland"}, "win32")
+
+
+def test_kill_hotkey_warns_that_it_is_unreliable_on_wayland(monkeypatch):
+    import sys
+    import types
+    import warnings
+
+    class FakeHotKeys:
+        def __init__(self, mapping):
+            self.mapping = mapping
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    kb = types.ModuleType("pynput.keyboard")
+    kb.GlobalHotKeys = FakeHotKeys
+    pkg = types.ModuleType("pynput")
+    pkg.keyboard = kb
+    monkeypatch.setitem(sys.modules, "pynput", pkg)
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", kb)
+    monkeypatch.setattr(fs_mod, "_is_wayland_session", lambda: True)
+    try:
+        with pytest.warns(RuntimeWarning, match="XWayland.*NOT a reliable emergency stop"):
+            assert install_kill_hotkey("ctrl+alt+k") is True
+        monkeypatch.setattr(fs_mod, "_is_wayland_session", lambda: False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert install_kill_hotkey("ctrl+alt+k") is True  # X11: no warning
+    finally:
+        fs_mod.uninstall_kill_hotkey()
+
+
 def test_install_kill_hotkey_with_fake_pynput(monkeypatch):
     import sys
     import types

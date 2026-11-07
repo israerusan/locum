@@ -207,9 +207,42 @@ def scrubbing_errors(active: bool = True) -> Iterator[None]:
     try:
         yield
     except BaseException as exc:
+        scrub_exception(exc)
+        raise
+
+
+def scrub_exception(exc: BaseException) -> BaseException:
+    """Scrub registered secrets out of ``exc`` and its ``__cause__`` / ``__context__`` chain, in place.
+
+    String ``args`` are rewritten; an exception whose ``str()`` still shows a secret
+    (a custom ``__str__``) gets a scrubbed ``__str__`` through a same-named subclass,
+    so ``isinstance`` checks and ``except`` clauses keep working."""
+    seen: set = set()
+    stack: List[Optional[BaseException]] = [exc]
+    while stack and len(seen) < 64:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
         try:
-            if any(isinstance(a, str) and contains_secret(a) for a in exc.args):
-                exc.args = tuple(scrub(a) if isinstance(a, str) else a for a in exc.args)
+            _scrub_one(cur)
         except Exception:  # pragma: no cover - exotic exception types
             pass
-        raise
+        stack.extend((cur.__cause__, cur.__context__))
+    return exc
+
+
+def _scrub_one(exc: BaseException) -> None:
+    if any(isinstance(a, str) and contains_secret(a) for a in exc.args):
+        exc.args = tuple(scrub(a) if isinstance(a, str) else a for a in exc.args)
+    try:
+        text = str(exc)
+    except Exception:
+        return
+    if not contains_secret(text):
+        return
+    masked = scrub(text) or ""
+    cls = type(exc)
+    sub = type(cls.__name__, (cls,), {"__str__": lambda self, _m=masked: _m,
+                                      "__module__": cls.__module__, "__qualname__": cls.__qualname__})
+    exc.__class__ = sub

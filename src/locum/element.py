@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 from . import _inputlock, _target
 from ._cancel import check as _cancel_check
-from ._secret import accepts_secret
+from ._secret import MASK, accepts_secret, contains_secret, known_secrets, scrub
 from .backends.base import CAP_CLIPBOARD, AccessibleNode
 from .errors import (
     ActionTimeout,
@@ -319,9 +319,37 @@ class VerifyResult:
     def verified(self) -> bool:
         return self.status == "verified"
 
+    def _shown(self) -> Tuple[str, Optional[str]]:
+        # A secret was typed: the read-back is (a near-copy of) the password, never shown.
+        if _holds_secret(self.expected) or _holds_secret(self.actual):
+            return MASK, (None if self.actual is None else MASK)
+        return self.expected, self.actual
+
     def to_dict(self) -> Dict[str, Any]:
-        return {"status": self.status, "mode": self.mode, "expected": self.expected,
-                "actual": self.actual, "reason": self.reason}
+        expected, actual = self._shown()
+        return {"status": self.status, "mode": self.mode, "expected": expected,
+                "actual": actual, "reason": self.reason}
+
+    def __repr__(self) -> str:
+        expected, actual = self._shown()
+        return (f"VerifyResult(status={self.status!r}, mode={self.mode!r}, expected={expected!r}, "
+                f"actual={actual!r}, reason={self.reason!r})")
+
+
+def _holds_secret(text: Optional[str]) -> bool:
+    """Whether ``text`` is or contains a registered secret (any length: also the short ones)."""
+    if not isinstance(text, str) or not text:
+        return False
+    return contains_secret(text) or text in known_secrets()
+
+
+def _secret_mismatch(actual: Optional[str], expected: str) -> str:
+    """Where a read-back differs from a secret, without showing either: lengths and the first differing position."""
+    if actual is None:
+        return f"no readable value, expected {MASK!r} (a {len(expected)}-character secret)"
+    pos = next((i for i, (a, e) in enumerate(zip(actual, expected)) if a != e), min(len(actual), len(expected)))
+    return (f"a {len(actual)}-character value, expected {MASK!r} (a {len(expected)}-character secret; "
+            f"first difference at position {pos})")
 
 
 def _norm_newlines(s: str) -> str:
@@ -1098,15 +1126,18 @@ class Element:
         if "readonly" in self.states and self.role in ("edit", "spinbutton"):
             raise ElementNotFound(f"{self!r} is read-only; refusing to enter text into it")
 
-    def _focus_by_click(self, require: bool = False) -> None:
+    def _focus_by_click(self, require: bool = False, *, before_click: Optional[Callable[[], Any]] = None) -> None:
         """Click the element to focus it and verify that it really got keyboard focus.
 
         Keystrokes typed after a click that did not focus the element would go
         to whichever control had focus before (another field, another window).
         With ``require=True`` focus must be proven (``_has_focus() is True``);
-        otherwise only a known *lack* of focus is refused.
+        otherwise only a known *lack* of focus is refused. ``before_click`` runs
+        right before the click (a policy gate raises there to prevent it).
         """
         self._check_enabled()
+        if before_click is not None:
+            before_click()
         self.click(native=False)
         last: List[Optional[bool]] = [None]
 
@@ -1120,11 +1151,13 @@ class Element:
         except ActionTimeout:
             raise self._focus_refusal(last[0]) from None
 
-    def _ensure_focus(self, require_focus: Optional[bool] = None) -> None:
+    def _ensure_focus(self, require_focus: Optional[bool] = None, *,
+                      before_click: Optional[Callable[[], Any]] = None) -> None:
         """Make sure keystrokes go to this element; raise rather than type elsewhere.
 
         Focus must be proven (see the module docstring) unless ``require_focus``
         -- or, when it is ``None``, ``desktop.require_focus`` -- is False.
+        ``before_click`` runs before a focusing click, if one is needed.
         """
         self._guard()
         require = _require_focus(self.desktop, require_focus)
@@ -1147,7 +1180,7 @@ class Element:
                 # A click would not produce proof either (the backend cannot tell) and
                 # may have side effects (pressing a button): refuse now.
                 raise self._focus_refusal(None)
-        self._focus_by_click(require)
+        self._focus_by_click(require, before_click=before_click)
 
     def _typing_mode(self, mode: Optional[str]) -> str:
         return mode or getattr(self.desktop, "typing_mode", None) or "auto"
@@ -1290,13 +1323,19 @@ class Element:
             _notify(self, "verify", verification=result)
             if vmode != "normalized":
                 raise VerificationUnavailable(
-                    f"{self!r}: cannot verify {target!r} with verify={vmode!r} ({result.reason}); the input is "
+                    f"{self!r}: cannot verify {MASK if _holds_secret(target) else repr(target)} with verify={vmode!r} ({result.reason}); the input is "
                     "not proven. Use a readable field, or verify=True to accept an unverified result"
                 )
         return result
 
     def _raise_mismatch(self, target: str, actual: Optional[str], vmode: str = "normalized") -> None:
         hint = "pass verify=False if the app legitimately reformats it"
+        if _holds_secret(target):
+            # A near-copy of the password (one keystroke dropped) would get past scrub(): never show it.
+            raise ActionTimeout(
+                f"{self._repr_without_value()} holds {_secret_mismatch(actual, target)} after set_text (verify={vmode!r}: the field "
+                f"refused, truncated or changed the input); {hint}"
+            )
         if vmode == "normalized" and actual is not None and len(_parse_number(actual)) > 1:
             hint = (f"{actual!r} reads as a different number per locale; pass decimal='.' or decimal=',' "
                     "(or verify='amount') to compare it by value")
@@ -1447,6 +1486,12 @@ class Element:
         else:
             intended = _repair_candidates(b, after, t)
         if len(intended) != 1:
+            if _holds_secret(text):
+                raise ActionTimeout(
+                    f"{self._repr_without_value()} holds {_secret_mismatch(last[0], b + t)} after typing a secret: the app dropped "
+                    "or garbled keystrokes and the intended text is ambiguous, so it was not repaired; use "
+                    "set_text(), mode='clipboard', or verify=False if the field reformats its input"
+                )
             raise ActionTimeout(
                 f"{self!r} holds {last[0]!r} after typing {text!r} into {before!r}: the app dropped or "
                 "garbled keystrokes and the intended text is ambiguous, so it was not repaired; use "
@@ -1679,7 +1724,41 @@ class Element:
         from .selectors import describe_node
 
         try:
-            desc = describe_node(self._node)
+            # Scrubbed before describe_node shortens them: a cut-off secret would no longer match.
+            desc = describe_node(_ScrubbedNode(self._node))
         except Exception:  # pragma: no cover - defensive
             desc = self.role
-        return f"<Element {desc}>"
+        return f"<Element {scrub(desc)}>"
+
+    def _repr_without_value(self) -> str:
+        """``repr(self)`` without the field's value (it may hold a near-copy of a secret)."""
+        from .selectors import describe_node
+
+        try:
+            return f"<Element {scrub(describe_node(_ScrubbedNode(self._node, hide_value=True)))}>"
+        except Exception:  # pragma: no cover - defensive
+            return f"<Element {self.role}>"
+
+
+class _ScrubbedNode:
+    """A node whose ``name`` / ``value`` have registered secrets masked (for :meth:`Element.__repr__`)."""
+
+    __slots__ = ("_n", "_hide_value")
+
+    def __init__(self, node: Any, hide_value: bool = False) -> None:
+        self._n = node
+        self._hide_value = hide_value
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._n, name)
+
+    @property
+    def name(self) -> Any:
+        return scrub(self._n.name)
+
+    @property
+    def value(self) -> Any:
+        if self._hide_value:
+            return None
+        v = self._n.value
+        return scrub(v) if isinstance(v, str) else v

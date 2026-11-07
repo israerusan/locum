@@ -129,7 +129,9 @@ def _check_name(name: Any) -> str:
         raise ValueError(f"credential name is longer than {_MAX_NAME} characters")
     if any(ord(c) < 32 for c in n) or "*" in n:
         raise ValueError(f"credential name {n!r} contains a control character or '*'")
-    return n
+    # Names are case-insensitive everywhere (Windows Credential Manager target names are):
+    # "ERP" and "erp" are one credential on every store.
+    return n.casefold()
 
 
 # =============================================================================== Windows
@@ -138,6 +140,10 @@ CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 ERROR_NOT_FOUND = 1168
 CRED_MAX_CREDENTIAL_BLOB_SIZE = 5 * 512
+#: ``CRED_MAX_USERNAME_LENGTH`` (513) less the terminating NUL.
+CRED_MAX_USERNAME_LENGTH = 512
+_MAX_VARIANTS = 64  # case variants of one target name delete() removes
+_INDEX_RETRIES = 5  # re-reads of the keyring name index after a concurrent update
 
 _DWORD = ctypes.c_uint32
 
@@ -200,7 +206,7 @@ class WindowsCredentialStore:
 
     def get(self, name: str) -> Optional[Tuple[str, str]]:
         pcred = _PCRED()
-        if not self._dll.CredReadW(TARGET_PREFIX + name, CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)):
+        if not self._dll.CredReadW(TARGET_PREFIX + name.casefold(), CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)):
             if int(self._last_error() or 0) == ERROR_NOT_FOUND:
                 return None
             raise self._fail("CredReadW")
@@ -213,10 +219,27 @@ class WindowsCredentialStore:
             self._dll.CredFree(pcred)
 
     def set(self, name: str, username: str, password: str) -> None:
+        name = name.casefold()
         blob = password.encode("utf-16-le")
         if len(blob) > CRED_MAX_CREDENTIAL_BLOB_SIZE:
             raise ValueError(f"password is too long for Windows Credential Manager "
                              f"({len(blob)} > {CRED_MAX_CREDENTIAL_BLOB_SIZE} bytes)")
+        if len(username) > CRED_MAX_USERNAME_LENGTH:
+            raise ValueError(f"username is too long for Windows Credential Manager "
+                             f"({len(username)} > {CRED_MAX_USERNAME_LENGTH} characters)")
+        self._write(name, username, blob)
+        if self.get(name) == (username, password):
+            return
+        # Windows matches target names case-insensitively but stacks a write whose case
+        # differs from an existing entry (one written before names were normalised): the
+        # read then returns that older entry. Remove every variant and write again.
+        self.delete(name)
+        self._write(name, username, blob)
+        if self.get(name) != (username, password):
+            raise LocumError(f"Windows Credential Manager does not return credential {name!r} as written "
+                             f"(an entry for {TARGET_PREFIX + name!r} that locum cannot replace?)")
+
+    def _write(self, name: str, username: str, blob: bytes) -> None:
         buf = ctypes.create_string_buffer(blob, len(blob) or 1)
         try:
             cred = CREDENTIALW()
@@ -234,11 +257,17 @@ class WindowsCredentialStore:
             ctypes.memset(buf, 0, len(buf))  # no copy of the password left in this process's buffer
 
     def delete(self, name: str) -> bool:
-        if self._dll.CredDeleteW(TARGET_PREFIX + name, CRED_TYPE_GENERIC, 0):
-            return True
-        if int(self._last_error() or 0) == ERROR_NOT_FOUND:
-            return False
-        raise self._fail("CredDeleteW")
+        """Remove ``name`` -- every case variant of it (each ``CredDeleteW`` removes one)."""
+        target = TARGET_PREFIX + name.casefold()
+        found = False
+        for _ in range(_MAX_VARIANTS):
+            if self._dll.CredDeleteW(target, CRED_TYPE_GENERIC, 0):
+                found = True
+                continue
+            if int(self._last_error() or 0) == ERROR_NOT_FOUND:
+                return found
+            raise self._fail("CredDeleteW")
+        raise LocumError(f"credential {name!r}: more than {_MAX_VARIANTS} entries in Windows Credential Manager")
 
     def names(self) -> List[str]:
         count = _DWORD(0)
@@ -253,8 +282,8 @@ class WindowsCredentialStore:
                 c = pcreds[i].contents
                 target = c.TargetName or ""
                 if int(c.Type) == CRED_TYPE_GENERIC and target.startswith(TARGET_PREFIX):
-                    out.append(target[len(TARGET_PREFIX):])
-            return sorted(out)
+                    out.append(target[len(TARGET_PREFIX):].casefold())
+            return sorted(set(out))
         finally:
             self._dll.CredFree(pcreds)
 
@@ -263,7 +292,13 @@ class WindowsCredentialStore:
 
 
 class KeyringCredentialStore:
-    """The ``keyring`` package (macOS Keychain, Secret Service, KWallet...)."""
+    """The ``keyring`` package (macOS Keychain, Secret Service, KWallet...).
+
+    The list of names is one keyring item (``locum`` / ``credential-index``). Updating
+    it is a read-modify-write that another process may interleave with; every update
+    is therefore re-read and repeated until it holds (best effort: :meth:`get` never
+    depends on the index, only :meth:`names` does).
+    """
 
     name = "keyring"
 
@@ -273,19 +308,56 @@ class KeyringCredentialStore:
         self._kr = keyring_module
         self._lock = threading.Lock()
 
+    def _call(self, fn: Any, *args: Any) -> Any:
+        """``fn(*args)``; keyring's "no usable backend" errors become :class:`CredentialStoreUnavailable`."""
+        errors = getattr(self._kr, "errors", None)
+        keyring_error = getattr(errors, "KeyringError", None)
+        delete_error = getattr(errors, "PasswordDeleteError", None)
+        try:
+            return fn(*args)
+        except Exception as exc:
+            if (isinstance(keyring_error, type) and isinstance(exc, keyring_error)
+                    and not (isinstance(delete_error, type) and isinstance(exc, delete_error))):
+                raise CredentialStoreUnavailable(f"the keyring is not usable: {type(exc).__name__}: {exc}") from exc
+            raise
+
+    def _get_raw(self, service: str) -> Optional[str]:
+        return self._call(self._kr.get_password, service, _KEYRING_ACCOUNT)
+
     def _index(self) -> List[str]:
-        raw = self._kr.get_password(*_KEYRING_INDEX)
+        raw = self._call(self._kr.get_password, *_KEYRING_INDEX)
         try:
             names = json.loads(raw) if raw else []
         except ValueError:
             names = []
-        return [n for n in names if isinstance(n, str)]
+        return [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
 
     def _save_index(self, names: List[str]) -> None:
-        self._kr.set_password(*_KEYRING_INDEX, json.dumps(sorted(set(names))))
+        self._call(self._kr.set_password, *_KEYRING_INDEX, json.dumps(sorted(set(names))))
+
+    def _update_index(self, add: Optional[str] = None, remove: Any = ()) -> None:
+        """Add ``add`` / drop the names in ``remove``, re-reading until another process's
+        concurrent update has not undone it."""
+        remove = set(remove)
+        with self._lock:
+            for _ in range(_INDEX_RETRIES):
+                names = self._index()
+                if (add is None or add in names) and not remove & set(names):
+                    return
+                self._save_index([n for n in names if n not in remove] + ([add] if add is not None else []))
+
+    def _variants(self, name: str) -> List[str]:
+        """Names in the index that differ from ``name`` only in case (written before names were normalised)."""
+        return [n for n in self._index() if n != name and n.casefold() == name]
 
     def get(self, name: str) -> Optional[Tuple[str, str]]:
-        raw = self._kr.get_password(TARGET_PREFIX + name, _KEYRING_ACCOUNT)
+        name = name.casefold()
+        raw = self._get_raw(TARGET_PREFIX + name)
+        if raw is None:
+            for legacy in self._variants(name):
+                raw = self._get_raw(TARGET_PREFIX + legacy)
+                if raw is not None:
+                    break
         if raw is None:
             return None
         try:
@@ -295,35 +367,30 @@ class KeyringCredentialStore:
             raise LocumError(f"credential {name!r} in the keyring is not a locum credential") from None
 
     def set(self, name: str, username: str, password: str) -> None:
-        self._kr.set_password(TARGET_PREFIX + name, _KEYRING_ACCOUNT,
-                              json.dumps({"username": username, "password": password}))
-        with self._lock:
-            names = self._index()
-            if name not in names:
-                self._save_index(names + [name])
+        name = name.casefold()
+        self._call(self._kr.set_password, TARGET_PREFIX + name, _KEYRING_ACCOUNT,
+                   json.dumps({"username": username, "password": password}))
+        self._update_index(add=name)
 
     def delete(self, name: str) -> bool:
+        name = name.casefold()
         errors = getattr(self._kr, "errors", None)
         delete_error = getattr(errors, "PasswordDeleteError", None) if errors is not None else None
-        try:
-            if self._kr.get_password(TARGET_PREFIX + name, _KEYRING_ACCOUNT) is None:
-                found = False
-            else:
-                self._kr.delete_password(TARGET_PREFIX + name, _KEYRING_ACCOUNT)
-                found = True
-        except Exception as exc:
-            if delete_error is not None and isinstance(exc, delete_error):
-                found = False
-            else:
-                raise
-        with self._lock:
-            names = self._index()
-            if name in names:
-                self._save_index([n for n in names if n != name])
+        variants = [name] + self._variants(name)
+        found = False
+        for n in variants:
+            try:
+                if self._get_raw(TARGET_PREFIX + n) is not None:
+                    self._call(self._kr.delete_password, TARGET_PREFIX + n, _KEYRING_ACCOUNT)
+                    found = True
+            except Exception as exc:
+                if not (delete_error is not None and isinstance(exc, delete_error)):
+                    raise
+        self._update_index(remove=variants)
         return found
 
     def names(self) -> List[str]:
-        return sorted(self._index())
+        return sorted({n.casefold() for n in self._index()})
 
 
 # =============================================================================== environment
@@ -416,7 +483,12 @@ def get_credential(name: str, *, env: Optional[bool] = None) -> Credential:
             raise
         store = None
     if store is not None:
-        found = store.get(n)
+        try:
+            found = store.get(n)
+        except CredentialStoreUnavailable:  # e.g. keyring's fail backend (NoKeyringError)
+            if not use_env:
+                raise
+            store, found = None, None
         if found is not None:
             return Credential(n, found[0], Secret(found[1]), getattr(store, "name", type(store).__name__))
     if use_env:

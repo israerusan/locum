@@ -105,6 +105,17 @@ class MONITORINFOEXW(ctypes.Structure):
     ]
 
 
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", UINT),
+        ("flags", UINT),
+        ("showCmd", UINT),
+        ("ptMinPosition", POINT),
+        ("ptMaxPosition", POINT),
+        ("rcNormalPosition", RECT),
+    ]
+
+
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
         ("biSize", DWORD),
@@ -207,6 +218,8 @@ SW_MINIMIZE = 6
 SW_SHOWMINNOACTIVE = 7
 SW_RESTORE = 9
 
+WPF_RESTORETOMAXIMIZED = 0x2
+
 WM_CLOSE = 0x0010
 
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
@@ -229,6 +242,7 @@ PW_CLIENTONLY = 0x1
 PW_RENDERFULLCONTENT = 0x2  # Windows 8.1+: render through DWM (DirectX / Chromium / UWP content too)
 MONITOR_DEFAULTTONEAREST = 0x2
 DPI_AWARENESS_UNAWARE = 0
+DPI_AWARENESS_PER_MONITOR_AWARE = 2
 
 DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE = -3
@@ -385,6 +399,11 @@ class _Win32:
             (u, "MonitorFromWindow", HMONITOR, [HWND, DWORD]),
             (u, "GetWindowDpiAwarenessContext", HANDLE, [HWND]),
             (u, "GetAwarenessFromDpiAwarenessContext", INT, [HANDLE]),
+            (u, "GetThreadDpiAwarenessContext", HANDLE, []),
+            (u, "GetWindowPlacement", BOOL, [HWND, P(WINDOWPLACEMENT)]),
+            (u, "SetWindowPlacement", BOOL, [HWND, P(WINDOWPLACEMENT)]),
+            (u, "GetClientRect", BOOL, [HWND, P(RECT)]),
+            (u, "ClientToScreen", BOOL, [HWND, P(POINT)]),
         ]
         for dll, name, res, args in optional:
             setattr(self, name, _proto(dll, name, res, args, required=False))

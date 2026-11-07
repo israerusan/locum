@@ -286,6 +286,8 @@ class MCPServer:
                 return
             job.answered = True
             self._jobs.pop(_key(job.id), None)
+        if job.client_cancelled:
+            response = None  # no response after notifications/cancelled (MCP), not even a late timeout
         job.response = response
         if response is not None and not job.batch:
             # Under the job's send lock: a heartbeat the monitor decided on before
@@ -359,6 +361,7 @@ class MCPServer:
         if job is None:
             return
         reason = params.get("reason")
+        job.client_cancelled = True
         job.scope.cancel(str(reason) if reason else "cancelled by the client")
         if job.started is None:
             self._finish(job, None)  # never ran: nothing to stop, no response (per the protocol)
@@ -458,6 +461,8 @@ class _Job:
         self.scope = CancelScope(timeout)  # counts from receipt: queueing time is included
         self.done = threading.Event()
         self.answered = False
+        #: The client sent ``notifications/cancelled``: the request gets no response at all.
+        self.client_cancelled = False
         #: Serialises this job's final response with its progress heartbeats.
         self.send_lock = threading.Lock()
         self.response: Optional[Dict[str, Any]] = None

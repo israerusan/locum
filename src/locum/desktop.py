@@ -281,7 +281,8 @@ class Desktop:
         """Sleep ``seconds`` (via the injected sleep function), honouring the global abort flag.
 
         An :func:`~locum.failsafe.abort` (kill hotkey) during the sleep raises
-        :class:`FailSafeTriggered` at once (within ~0.1 s), not after the whole wait.
+        :class:`FailSafeTriggered` at once (within ~0.1 s), not after the whole wait; so does
+        a cancelled or timed-out MCP tool call (``CallCancelled``, a ``FailSafeTriggered``).
         """
         self._check_abort()
         seconds = float(seconds)

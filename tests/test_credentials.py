@@ -17,7 +17,7 @@ import pickle
 
 import pytest
 
-from locum import cli
+from locum import _secret, cli
 from locum._secret import MASK, Secret, contains_secret, scrub, scrub_data
 from locum.backends import mock
 from locum.backends.mock import MockBackend
@@ -70,9 +70,15 @@ def isolated(monkeypatch):
     store = MemoryStore()
     old = creds.set_store(store)
     creds.enable_env_fallback(None)
+    # Values registered here ("other", "plain"...) must not be scrubbed out of later tests' text.
+    known, known_set = list(_secret._known), set(_secret._known_set)
     yield store
     creds.set_store(old)
     creds.enable_env_fallback(None)
+    with _secret._lock:
+        _secret._known[:] = known
+        _secret._known_set.clear()
+        _secret._known_set.update(known_set)
 
 
 # ====================================================================== Secret
@@ -170,7 +176,14 @@ def _write_ptr(byref_arg, address):
 
 
 class FakeAdvapi32:
-    """CredReadW / CredWriteW / CredDeleteW / CredEnumerateW / CredFree over a dict."""
+    """CredReadW / CredWriteW / CredDeleteW / CredEnumerateW / CredFree over a dict.
+
+    Like real Windows (verified against Credential Manager): CredReadW/CredDeleteW match
+    target names case-insensitively and act on the oldest matching entry, while a
+    CredWriteW whose case differs from an existing entry stacks a second one."""
+
+    def _find(self, target):
+        return next((t for t in self.items if t.casefold() == target.casefold()), None)
 
     def __init__(self):
         self.items = {}  # target -> (type, username, blob, persist)
@@ -198,17 +211,19 @@ class FakeAdvapi32:
         return cred
 
     def CredReadW(self, target, typ, flags, out):
-        if target not in self.items or self.items[target][0] != typ:
+        found = self._find(target)
+        if found is None or self.items[found][0] != typ:
             self.error = 1168
             return 0
-        _write_ptr(out, ctypes.addressof(self._make(target)))
+        _write_ptr(out, ctypes.addressof(self._make(found)))
         return 1
 
     def CredDeleteW(self, target, typ, flags):
-        if target not in self.items:
+        found = self._find(target)
+        if found is None:
             self.error = 1168
             return 0
-        del self.items[target]
+        del self.items[found]
         return 1
 
     def CredEnumerateW(self, filt, flags, pcount, out):

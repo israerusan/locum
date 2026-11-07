@@ -432,7 +432,8 @@ locum.llm.ComputerUseAdapter class(desktop: "'Desktop'", *, max_long_edge: 'Unio
     .screen_region(self) -> 'Rect'
     .to_image(self, x: 'float', y: 'float') -> 'Point'
     .to_screen(self, x: 'float', y: 'float') -> 'Point'
-    .tool_definition(self) -> 'Dict[str, Any]'
+    .tool_definition(self, model: 'Optional[str]' = None) -> 'Dict[str, Any]'
+    .tool_version(model: 'Optional[str]' = None) -> 'Tuple[str, Optional[str]]'
 locum.llm.DEFAULT_CONFIRM tuple
 locum.llm.DEFAULT_CONFIRM_KEYS tuple
 locum.llm.DesktopToolkit class(desktop: "'Desktop'", policy: 'Optional[Policy]' = None, audit: 'Optional[AuditLog]' = None, observe_kwargs: 'Optional[Dict[str, Any]]' = None, *, find_timeout: 'float' = 5.0, feedback: 'bool' = True, launch_kwargs: 'Optional[Dict[str, Any]]' = None)

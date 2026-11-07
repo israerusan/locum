@@ -30,7 +30,9 @@ def env():
     btn = win.add_button("Go", (20, 220, 80, 30))
     edit = win.add_edit("Text", (20, 40, 200, 28))
     edit2 = win.add_edit("Other", (20, 90, 200, 28))
-    d = Desktop(be, sleep=lambda s: None, pause=0.0, default_timeout=0.0)
+    # The desktop's own fail-safe is off: FAILSAFE / FAILSAFE_POINTS alone decide (they
+    # never weaken the fail-safe of a desktop handed in with set_desktop).
+    d = Desktop(be, sleep=lambda s: None, pause=0.0, default_timeout=0.0, failsafe=False)
     saved = {k: getattr(pg, k) for k in ("PAUSE", "FAILSAFE", "FAILSAFE_POINTS", "USE_IMAGE_NOT_FOUND_EXCEPTION", "_SLEEP")}
     pauses = []
     pg._SLEEP = pauses.append

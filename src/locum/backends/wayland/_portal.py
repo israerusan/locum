@@ -27,9 +27,10 @@ import os
 import secrets
 import tempfile
 import threading
+import time
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-from ...errors import BackendError, BackendUnavailable, PermissionDenied
+from ...errors import BackendError, BackendUnavailable, FailSafeTriggered, PermissionDenied
 
 PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -99,7 +100,11 @@ class PortalBus:
         raise NotImplementedError
 
     def watch(self, path: str, interface: str, member: str) -> SignalWatch:
-        """Subscribe to ``interface.member`` signals emitted on ``path`` by the portal."""
+        """Subscribe to ``interface.member`` signals emitted on ``path`` by the portal.
+
+        Only signals sent by the portal itself may be delivered: any session-bus
+        client can emit a signal on any path.
+        """
         raise NotImplementedError
 
     def close(self) -> None:
@@ -115,27 +120,66 @@ def _load_jeepney() -> Any:
     return jeepney
 
 
+#: Longest time :meth:`_JeepneyWatch.wait` holds the connection lock at once, so other
+#: threads (input, ``release_all``) can use the bus while a dialog is open.
+WAIT_SLICE = 0.1
+
+
 class _JeepneyWatch(SignalWatch):
-    def __init__(self, bus: "JeepneyBus", rule: Any) -> None:
+    def __init__(self, bus: "JeepneyBus", rule: Any, sender: str) -> None:
         self._bus = bus
         self._rule = rule
+        self._sender = sender
         self._handle = bus._conn.filter(rule, bufsize=16)
         self._queue = self._handle.queue
         self._closed = False
-        bus._add_match(rule)
+        try:
+            bus._add_match(rule)
+        except BaseException:
+            self._closed = True
+            self._handle.close()
+            raise
+
+    def _accept(self, msg: Any) -> Optional[Tuple[Any, ...]]:
+        # The filter already matches the sender; check again: only the portal may answer.
+        sender = msg.header.fields.get(self._bus._jeepney.HeaderFields.sender)
+        return tuple(msg.body) if sender == self._sender else None
+
+    def _pop(self) -> Optional[Tuple[Any, ...]]:
+        while self._queue:
+            body = self._accept(self._queue.popleft())
+            if body is not None:
+                return body
+        return None
 
     def wait(self, timeout: Optional[float]) -> Tuple[Any, ...]:
-        with self._bus._lock:
-            if self._queue:
-                return tuple(self._queue.popleft().body)
-            # Reads the socket, routing other messages to their filters, until one lands here.
-            msg = self._bus._conn.recv_until_filtered(self._queue, timeout=timeout)
-            return tuple(msg.body)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            body = self._pop()
+            if body is not None:
+                return body
+            left = WAIT_SLICE if deadline is None else min(WAIT_SLICE, deadline - time.monotonic())
+            if left <= 0:
+                raise TimeoutError
+            # The lock is held for one short slice only: another thread's call may run (and
+            # route our signal into the queue) in between.
+            msg = None
+            with self._bus._lock:
+                if not self._queue:
+                    try:
+                        # Reads the socket, routing other messages to their filters.
+                        msg = self._bus._conn.recv_until_filtered(self._queue, timeout=left)
+                    except TimeoutError:
+                        pass
+            if msg is None:
+                time.sleep(0.002)  # locks are not fair: let a waiting thread take the bus
+                continue
+            body = self._accept(msg)
+            if body is not None:
+                return body
 
     def poll(self) -> Optional[Tuple[Any, ...]]:
-        if self._queue:
-            return tuple(self._queue.popleft().body)
-        return None
+        return self._pop()
 
     def close(self) -> None:
         if self._closed:
@@ -207,11 +251,34 @@ class JeepneyBus(PortalBus):
     def _remove_match(self, rule: Any) -> None:
         self._bus_call("RemoveMatch", rule)
 
+    def _portal_owner(self) -> str:
+        """The unique bus name of xdg-desktop-portal (started by D-Bus activation if needed).
+
+        Match rules use it, not the well-known name: jeepney matches the sender of incoming
+        messages literally, and the bus daemon stamps the unique name on every message.
+        """
+        jp = self._jeepney
+        for attempt in (0, 1):
+            try:
+                (owner,) = self._send(jp.message_bus.GetNameOwner(PORTAL_BUS_NAME), 5.0)
+                return str(owner)
+            except Exception as exc:
+                if attempt:
+                    raise BackendError(f"xdg-desktop-portal is not running on the session bus: {exc}") from exc
+            try:  # any method call activates the portal
+                self.call(PORTAL_PATH, "org.freedesktop.DBus.Peer", "Ping", "", (), timeout=5.0)
+            except BackendError:
+                pass
+        raise AssertionError("unreachable")  # pragma: no cover
+
     def watch(self, path: str, interface: str, member: str) -> SignalWatch:
         jp = self._jeepney
-        rule = jp.MatchRule(type="signal", interface=interface, member=member, path=path)
         with self._lock:
-            return _JeepneyWatch(self, rule)
+            # sender=: no other session-bus client can forge a portal Response (e.g. a
+            # screenshot ``uri`` pointing at an arbitrary file).
+            sender = self._portal_owner()
+            rule = jp.MatchRule(type="signal", sender=sender, interface=interface, member=member, path=path)
+            return _JeepneyWatch(self, rule, sender)
 
     def close(self) -> None:
         with self._lock:
@@ -307,13 +374,16 @@ class PortalClient:
                 watch.close()
                 watch = self.bus.watch(handle, REQUEST, "Response")
             try:
-                body = watch.wait(timeout)
+                body = self._wait(watch, timeout)
             except TimeoutError:
                 self._close_request(handle)
                 raise BackendError(
                     f"{interface.rsplit('.', 1)[-1]}.{method}: no answer from the portal within {timeout:g}s "
                     "(was a permission dialog left open?)"
                 ) from None
+            except BaseException:
+                self._close_request(handle)  # aborted: dismiss the dialog too
+                raise
         finally:
             watch.close()
         response = int(body[0]) if body else RESPONSE_OTHER
@@ -324,6 +394,25 @@ class PortalClient:
         if response != RESPONSE_SUCCESS:
             raise BackendError(f"{what} failed in the portal (response {response})")
         return results
+
+    @staticmethod
+    def _wait(watch: SignalWatch, timeout: Optional[float]) -> Tuple[Any, ...]:
+        """``watch.wait`` in short slices, so :func:`locum.failsafe.abort` ends a long
+        wait (an open approval dialog) within :data:`WAIT_SLICE` seconds."""
+        from ...failsafe import abort_reason, is_aborted
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if is_aborted():
+                reason = abort_reason()
+                raise FailSafeTriggered("Automation aborted" + (f": {reason}" if reason else ""))
+            left = WAIT_SLICE if deadline is None else min(WAIT_SLICE, deadline - time.monotonic())
+            if left <= 0:
+                raise TimeoutError
+            try:
+                return watch.wait(left)
+            except TimeoutError:
+                continue
 
     def _close_request(self, handle: str) -> None:
         try:

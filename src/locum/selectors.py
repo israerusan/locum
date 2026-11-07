@@ -523,8 +523,12 @@ class _AttrCond(_Cond):
         raise AssertionError(op)  # pragma: no cover
 
     def test(self, entry: _Entry, snap: _Snapshot) -> bool:
-        vals = _attr_values(entry, self.key)
-        hit = any(self._one(v) for v in vals)
+        if self.key == "text":
+            # Name first: reading a value costs several cross-process pattern calls
+            # (and a document's text) per node, needed only when the name misses.
+            hit = self._one(entry.prop("name")) or self._one(entry.prop("value"))
+        else:
+            hit = any(self._one(v) for v in _attr_values(entry, self.key))
         if not hit and self._core is not None and entry.prop("role") in _TITLED_ROLES:
             hit = self._core_hit(entry.prop("name"))
         return not hit if self.op == "!=" else hit

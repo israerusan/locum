@@ -27,6 +27,7 @@ from ..backends.base import AccessibleNode
 from ..errors import ElementNotFound, NotSupported
 from ..types import Point, Rect, WindowInfo
 from .._nodeinfo import is_password
+from .._secret import scrub, scrub_data
 
 if TYPE_CHECKING:  # pragma: no cover
     from PIL.Image import Image
@@ -131,7 +132,8 @@ def _node_value(node: Any) -> Optional[str]:
     value = _safe(lambda: node.value)
     if value not in (None, "") and is_password(node):
         return "***"
-    return value
+    # A secret typed into an ordinary field: masked like a password field.
+    return scrub(value) if isinstance(value, str) else value
 
 
 def _quote(text: str, limit: int = 80) -> str:
@@ -203,7 +205,7 @@ class ObservedElement:
         return "occluded" in self.states
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        return scrub_data({
             "id": self.id,
             "role": self.role,
             "name": self.name,
@@ -213,7 +215,7 @@ class ObservedElement:
             "selector": self.selector,
             "window": self.window_title,
             "app": self.app,
-        }
+        })
 
 
 @dataclass
@@ -445,7 +447,7 @@ class Observation:
         else:
             lines.append("No accessible interactive elements were found (use coordinates from the screenshot).")
         lines.extend(f"Note: {n}" for n in self.notes)
-        return "\n".join(lines)
+        return scrub("\n".join(lines)) or ""
 
     def image_base64(self, annotated: bool = True) -> str:
         """Base64 PNG of the (annotated) screenshot; raises ``ValueError`` if none was captured."""
@@ -458,7 +460,7 @@ class Observation:
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-friendly summary (no images)."""
-        return {
+        return scrub_data({
             "region": self.region.to_dict(),
             "screen_size": list(self.screen_size),
             "image_size": list(self.image_size),
@@ -468,7 +470,7 @@ class Observation:
             "windows": [w.to_dict() for w in self.windows],
             "elements": [e.to_dict() for e in self.elements],
             "notes": list(self.notes),
-        }
+        })
 
 
 def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
@@ -500,7 +502,7 @@ def _refresh(el: ObservedElement, node: AccessibleNode, ctx: Optional["_Selector
         el.name = name
     raw = _safe(lambda: node.value, missing)
     if raw is not missing:
-        el.value = "***" if raw not in (None, "") and is_password(node) else raw
+        el.value = "***" if raw not in (None, "") and is_password(node) else (scrub(raw) if isinstance(raw, str) else raw)
     b = _safe(lambda: node.bounds)
     if b is not None:
         el.bounds = b

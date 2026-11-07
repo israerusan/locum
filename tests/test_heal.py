@@ -285,7 +285,8 @@ def test_fingerprint_round_trip(renamed):
 def test_name_similarity():
     sim = heal_mod.name_similarity
     assert sim("Save", "save") == 1.0
-    assert sim("Save", "Save as") >= 0.85
+    assert 0.7 <= sim("Save", "Save as") < 0.85  # an added word earns no bonus
+    assert sim("Save as...", "Save as") >= 0.9
     assert sim("Save", "Cancel") < 0.5
     assert sim("", "x") == 0.0
 

@@ -96,18 +96,55 @@ def _walk(c: Comp):
         yield from _walk(k)
 
 
-class Table(Comp):
-    """A GuiTableControl with 10 rows, 3 visible, one column 'Amount' (GetCell is visible-relative)."""
+class Scrollbar:
+    """A table's vertical scrollbar: setting Position is a server round trip that rebuilds the table."""
 
-    def __init__(self, cid: str, session: "Session") -> None:
+    def __init__(self, table: "Table", position: int = 0) -> None:
+        self._table = table
+        self._pos = position
+
+    @property
+    def Position(self) -> int:
+        if object.__getattribute__(self._table, "__dict__").get("stale"):
+            raise FakeComError("The object has been destroyed (stale reference).")
+        return self._pos
+
+    @Position.setter
+    def Position(self, v: int) -> None:
+        self._table._round_trip(int(v))
+
+
+class Table(Comp):
+    """A GuiTableControl with 10 rows, 3 visible, one column 'Amount' (GetCell is visible-relative).
+
+    Like real SAP GUI, scrolling (a server round trip) replaces the table object: the old proxy is
+    stale afterwards and every property access on it raises a com_error; findById gets the new one."""
+
+    def __init__(self, cid: str, session: "Session", data: Any = None, position: int = 0) -> None:
         super().__init__("GuiTableControl", cid, ContainerType=True)
         self.session = session
         self.RowCount = 10
         self.VisibleRowCount = 3
-        self.data = {r: f"{r * 100}.00" for r in range(10)}
-        self.VerticalScrollbar = type("SB", (), {})()
-        self.VerticalScrollbar.Position = 0
+        self.data = data if data is not None else {r: f"{r * 100}.00" for r in range(10)}
+        self.VerticalScrollbar = Scrollbar(self, position)
         self.Columns = Coll([type("Col", (), {"Name": "WRBTR", "Title": "Amount"})()])
+        self.stale = False
+
+    def __getattribute__(self, name: str) -> Any:
+        d = object.__getattribute__(self, "__dict__")
+        if d.get("stale") and not name.startswith("_") and name not in ("stale", "calls"):
+            raise FakeComError("The object has been destroyed (stale reference).")
+        return object.__getattribute__(self, name)
+
+    def _round_trip(self, position: int) -> None:
+        d = object.__getattribute__(self, "__dict__")
+        new = Table(d["Id"], d["session"], data=d["data"], position=position)
+        new.Columns = d["Columns"]
+        parent = d["Parent"]
+        new.Parent = parent
+        parent.kids[parent.kids.index(self)] = new
+        d["session"].table = new
+        d["stale"] = True
 
     def GetCell(self, r: int, c: int) -> Comp:
         if not (0 <= r < self.VisibleRowCount):
@@ -146,7 +183,7 @@ class Grid(Comp):
     def __setattr__(self, name: str, value: Any) -> None:
         object.__setattr__(self, name, value)
         if name == "FirstVisibleRow" and hasattr(self, "loaded"):
-            self.loaded.update(range(value, value + self.VisibleRowCount))
+            self.loaded.update(range(value, value + object.__getattribute__(self, "VisibleRowCount")))
 
     def GetCellValue(self, r: int, c: str) -> str:
         return self.values[(r, c)] if r in self.loaded else ""
@@ -485,6 +522,73 @@ def test_table_control_absolute_rows_scroll(engine):
         t.read(10, 0)
     with pytest.raises(ElementNotFound, match="Column"):
         t.read(0, "Nope")
+
+
+def test_table_scroll_refinds_by_stored_id_after_the_proxy_goes_stale(engine):
+    s = _session(engine)
+    t = s.find("wnd[0]/usr/tblSAPLTABLE")
+    old = raw(engine).table
+    assert t.read(7, 0) == "700.00"  # the scroll round trip replaced the table object
+    assert raw(engine).table is not old and t.com is raw(engine).table
+    with pytest.raises(FakeComError):
+        old.RowCount  # the pre-round-trip proxy is dead, as in real SAP GUI
+    assert t.id == "wnd[0]/usr/tblSAPLTABLE"
+    assert t.read(2, 0) == "200.00"  # scrolls back up: a second round trip
+    t.scroll_to(5)
+    assert raw(engine).table.VerticalScrollbar.Position == 5 and t.read(6, "Amount") == "600.00"
+
+
+def test_table_reads_of_off_screen_rows_work_under_dry_run_and_allow_lists(engine):
+    audit = AuditLog()
+    s = _session(engine, policy=Policy(dry_run=True), audit=audit)
+    t = s.find("wnd[0]/usr/tblSAPLTABLE")
+    assert t.read(7, 0) == "700.00"  # positioning for a read is not gated
+    assert t.read(1, 0) == "100.00"  # a row above the visible part
+    assert audit.read() == []
+    t.write(9, 0, "1.00")  # the write's scroll and the write are dry-run skipped
+    assert raw(engine).table.data[9] == "900.00"
+    assert [e["status"] for e in audit.read()] == ["dry_run", "dry_run"]
+    t.scroll_to(0)  # an explicit scroll stays gated
+    assert raw(engine).table.VerticalScrollbar.Position == 1
+    s2 = _session(engine, policy=Policy(allow=['edit[name="Amount"]'], confirm_patterns=()))
+    assert s2.find("wnd[0]/usr/tblSAPLTABLE").read(4, 0) == "400.00"
+
+
+def test_table_column_without_name_falls_back_to_title_and_first_cell(engine):
+    s = _session(engine)
+    raw(engine).table.Columns = Coll([type("Col", (), {"Title": "Amount"})()])  # GuiTableColumn has no Name
+    t = s.find("wnd[0]/usr/tblSAPLTABLE")
+    assert t.columns == [("WRBTR", "Amount")]  # the name of GetCell(0, 0)
+    assert t.read(1, "WRBTR") == "100.00" and t.read(1, "amount") == "100.00"
+    with pytest.raises(ElementNotFound) as ei:
+        t.read(0, "Nope")
+    assert "WRBTR (Amount)" in str(ei.value)
+
+
+def test_grid_rows_reads_counts_once_not_per_cell(engine):
+    grid = raw(engine).grid
+    grid.RowCount, grid.VisibleRowCount = 6, 2
+    for r in range(6):
+        grid.values[(r, "BUKRS")], grid.values[(r, "BUTXT")] = f"{1000 + r}", f"Company {r}"
+    reads: dict = {}
+    real = Grid.__getattribute__
+
+    def counting(self, name):
+        if name in ("RowCount", "VisibleRowCount", "FirstVisibleRow"):
+            reads[name] = reads.get(name, 0) + 1
+        return real(self, name)
+
+    s = _session(engine)
+    g = s.find("wnd[0]/usr/cntlGRID/shellcont/shell")
+    Grid.__getattribute__ = counting  # type: ignore[method-assign]
+    try:
+        rows = g.rows()
+    finally:
+        Grid.__getattribute__ = real  # type: ignore[method-assign]
+    assert [r["BUKRS"] for r in rows] == [f"{1000 + r}" for r in range(6)]
+    assert rows[5]["BUTXT"] == "Company 5"
+    assert reads == {"RowCount": 1, "VisibleRowCount": 1, "FirstVisibleRow": 1}
+    assert g.cell(4, "BUKRS") == "1004" and g.cell(0, "BUTXT") == "Company 0"  # cell() still loads the page
 
 
 def test_grid_view_rows_load_lazily_and_write(engine):

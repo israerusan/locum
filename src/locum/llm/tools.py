@@ -84,6 +84,12 @@ class ToolResult:
     is_error: bool = False
     data: Any = None
 
+    def __post_init__(self) -> None:
+        # Text reaches the model (and MCP clients): registered secrets never do.
+        from .._secret import scrub
+
+        self.text = scrub(self.text) or self.text
+
     @classmethod
     def ok(cls, text: str = "OK", **kw: Any) -> "ToolResult":
         return cls(text=text, **kw)
@@ -954,6 +960,9 @@ class DesktopToolkit:
                         )
 
         wrapped.__name__ = name
+        # The tool's real signature, not ``**kwargs``: ToolRegistry.call rejects unknown
+        # arguments with a usable message only for functions that take no ``**kwargs``.
+        wrapped.__signature__ = _signature(method)  # type: ignore[attr-defined]
         return wrapped
 
     # ----------------------------------------------------------------- helpers

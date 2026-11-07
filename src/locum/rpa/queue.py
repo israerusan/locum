@@ -1594,6 +1594,10 @@ class WorkQueue:
     def export_csv(self, path: PathLike, *, encoding: str = "utf-8") -> str:
         """Write a flat CSV report: id, reference, status, attempts, error, payload and output fields.
 
+        Text cells starting with ``=``, ``+``, ``-``, ``@``, a tab or a carriage return
+        get a leading ``'`` so a spreadsheet shows them instead of running them as a
+        formula (CSV injection); numbers are written as they are.
+
         Output fields are ``output.<k>`` columns; a payload field whose name is already a
         column (``status``, ``id``, ``error``...) is written as ``payload.<k>``.
         """
@@ -1618,9 +1622,9 @@ class WorkQueue:
             # read the payload value in place of the queue's own column.
             taken = set(base) | set(output_keys)
             payload_headers = [f"payload.{k}" if str(k) in taken else k for k in payload_keys]
-            w.writerow(base + payload_headers + output_keys)
+            w.writerow([_cell(h) for h in base + payload_headers + output_keys])
             for it in items:
-                row = [it.id, it.reference or "", it.status, it.attempts, it.error_type or "", it.error or ""]
+                row = [_cell(it.id), _cell(it.reference), it.status, it.attempts, _cell(it.error_type), _cell(it.error)]
                 row += [_cell(it.payload.get(k, "")) for k in payload_keys]
                 row += [_cell(it.output.get(k[len("output."):], "")) for k in output_keys]
                 w.writerow(row)
@@ -1631,7 +1635,15 @@ class WorkQueue:
         return f"<WorkQueue {self.name!r} total={s['total']} new={s[NEW]} success={s[SUCCESS]} failed={s[FAILED]} business={s[BUSINESS_EXCEPTION]}>"
 
 
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _cell(v: Any) -> str:
+    """A CSV cell; text a spreadsheet would run as a formula (``=HYPERLINK(...)``) gets a ``'`` prefix."""
     if isinstance(v, (dict, list)):
         return json.dumps(v, ensure_ascii=False, default=str)
-    return "" if v is None else str(v)
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return "'" + v if v.startswith(_FORMULA_START) else v
+    return str(v)

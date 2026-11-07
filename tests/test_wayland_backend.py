@@ -44,7 +44,14 @@ from locum.backends.wayland import (
     parse_streams,
 )
 from locum.backends.wayland import _portal as P
-from locum.backends.wayland.backend import BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE
+from locum.backends.wayland.backend import (
+    BTN_LEFT,
+    BTN_MIDDLE,
+    BTN_RIGHT,
+    BTN_SIDE,
+    MUTTER_DISPLAY_CONFIG,
+    MUTTER_LAYOUT_LOGICAL,
+)
 from locum.errors import BackendError, BackendUnavailable, NotSupported, PermissionDenied, TargetLost
 from locum.types import MouseButton, Point, Rect
 
@@ -95,7 +102,7 @@ class FakeBus(PortalBus):
                  devices: int = 3, streams: Optional[List[Tuple[int, Dict[str, Any]]]] = None,
                  restore_token: Optional[str] = "token-2", screenshot_path: Optional[str] = None,
                  responses: Optional[Dict[str, int]] = None, silent: Tuple[str, ...] = (),
-                 old_portal: bool = False) -> None:
+                 old_portal: bool = False, mutter: Any = None) -> None:
         self.unique_name = UNIQUE
         self.versions = {P.REMOTE_DESKTOP: 2, P.SCREEN_CAST: 4, P.SCREENSHOT: 2} if versions is None else versions
         self.available = available
@@ -107,6 +114,9 @@ class FakeBus(PortalBus):
         self.responses = responses or {}  # method -> response code
         self.silent = silent  # methods that never answer
         self.old_portal = old_portal  # ignores handle_token, answers later on its own path
+        # None: not GNOME (no org.gnome.Mutter.DisplayConfig on the bus); "denied": mutter
+        # refuses GetCurrentState; else (layout_mode, [(x, y, scale), ...]) of its logical monitors.
+        self.mutter = mutter
         self.calls: List[Tuple[str, str, str, str, Tuple[Any, ...]]] = []
         self.events: List[Tuple[Any, ...]] = []
         self.watches: List[FakeWatch] = []
@@ -141,6 +151,15 @@ class FakeBus(PortalBus):
             if prop == "AvailableDeviceTypes":
                 return (("u", self.available),)
             raise P.PortalError("org.freedesktop.DBus.Error.UnknownProperty")
+        if destination == MUTTER_DISPLAY_CONFIG:
+            if self.mutter is None:
+                raise P.PortalError("org.freedesktop.DBus.Error.ServiceUnknown: no such name",
+                                    "org.freedesktop.DBus.Error.ServiceUnknown")
+            if self.mutter == "denied":
+                raise P.PortalError("org.freedesktop.DBus.Error.AccessDenied", "org.freedesktop.DBus.Error.AccessDenied")
+            mode, monitors = self.mutter
+            logical = [(x, y, sc, 0, i == 0, [], {}) for i, (x, y, sc) in enumerate(monitors)]
+            return (1, [], logical, {"layout-mode": ("u", mode)})
         if (interface, member) in ASYNC_METHODS:
             return self._async(interface, member, body)
         if member.startswith("Notify") and body[0] != self.session_handle():
@@ -182,6 +201,21 @@ class FakeBus(PortalBus):
             self.emit(path, P.REQUEST, "Response", signal)  # lost unless already subscribed
         return (path,)
 
+    def landed(self) -> List[Tuple[float, float]]:
+        """Where each NotifyPointerMotionAbsolute put the pointer, the way the compositor
+        maps it: mutter with scaled stage views reads stream coordinates in physical pixels
+        (``layout.x + stream_x / scale``); other portals take them as logical offsets."""
+        rects = {node: P.unwrap_vardict(props) for node, props in self.streams}
+        scales: Dict[Tuple[int, int], float] = {}
+        if self.mutter not in (None, "denied") and self.mutter[0] == MUTTER_LAYOUT_LOGICAL:
+            scales = {(x, y): sc for x, y, sc in self.mutter[1]}
+        out = []
+        for node, sx, sy in self.notify_calls("NotifyPointerMotionAbsolute"):
+            x, y = rects[node].get("position", (0, 0))
+            scale = scales.get((x, y), 1.0)
+            out.append((x + sx / scale, y + sy / scale))
+        return out
+
     def notify_calls(self, member: Optional[str] = None) -> List[Tuple[Any, ...]]:
         return [c[4][2:] for c in self.calls if c[2].startswith("Notify") and (member is None or c[2] == member)]
 
@@ -202,6 +236,17 @@ def _to_uri_path(path: str) -> str:
     from urllib.request import pathname2url
 
     return pathname2url(path) if path else ""
+
+
+@pytest.fixture(autouse=True)
+def _pictures_dir(tmp_path, monkeypatch):
+    """The XDG Pictures directory is the test's tmp_path: screenshots written there by the
+    fake portal are the ones the backend may delete."""
+    cfg = tmp_path / "xdg-config"
+    cfg.mkdir()
+    (cfg / "user-dirs.dirs").write_text(f'# comment\nXDG_PICTURES_DIR="{tmp_path}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    return tmp_path
 
 
 def make(bus: Optional[FakeBus] = None, tmp_path: Any = None, **kw: Any) -> Tuple[WaylandBackend, FakeBus]:
@@ -406,6 +451,107 @@ def test_release_all_and_close_release_held_input():
         be.key_down("a")
 
 
+def test_release_all_releases_in_reverse_press_order():
+    be, bus = make()
+    be.key_down("ctrl")
+    be.key_down("shift")
+    be.mouse_down(MouseButton.LEFT)
+    be.mouse_down(MouseButton.RIGHT)
+    be.release_all()
+    assert bus.notify_calls()[4:] == [(BTN_RIGHT, 0), (BTN_LEFT, 0), (0xFFE1, 0), (0xFFE3, 0)]
+    be.key_down("alt")
+    be.key_down("x")
+    be.close()
+    assert bus.notify_calls()[-2:] == [(0x78, 0), (0xFFE9, 0)]
+
+
+class _GatedBus(FakeBus):
+    """The Start dialog stays open until ``gate`` is set."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        import threading
+
+        self.gate, self.entered = threading.Event(), threading.Event()
+        self.start_path: Optional[str] = None
+
+    def _async(self, interface, member, body):
+        if member != "Start":
+            return super()._async(interface, member, body)
+        self.silent = ("Start",)
+        reply = super()._async(interface, member, body)
+        self.silent = ()
+        self.start_path = reply[0]
+        self.deferred[reply[0]] = (P.RESPONSE_SUCCESS, {"devices": ("u", self.devices),
+                                                        "streams": ("a(ua{sv})", self.streams)})
+        return reply
+
+    def watch(self, path, interface, member):
+        w = super().watch(path, interface, member)
+        bus, real_wait = self, w.wait
+
+        def wait(timeout):
+            if path == bus.start_path:
+                bus.entered.set()
+                if not bus.gate.wait(timeout):
+                    raise TimeoutError
+            return real_wait(timeout)
+
+        w.wait = wait  # type: ignore[method-assign]
+        return w
+
+
+def test_open_approval_dialog_does_not_block_release_all_or_close():
+    import threading
+    import time
+
+    bus = _GatedBus()
+    be, _ = make(bus=bus, approval_timeout=10.0)
+    errors: List[BaseException] = []
+
+    def start():
+        try:
+            be.start_session()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t = threading.Thread(target=start, daemon=True)
+    t.start()
+    assert bus.entered.wait(5.0)
+    t0 = time.monotonic()
+    be.release_all()  # nothing held, no session yet: returns at once
+    assert be.capabilities
+    be.close()
+    assert time.monotonic() - t0 < 1.0
+    bus.gate.set()
+    t.join(5.0)
+    assert not t.is_alive()
+    assert errors and isinstance(errors[0], BackendError)  # closed meanwhile: the new session is closed
+    assert bus.calls[-1][1:3] == (P.SESSION, "Close")
+
+
+def test_abort_ends_the_wait_for_the_approval_dialog():
+    from locum.errors import FailSafeTriggered
+    from locum.failsafe import abort, reset_abort
+
+    class AbortingBus(FakeBus):
+        def _async(self, interface, member, body):
+            if member == "Start":
+                abort("stop")  # the user hits the kill switch while the dialog is open
+            return super()._async(interface, member, body)
+
+    be, bus = make(bus=AbortingBus(silent=("Start",)), approval_timeout=30.0)
+    try:
+        with pytest.raises(FailSafeTriggered, match="stop"):
+            be.start_session()
+    finally:
+        reset_abort()
+    closes = [c for c in bus.calls if c[2] == "Close"]
+    assert any(c[1] == P.REQUEST for c in closes)  # the dialog is dismissed
+    assert any(c[1] == P.SESSION for c in closes)
+    assert be.session_handle is None
+
+
 def test_keyboard_only_session_refuses_the_pointer():
     be, _ = make(bus=FakeBus(devices=P.DEVICE_KEYBOARD))
     be.key_down("a")
@@ -508,6 +654,66 @@ def test_pointer_position_is_unknown_until_moved_and_mouse_jumps():
     assert m.position() == Point(310, 200)
 
 
+TWO_STREAMS = [
+    (42, {"position": ("(ii)", (0, 0)), "size": ("(ii)", (1920, 1080))}),
+    (43, {"position": ("(ii)", (1920, 0)), "size": ("(ii)", (1280, 1024))}),
+]
+
+
+def test_scaled_mutter_streams_get_physical_offsets():
+    # GNOME, fractional scaling on: the left monitor is 2x, the right one 1x. The portal
+    # reports logical sizes, mutter reads stream coordinates as layout.x + stream_x / scale.
+    bus = FakeBus(streams=TWO_STREAMS, mutter=(MUTTER_LAYOUT_LOGICAL, [(0, 0, 2.0), (1920, 0, 1.0)]))
+    be, _ = make(bus=bus)
+    be.mouse_move(1000, 500)
+    be.mouse_move(2000, 10)
+    assert bus.notify_calls("NotifyPointerMotionAbsolute") == [(42, 2000.0, 1000.0), (43, 80.0, 10.0)]
+    assert bus.landed() == [(1000.0, 500.0), (2000.0, 10.0)]
+    assert be.mouse_position() == Point(2000, 10)
+
+
+def test_fractional_and_physical_mutter_layouts():
+    st = [(42, {"size": ("(ii)", (1280, 720))})]
+    bus = FakeBus(streams=st, mutter=(MUTTER_LAYOUT_LOGICAL, [(0, 0, 1.5)]))
+    be, _ = make(bus=bus)
+    be.mouse_move(640, 360)
+    assert bus.notify_calls("NotifyPointerMotionAbsolute") == [(42, 960.0, 540.0)]
+    assert bus.landed() == [(640.0, 360.0)]
+    # "physical" layout mode (no scaled stage views): coordinates are taken as given
+    bus = FakeBus(mutter=(2, [(0, 0, 2.0)]))
+    be, _ = make(bus=bus)
+    be.mouse_move(100, 50)
+    assert bus.notify_calls("NotifyPointerMotionAbsolute") == [(42, 100.0, 50.0)]
+
+
+def test_unreadable_mutter_scale_comes_from_one_screenshot(tmp_path):
+    path = _png(tmp_path, (3840, 2160))  # a 2x monitor; the stream says 1920x1080 logical
+    bus = FakeBus(mutter="denied", screenshot_path=path)
+    be, _ = make(bus=bus)
+    be.mouse_move(1000, 500)
+    be.mouse_move(10, 10)
+    assert bus.notify_calls("NotifyPointerMotionAbsolute") == [(42, 2000.0, 1000.0), (42, 20.0, 20.0)]
+    assert bus.members().count("Screenshot") == 1  # once per session
+    assert not os.path.exists(path)
+
+
+def test_unknown_motion_scale_refuses_absolute_moves(tmp_path):
+    # mutter's configuration is unreadable and two monitors share one (2x) screenshot: the
+    # per-monitor scale is unknowable, so nothing is sent rather than a misplaced move.
+    path = _png(tmp_path, (6400, 2160))
+    bus = FakeBus(streams=TWO_STREAMS, mutter="denied", screenshot_path=path)
+    be, _ = make(bus=bus)
+    with pytest.raises(NotSupported, match="scale"):
+        be.mouse_move(1000, 500)
+    # a stream at a position mutter does not list
+    bus = FakeBus(streams=TWO_STREAMS, mutter=(MUTTER_LAYOUT_LOGICAL, [(0, 0, 2.0)]))
+    be, _ = make(bus=bus)
+    be.mouse_move(10, 10)
+    with pytest.raises(NotSupported, match="scale"):
+        be.mouse_move(2000, 10)
+    assert bus.notify_calls("NotifyPointerMotionAbsolute") == [(42, 20.0, 20.0)]
+
+
 # ============================================================================ screenshots
 def _png(tmp_path, size, name="shot.png"):
     w, h = size
@@ -577,6 +783,40 @@ def test_keep_screenshots_and_capture_only_mode(tmp_path):
         be.mouse_move(1, 1)
 
 
+def test_screenshot_files_are_deleted_only_when_they_are_the_portals(tmp_path, monkeypatch):
+    pictures, other = tmp_path / "Bilder", tmp_path / "elsewhere"
+    shots = pictures / "Bildschirmfotos"
+    shots.mkdir(parents=True)
+    other.mkdir()
+    cfg = tmp_path / "cfg2"
+    cfg.mkdir()
+    (cfg / "user-dirs.dirs").write_text(f'XDG_PICTURES_DIR="{pictures}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    # Inside the (localized) Pictures directory: GNOME's own file, deleted.
+    path = _png(shots, (1920, 1080))
+    be, _ = make(bus=FakeBus(screenshot_path=path))
+    be.screenshot()
+    assert not os.path.exists(path)
+    # Outside the Pictures and temporary directories: left alone (e.g. a forged uri).
+    path = _png(other, (1920, 1080))
+    be, _ = make(bus=FakeBus(screenshot_path=path))
+    assert be.screenshot().size == (1920, 1080)
+    assert os.path.exists(path)
+    # Not an image: never deleted, even in the Pictures directory.
+    bad = pictures / "notes.txt"
+    bad.write_text("my notes")
+    be, _ = make(bus=FakeBus(screenshot_path=str(bad)))
+    with pytest.raises(BackendError, match="Cannot read"):
+        be.screenshot()
+    assert bad.read_text() == "my notes"
+    # An old file, not written by this request: kept.
+    path = _png(pictures, (1920, 1080), name="old.png")
+    os.utime(path, (1_000_000_000, 1_000_000_000))
+    be, _ = make(bus=FakeBus(screenshot_path=path))
+    be.screenshot()
+    assert os.path.exists(path)
+
+
 def test_screenshot_portal_missing_or_denied(tmp_path):
     be, _ = make(bus=FakeBus(versions={P.REMOTE_DESKTOP: 2, P.SCREEN_CAST: 4}))
     with pytest.raises(NotSupported, match="Screenshot"):
@@ -596,6 +836,9 @@ def test_capabilities_before_the_session_show_no_dialog():
     notes = be.limitations()
     assert any("not yet validated" in n for n in notes)
     assert any("not started" in n for n in notes)
+    stop = next(n for n in notes if "emergency stop" in n)
+    assert "no reliable emergency stop" in stop and "XWayland" in stop and "Ctrl+C" in stop
+    assert any("flash" in n and "Pictures" in n for n in notes)  # GNOME's screenshot side effects
 
 
 def test_cli_info_reports_limitations(monkeypatch):
@@ -772,6 +1015,20 @@ def test_window_belongs_to_same_app_dialog_only():
     assert not be.window_belongs_to(h["Terminal"], h["Notes - Editor"])
 
 
+def test_fallback_window_handle_does_not_move_to_a_sibling():
+    # Without a D-Bus identity the handle uses the index in the application, which
+    # shifts when a sibling closes: it must then stop matching, not name another window.
+    desk, main, dlg, *_ = _desktop()
+    be, _ = make(accessibility=FakeAtspi(desk))
+    h = {w.title: w.handle for w in be.list_windows()}
+    stored = h["Save?"]  # index 0 of the editor
+    dlg.par.kids.remove(dlg)  # the dialog closes; the main window moves to index 0
+    now = {w.title: w.handle for w in be.list_windows()}
+    assert stored not in now.values()
+    with pytest.raises(NotSupported, match="no longer known"):
+        be.window_belongs_to(stored, now["Notes - Editor"])
+
+
 def test_window_control_is_not_supported():
     desk, *_ = _desktop()
     be, _ = make(accessibility=FakeAtspi(desk))
@@ -880,11 +1137,18 @@ def test_missing_jeepney_is_backend_unavailable_with_hint(monkeypatch):
 
 
 # ============================================================================ jeepney adapter
-def test_jeepney_bus_adapter_messages():
-    jeepney = pytest.importorskip("jeepney")
+PORTAL_UNIQUE = ":1.3"
+
+
+def _fake_jeepney_conn(add_match_fails: bool = False):
+    """A stand-in for jeepney's blocking connection; ``incoming`` messages are read by
+    ``recv_until_filtered``, which (like jeepney's) waits ``timeout`` when nothing comes."""
+    import threading
+    import time
+
     from jeepney.io.common import FilterHandle, MessageFilters
-    from jeepney.low_level import HeaderFields, MessageType
-    from jeepney.wrappers import new_error, new_method_return, new_signal, DBusAddress
+    from jeepney.low_level import HeaderFields
+    from jeepney.wrappers import new_error, new_method_return
 
     class FakeConn:
         unique_name = ":1.7"
@@ -893,23 +1157,31 @@ def test_jeepney_bus_adapter_messages():
             self.sent = []
             self._filters = MessageFilters()
             self.incoming = []
+            self.in_recv = threading.Event()
 
         def send_and_get_reply(self, msg, *, timeout=None):
             self.sent.append(msg)
             member = msg.header.fields.get(HeaderFields.member)
-            if member == "Fail":
+            if member == "Fail" or (member == "AddMatch" and add_match_fails):
                 return new_error(msg, "org.example.Error.Nope", "s", ("nope",))
             if member == "Get":
                 return new_method_return(msg, "v", (("u", 3),))
+            if member == "GetNameOwner":
+                return new_method_return(msg, "s", (PORTAL_UNIQUE,))
             return new_method_return(msg)
 
         def filter(self, rule, *, queue=None, bufsize=1):
             return FilterHandle(self._filters, rule, queue if queue is not None else collections.deque(maxlen=bufsize))
 
         def recv_until_filtered(self, queue, *, timeout=None):
+            end = time.monotonic() + (timeout or 0)
             while not queue:
+                self.in_recv.set()
                 if not self.incoming:
-                    raise TimeoutError
+                    if time.monotonic() >= end:
+                        raise TimeoutError
+                    time.sleep(0.005)
+                    continue
                 msg = self.incoming.pop(0)
                 for f in self._filters.matches(msg):
                     f.queue.append(msg)
@@ -918,7 +1190,24 @@ def test_jeepney_bus_adapter_messages():
         def close(self):
             self.closed = True
 
-    conn = FakeConn()
+    return FakeConn()
+
+
+def _signal(path, member, signature, body, sender=PORTAL_UNIQUE):
+    from jeepney.low_level import HeaderFields
+    from jeepney.wrappers import DBusAddress, new_signal
+
+    msg = new_signal(DBusAddress(path, interface=P.REQUEST), member, signature, body)
+    if sender:
+        msg.header.fields[HeaderFields.sender] = sender  # the bus daemon stamps it
+    return msg
+
+
+def test_jeepney_bus_adapter_messages():
+    pytest.importorskip("jeepney")
+    from jeepney.low_level import HeaderFields, MessageType
+
+    conn = _fake_jeepney_conn()
     bus = P.JeepneyBus(conn)
     assert bus.unique_name == ":1.7"
     assert PortalClient(bus).version(P.SCREENSHOT) == 3
@@ -937,9 +1226,8 @@ def test_jeepney_bus_adapter_messages():
     add = conn.sent[-1]
     assert add.header.fields[HeaderFields.member] == "AddMatch"
     assert f"path='{path}'" in add.body[0] and "member='Response'" in add.body[0]
-    emitter = DBusAddress(path, interface=P.REQUEST)
-    conn.incoming.append(new_signal(DBusAddress("/other", interface=P.REQUEST), "Response", "ua{sv}", (2, {})))
-    conn.incoming.append(new_signal(emitter, "Response", "ua{sv}", (0, {"uri": ("s", "file:///x.png")})))
+    conn.incoming.append(_signal("/other", "Response", "ua{sv}", (2, {})))
+    conn.incoming.append(_signal(path, "Response", "ua{sv}", (0, {"uri": ("s", "file:///x.png")})))
     body = w.wait(1.0)
     assert body == (0, {"uri": ("s", "file:///x.png")})
     assert w.poll() is None
@@ -948,6 +1236,58 @@ def test_jeepney_bus_adapter_messages():
     w.close()
     assert conn.sent[-1].header.fields[HeaderFields.member] == "RemoveMatch"
     assert conn.sent[-1].header.message_type == MessageType.method_call
+
+
+def test_jeepney_watch_ignores_responses_not_sent_by_the_portal():
+    pytest.importorskip("jeepney")
+    from jeepney.low_level import HeaderFields
+
+    conn = _fake_jeepney_conn()
+    bus = P.JeepneyBus(conn)
+    path = "/org/freedesktop/portal/desktop/request/1_7/t2"
+    w = bus.watch(path, P.REQUEST, "Response")
+    owner = next(m for m in conn.sent if m.header.fields.get(HeaderFields.member) == "GetNameOwner")
+    assert owner.body == (P.PORTAL_BUS_NAME,)
+    assert f"sender='{PORTAL_UNIQUE}'" in conn.sent[-1].body[0]  # the bus daemon filters too
+    forged = (0, {"uri": ("s", "file:///home/u/.ssh/id_ed25519")})
+    conn.incoming.append(_signal(path, "Response", "ua{sv}", forged, sender=":1.99"))
+    conn.incoming.append(_signal(path, "Response", "ua{sv}", forged, sender=None))
+    with pytest.raises(TimeoutError):
+        w.wait(0.05)
+    conn.incoming.append(_signal(path, "Response", "ua{sv}", (0, {})))
+    assert w.wait(1.0) == (0, {})
+    w.close()
+
+
+def test_jeepney_watch_closes_its_filter_when_add_match_fails():
+    pytest.importorskip("jeepney")
+    conn = _fake_jeepney_conn(add_match_fails=True)
+    bus = P.JeepneyBus(conn)
+    with pytest.raises(P.PortalError):
+        bus.watch("/org/freedesktop/portal/desktop/request/1_7/t3", P.REQUEST, "Response")
+    assert len(conn._filters.filters) == 0  # no leaked filter keeps collecting messages
+
+
+def test_jeepney_wait_does_not_hold_the_bus_lock():
+    import threading
+    import time
+
+    pytest.importorskip("jeepney")
+    conn = _fake_jeepney_conn()
+    bus = P.JeepneyBus(conn)
+    path = "/org/freedesktop/portal/desktop/request/1_7/t4"
+    w = bus.watch(path, P.REQUEST, "Response")
+    got: List[Any] = []
+    waiter = threading.Thread(target=lambda: got.append(w.wait(5.0)), daemon=True)
+    waiter.start()
+    assert conn.in_recv.wait(2.0)
+    t0 = time.monotonic()
+    bus.call(P.PORTAL_PATH, P.REMOTE_DESKTOP, "NotifyKeyboardKeysym", "", ())  # e.g. release_all()
+    assert time.monotonic() - t0 < 1.0
+    conn.incoming.append(_signal(path, "Response", "ua{sv}", (0, {})))
+    waiter.join(2.0)
+    assert got == [(0, {})]
+    w.close()
 
 
 # ============================================================================ real session
@@ -964,8 +1304,11 @@ def test_real_portal_session():  # pragma: no cover - needs a real session
         img = be.screenshot(Rect(mons[0].rect.left, mons[0].rect.top, 64, 64))
         assert img.size == (64, 64)
         c = mons[0].rect.center
-        be.mouse_move(c.x, c.y)
-        assert be.mouse_position() == c
+        be.mouse_move(c.x, c.y)  # must not raise (the stream's scale was determined)
+        # Where the pointer landed cannot be checked here: Wayland reports the pointer
+        # position to no client, AT-SPI has no pointer query, and portal screenshots do
+        # not reliably include the cursor. be.mouse_position() only echoes the position
+        # locum sent, so asserting it would prove nothing. Verify landing by eye.
     finally:
         be.close()
 

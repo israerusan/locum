@@ -362,7 +362,7 @@ def test_tool_calls_free_the_shared_trees():
     kit = DesktopToolkit(Desktop(be, failsafe=False, sleep=lambda s: None, default_timeout=0), Policy())
     selector_for(_node(be, ok), roots=be.accessibility_roots(), prefix_cache=[])
     assert sel_mod._TREES.trees
-    kit.call("find_elements", {"query": "OK"})
+    kit.call("find_elements", {"text": "OK"})
     assert not getattr(sel_mod._TREES, "trees", None)
 
 

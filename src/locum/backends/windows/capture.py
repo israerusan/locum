@@ -4,7 +4,9 @@
 shows the window's own content even where other windows cover it or it extends
 past the monitors. ``PW_RENDERFULLCONTENT`` (Windows 8.1+) renders through DWM,
 which also captures DirectX / Chromium / UWP content; when that comes back
-blank, the classic ``WM_PRINT`` path (flags 0) is tried.
+blank, the classic ``WM_PRINT`` path (flags 0) is tried. A classic print
+whose client area comes back black (content drawn through DirectX, which
+``WM_PRINT`` cannot see) counts as a failure too.
 
 The capture runs with the calling thread per-monitor DPI aware, so window
 rectangles and the bitmap are in physical pixels whatever the process
@@ -33,14 +35,30 @@ from ._win32api import (
     DPI_AWARENESS_UNAWARE,
     LPVOID,
     MONITOR_DEFAULTTONEAREST,
+    POINT,
     PW_RENDERFULLCONTENT,
+    RECT,
     SW_SHOWMINNOACTIVE,
     SW_SHOWNOACTIVATE,
+    WINDOWPLACEMENT,
+    WPF_RESTORETOMAXIMIZED,
 )
 from .screen import _bgrx_image, _bitmap_info
 
 #: Largest bitmap side PrintWindow is asked to fill (GDI's own coordinate limit).
 _MAX_SIDE = 32767
+
+
+#: Highest channel value a pixel of a "black" client area may have (PrintWindow failure).
+_BLACK_MAX = 8
+
+
+def _is_black(img: Any) -> bool:
+    """Whether every pixel of ``img`` is (near-)black."""
+    ext = img.getextrema()
+    if ext and not isinstance(ext[0], tuple):  # single-band image
+        ext = (ext,)
+    return all(hi <= _BLACK_MAX for _lo, hi in ext)
 
 
 def _is_parked(r: Rect) -> bool:
@@ -129,6 +147,22 @@ class _CaptureMixin:
         except Exception:
             return 1.0
 
+    def _client_box(self, hwnd: int, outer: Rect) -> Optional[Tuple[int, int, int, int]]:
+        """The client area as a crop box of the outer-window image (None when unknown or empty)."""
+        a = self._api
+        get_client, to_screen = getattr(a, "GetClientRect", None), getattr(a, "ClientToScreen", None)
+        if get_client is None or to_screen is None:
+            return None
+        rc, pt = RECT(), POINT(0, 0)
+        try:
+            if not get_client(hwnd, ctypes.byref(rc)) or not to_screen(hwnd, ctypes.byref(pt)):
+                return None
+        except Exception:
+            return None
+        left, top = pt.x - outer.left, pt.y - outer.top
+        box = (max(0, left), max(0, top), min(outer.width, left + rc.right), min(outer.height, top + rc.bottom))
+        return box if box[2] > box[0] and box[3] > box[1] else None
+
     def _window_image(self, hwnd: int) -> Any:
         """The window's visible frame (DWM bounds) rendered by PrintWindow; NotSupported if blank."""
         outer = self._outer_rect(hwnd)
@@ -155,6 +189,12 @@ class _CaptureMixin:
                     lw, lh = max(1, int(round(w / scale))), max(1, int(round(h / scale)))
                     resample = getattr(Image, "Resampling", Image).LANCZOS
                     img = img.crop((0, 0, lw, lh)).resize((w, h), resample)
+                client = self._client_box(hwnd, outer)
+                if client is not None and _is_black(img.crop(client)):
+                    # WM_PRINT of a window that draws its content through DirectX /
+                    # DirectComposition: the frame paints, the client area stays black.
+                    outcomes.append(f"PrintWindow(flags={flags}) returned a black client area")
+                    continue
             if box != full:
                 img = img.crop(box)
             if not is_blank_image(img):
@@ -192,6 +232,10 @@ class _CaptureMixin:
                     "change), or restore it first."
                 )
             with self._lock:
+                # SW_SHOWNOACTIVATE shows the window at its normal size and clears
+                # WPF_RESTORETOMAXIMIZED: the placement is read first so that a window
+                # minimized while maximized still comes back maximized for the user.
+                placement = self._placement(hwnd)
                 a.ShowWindow(hwnd, SW_SHOWNOACTIVATE)  # restores without activation or focus change
                 try:
                     self._sleep(self.RESTORE_SETTLE)
@@ -199,3 +243,29 @@ class _CaptureMixin:
                 finally:
                     if a.IsWindow(hwnd) and not a.IsIconic(hwnd):
                         a.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)  # minimize again, activating nothing
+                    if placement is not None and placement.flags & WPF_RESTORETOMAXIMIZED and a.IsWindow(hwnd):
+                        self._restore_placement(hwnd, placement)
+
+    def _placement(self, hwnd: int) -> Optional[WINDOWPLACEMENT]:
+        fn = getattr(self._api, "GetWindowPlacement", None)
+        if fn is None:
+            return None
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        try:
+            return wp if fn(hwnd, ctypes.byref(wp)) else None
+        except Exception:
+            return None
+
+    def _restore_placement(self, hwnd: int, placement: WINDOWPLACEMENT) -> None:
+        """Put back the minimized window's original placement (its WPF_RESTORETOMAXIMIZED
+        flag) without activating it."""
+        fn = getattr(self._api, "SetWindowPlacement", None)
+        if fn is None:
+            return
+        placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+        placement.showCmd = SW_SHOWMINNOACTIVE
+        try:
+            fn(hwnd, ctypes.byref(placement))
+        except Exception:
+            pass

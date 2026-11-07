@@ -606,10 +606,13 @@ class SapComponent:
     def __init__(self, com: Any, session: SapSession) -> None:
         self.com = com
         self.session = session
+        # Captured once: after a server round trip the COM proxy can be stale (its properties raise),
+        # but the id still finds the rebuilt component.
+        self._id = _relative_id(str(_get(com, "Id", "") or ""))
 
     @property
     def id(self) -> str:
-        return _relative_id(str(_get(self.com, "Id", "") or ""))
+        return self._id or _relative_id(str(_get(self.com, "Id", "") or ""))
 
     @property
     def type(self) -> str:
@@ -878,9 +881,18 @@ class SapTableControl(SapComponent):
 
     @property
     def columns(self) -> List[Tuple[str, str]]:
-        """``[(name, title), ...]`` in display order."""
-        return [(str(_get(c, "Name", "") or ""), str(_get(c, "Title", "") or ""))
-                for c in _items(_get(self.com, "Columns"))]
+        """``[(name, title), ...]`` in display order. ``GuiTableColumn`` documents ``Title`` but not
+        always ``Name``; without one, the name is that of the column's first cell (``GetCell(0, i).Name``)."""
+        out = []
+        for i, c in enumerate(_items(_get(self.com, "Columns"))):
+            name = str(_get(c, "Name", "") or "")
+            if not name:
+                try:
+                    name = str(_get(self.com.GetCell(0, i), "Name", "") or "")
+                except Exception:  # noqa: BLE001 - no visible row
+                    name = ""
+            out.append((name, str(_get(c, "Title", "") or "")))
+        return out
 
     def _column(self, col: Union[int, str]) -> int:
         if isinstance(col, int):
@@ -893,18 +905,21 @@ class SapTableControl(SapComponent):
         for i, (name, title) in enumerate(cols):
             if low in (name.lower(), title.lower()):
                 return i
-        raise ElementNotFound(f"Column {col!r} not in SAP table {self.id!r}; columns: "
-                              + ", ".join(t or n for n, t in cols))
+        listed = ", ".join(f"{n} ({t})" if n and t else (n or t or f"#{i}") for i, (n, t) in enumerate(cols))
+        raise ElementNotFound(f"Column {col!r} not in SAP table {self.id!r}; columns (name and title, or index): "
+                              f"{listed or 'none'}")
 
     def _refind(self) -> None:
+        # The id captured at construction: the old proxy is stale after the round trip.
         self.com = self.session._find_raw(self.id)
 
     def _top(self) -> int:
         sb = _get(self.com, "VerticalScrollbar")
         return int(_get(sb, "Position", 0) or 0) if sb is not None else 0
 
-    def scroll_to(self, row: int) -> "SapTableControl":
-        """Make ``row`` the first visible row."""
+    def _scroll(self, row: int, *, gated: bool) -> bool:
+        """Scroll ``row`` to the top; ``False`` when the policy skipped it (dry run). A scroll that
+        only positions the table for a read is not gated."""
         sb = _get(self.com, "VerticalScrollbar")
         if sb is None:
             raise NotSupported(f"SAP table {self.id!r} has no vertical scrollbar")
@@ -912,34 +927,66 @@ class SapTableControl(SapComponent):
         def move() -> None:
             sb.Position = int(row)
 
-        self._act("scroll", f"scroll to row {row} of", move, activates=False, args={"row": int(row)})
-        self._refind()  # the table object is rebuilt after the round trip
+        if gated:
+            done = self.session._run("scroll", {"target": self.id, "row": int(row)},
+                                     self.session._ctx(self, activates=False),
+                                     f"scroll to row {row} of {self.label or self.id!r}", move)
+        else:
+            try:
+                move()
+            except Exception as exc:  # noqa: BLE001 - pywintypes.com_error
+                raise BackendError(f"SAP GUI refused to scroll to row {row} of {self.id!r} "
+                                   f"({_com_message(exc)})") from exc
+            self.session.wait_ready()
+            done = True
+        if done:
+            self._refind()  # the table object is rebuilt after the round trip
+        return done
+
+    def scroll_to(self, row: int) -> "SapTableControl":
+        """Make ``row`` the first visible row."""
+        self._scroll(int(row), gated=True)
         return self
 
-    def _visible_row(self, row: int) -> int:
-        if row < 0 or (self.row_count and row >= self.row_count):
-            raise IndexError(f"Row {row} outside SAP table {self.id!r} ({self.row_count} rows)")
+    def _visible_row(self, row: int, *, gated: bool = False) -> Optional[int]:
+        """``row`` relative to the visible part, scrolling first; ``None`` when a gated scroll was skipped."""
+        n = self.row_count
+        if row < 0 or (n and row >= n):
+            raise IndexError(f"Row {row} outside SAP table {self.id!r} ({n} rows)")
         top, vis = self._top(), self.visible_row_count
         if vis and not (top <= row < top + vis):
-            self.scroll_to(row)
+            if not self._scroll(row, gated=gated):
+                return None
             top = self._top()
         return row - top
 
-    def cell(self, row: int, col: Union[int, str]) -> SapComponent:
-        """The cell component (a text field, check box, ...) at absolute ``row``."""
+    def _cell(self, row: int, col: Union[int, str], *, gated: bool) -> Optional[SapComponent]:
         c = self._column(col)
-        r = self._visible_row(int(row))
+        r = self._visible_row(int(row), gated=gated)
+        if r is None:
+            return None
         try:
             com = self.com.GetCell(r, c)
         except Exception as exc:  # noqa: BLE001
             raise ElementNotFound(f"No cell ({row}, {col!r}) in SAP table {self.id!r} ({_com_message(exc)})") from exc
         return wrap(com, self.session)
 
+    def cell(self, row: int, col: Union[int, str]) -> SapComponent:
+        """The cell component (a text field, check box, ...) at absolute ``row``. Scrolling to an
+        off-screen row here is a read, so it is not gated."""
+        cell = self._cell(row, col, gated=False)
+        assert cell is not None
+        return cell
+
     def read(self, row: int, col: Union[int, str]) -> str:
         return self.cell(row, col).text
 
     def write(self, row: int, col: Union[int, str], text: str) -> "SapTableControl":
-        cell = self.cell(row, col)
+        cell = self._cell(row, col, gated=True)
+        if cell is None:  # dry run skipped the scroll: the write is skipped (and recorded) too
+            self._act("set_value", f"set cell ({row}, {col!r}) of", lambda: None, activates=False,
+                      args={"row": int(row), "column": str(col), "text": str(text)})
+            return self
         setter = getattr(cell, "set_text", None)
         if setter is None:
             raise NotSupported(f"Cell ({row}, {col!r}) of {self.id!r} is a {cell.type}, not a text field")
@@ -979,23 +1026,41 @@ class SapGridView(SapComponent):
             except Exception:  # noqa: BLE001
                 pass
 
-    def cell(self, row: int, col: str) -> str:
-        """The cell's text."""
-        if row < 0 or row >= self.row_count:
-            raise IndexError(f"Row {row} outside ALV grid {self.id!r} ({self.row_count} rows)")
-        self._load(int(row))
+    def _value(self, row: int, col: str) -> str:
         try:
             return str(self.com.GetCellValue(int(row), str(col)))
         except Exception as exc:  # noqa: BLE001
             raise ElementNotFound(f"No cell ({row}, {col!r}) in ALV grid {self.id!r} ({_com_message(exc)})") from exc
 
+    def cell(self, row: int, col: str) -> str:
+        """The cell's text."""
+        n = self.row_count
+        if row < 0 or row >= n:
+            raise IndexError(f"Row {row} outside ALV grid {self.id!r} ({n} rows)")
+        self._load(int(row))
+        return self._value(row, col)
+
     read = cell
 
     def rows(self, columns: Optional[Sequence[str]] = None, *, limit: Optional[int] = None) -> List[Dict[str, str]]:
-        """Every row as ``{column: text}`` (``columns``: a subset, default all)."""
+        """Every row as ``{column: text}`` (``columns``: a subset, default all). The row count and
+        visible page are read once, and ``FirstVisibleRow`` is moved once per page (each property
+        access is a cross-process COM call)."""
         cols = list(columns) if columns is not None else self.columns
-        n = self.row_count if limit is None else min(self.row_count, int(limit))
-        return [{c: self.cell(r, c) for c in cols} for r in range(n)]
+        total = self.row_count
+        n = total if limit is None else min(total, int(limit))
+        vis = int(_get(self.com, "VisibleRowCount", 0) or 0)
+        first = int(_get(self.com, "FirstVisibleRow", 0) or 0)
+        out = []
+        for r in range(n):
+            if vis and not (first <= r < first + vis):
+                try:
+                    self.com.FirstVisibleRow = r
+                except Exception:  # noqa: BLE001
+                    pass
+                first = r
+            out.append({c: self._value(r, c) for c in cols})
+        return out
 
     def write(self, row: int, col: str, text: str) -> "SapGridView":
         """Change an editable cell (``ModifyCell``)."""

@@ -160,7 +160,12 @@ def dll_name() -> str:
 def _candidates(path: Optional[str]) -> List[str]:
     name = dll_name()
     out = [p for p in (path, os.environ.get("LOCUM_JAB_DLL")) if p]
-    out.append(name)
+    out.append(name)  # the default DLL search: System32 and the application directory
+    # Python 3.8+ no longer searches PATH for DLLs (ctypes.CDLL with a bare name), so look there ourselves.
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = d.strip().strip('"')
+        if d and os.path.isfile(os.path.join(d, name)):
+            out.append(os.path.join(d, name))
     for home in (os.environ.get("JAVA_HOME"), os.environ.get("JRE_HOME")):
         if home:
             out.append(os.path.join(home, "bin", name))
@@ -281,6 +286,15 @@ _STATE_MAP = {"indeterminate": "mixed", "collapsed": "collapsed", "expanded": "e
               "enabled": "enabled", "busy": "busy", "modal": "modal", "active": "active", "pressed": "pressed"}
 #: AccessibleAction names that mean "press this control" (Swing's AbstractButton action is "click").
 CLICK_ACTIONS = ("click", "press", "activate", "doclick")
+#: Java roles whose first AccessibleAction presses them whatever its name: Swing localises the
+#: AbstractButton action (UIManager ``AbstractButton.clickText``: "Klicken", "cliquer", "hacer clic"...).
+_PRESSABLE_ROLES = frozenset({"push button", "toggle button", "check box", "radio button", "menu item",
+                              "check box menu item", "radio button menu item"})
+#: Java roles whose descendants are index-addressed proxies: ``AccessibleJTable.getAccessibleChild``
+#: (``AccessibleJTableCell``), ``AccessibleJList`` (``AccessibleJListChild``) and ``AccessibleJTree``
+#: (``AccessibleJTreeNode``) return a NEW object on every call, so ``isSameObject`` never matches them.
+#: Their children are kept by index: the node stays, its reference is swapped for the new one.
+_INDEXED_ROLES = frozenset({"table", "list", "tree", "tree table"})
 #: How far from its old position a cached child is looked for when the tree is re-read.
 _MATCH_WINDOW = 4
 
@@ -431,8 +445,14 @@ class JavaBridge:
                     return w
             return None
 
-        info = wait_until(pick, timeout, 0.2, message=f"No Java window titled {title!r}",
-                          sleep=self.sleep, clock=self.clock) if timeout else pick()
+        if timeout:
+            try:
+                info = wait_until(pick, timeout, 0.2, message=f"No Java window titled {title!r}",
+                                  sleep=self.sleep, clock=self.clock)
+            except ActionTimeout as exc:
+                raise WindowNotFound(f"No Java window titled {title!r} within {timeout} s") from exc
+        else:
+            info = pick()
         if info is None:
             raise WindowNotFound(f"No Java window titled {title!r}")
         return self.from_hwnd(info.handle, title=info.title or "")
@@ -462,6 +482,8 @@ class JavaNode(AccessibleNode):
         #: ``True`` when the cached children must be checked against the JVM on the next read.
         self._kids_stale = False
         self._released = False
+        #: The index this node was read at in its parent (``getAccessibleChildFromContext``).
+        self._index = -1
 
     # ------------------------------------------------------------------ raw data
     @property
@@ -483,8 +505,11 @@ class JavaNode(AccessibleNode):
         Names, states, values and bounds are read again. The child lists are
         checked against the JVM: unchanged children keep their node (so
         elements already handed out stay valid), new ones are added, and the
-        ones that went away are dropped from the tree (their references are
-        released on :meth:`JavaBridge.close`). A refresh leaks no reference.
+        ones that went away are dropped from the tree and their references
+        released. Cells, list items and tree nodes below a table, list or tree
+        are kept by index (Swing hands out a new proxy object on every read):
+        a held cell element stays valid and reads whatever is at its position
+        now. A refresh leaks no reference.
         """
         self._info = None
         if self._kids is not None:
@@ -583,19 +608,77 @@ class JavaNode(AccessibleNode):
             info = self.info
             count = min(int(info.childrenCount), self.bridge.max_children) if info is not None else 0
             prev = list(self._kids or ())
-            used: set = set()
-            shift = 0  # rows inserted/removed above: the old index of child i is i - shift
-            kids: List[JavaNode] = []
-            for i in range(max(0, count)):
-                try:
-                    child = self.bridge.dll.getAccessibleChildFromContext(self.vm, self.ac, i)
-                except Exception:  # noqa: BLE001
-                    child = 0
-                if not child:
-                    continue
-                # Same position first, then a few neighbours: a bounded number of isSameObject
-                # calls per child, not a scan of every cached child (a JTable has thousands).
-                same = None
+            kids = self._read_indexed(count, prev) if self._index_addressed() else self._read_matched(count, prev)
+            kept = {id(k) for k in kids}
+            for old in prev:  # gone from the JVM (or replaced by a new proxy): free it now, not on close
+                if id(old) not in kept:
+                    old.release()
+            self._kids = kids
+            self._kids_stale = False
+        return self._kids
+
+    def _child(self, i: int) -> int:
+        try:
+            return int(self.bridge.dll.getAccessibleChildFromContext(self.vm, self.ac, i) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _new_child(self, child: int, i: int) -> "JavaNode":
+        self.bridge._track(self.vm, child)
+        node = JavaNode(self.bridge, self.vm, child, self)
+        node._index = i
+        return node
+
+    def _index_addressed(self) -> bool:
+        """``True`` below a table, list or tree, whose children are fresh proxies on every read."""
+        n: Optional[JavaNode] = self
+        while n is not None:
+            if n.java_role in _INDEXED_ROLES:
+                return True
+            n = n._parent
+        return False
+
+    def _read_indexed(self, count: int, prev: List["JavaNode"]) -> List["JavaNode"]:
+        """Children of a table/list/tree: no ``isSameObject`` matching (it never matches a new
+        proxy); the node at each index is kept and re-pointed at the new reference."""
+        by_index = {k._index: k for k in prev if not k._released}
+        kids: List[JavaNode] = []
+        for i in range(max(0, count)):
+            child = self._child(i)
+            if not child:
+                continue
+            old = by_index.get(i)
+            if old is None:
+                kids.append(self._new_child(child, i))
+                continue
+            self.bridge._track(self.vm, child)
+            old._rebind(child)
+            kids.append(old)
+        return kids
+
+    def _rebind(self, ac: int) -> None:
+        """Point this node at a new reference to (the proxy at) its position; free the old one."""
+        for kid in self._kids or ():
+            kid.release()
+        old, self.ac = self.ac, ac
+        self._kids = None
+        self._kids_stale = False
+        self._info = None
+        self.bridge.release(self.vm, old)
+
+    def _read_matched(self, count: int, prev: List["JavaNode"]) -> List["JavaNode"]:
+        used: set = set()
+        shift = 0  # rows inserted/removed above: the old index of child i is i - shift
+        matching = bool(prev)
+        kids: List[JavaNode] = []
+        for i in range(max(0, count)):
+            child = self._child(i)
+            if not child:
+                continue
+            # Same position first, then a few neighbours: a bounded number of isSameObject
+            # calls per child, not a scan of every cached child (a JTable has thousands).
+            same = None
+            if matching:
                 for j in sorted(range(i - shift - _MATCH_WINDOW, i - shift + _MATCH_WINDOW + 1),
                                 key=lambda j: abs(j - (i - shift))):
                     if 0 <= j < len(prev) and j not in used and not prev[j]._released \
@@ -603,20 +686,22 @@ class JavaNode(AccessibleNode):
                         same, shift = prev[j], i - j
                         used.add(j)
                         break
-                if same is not None:
-                    # A second reference to a child we already hold: keep the node, drop the new reference.
-                    if child != same.ac:
-                        try:
-                            self.bridge.dll.releaseJavaObject(self.vm, child)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    kids.append(same)
-                    continue
-                self.bridge._track(self.vm, child)
-                kids.append(JavaNode(self.bridge, self.vm, child, self))
-            self._kids = kids
-            self._kids_stale = False
-        return self._kids
+                if same is None and not used and i >= 2 * _MATCH_WINDOW:
+                    # Not one of the first children matched: a new generation of objects (a
+                    # component that hands out fresh proxies). Stop paying isSameObject calls.
+                    matching = False
+            if same is not None:
+                # A second reference to a child we already hold: keep the node, drop the new reference.
+                if child != same.ac:
+                    try:
+                        self.bridge.dll.releaseJavaObject(self.vm, child)
+                    except Exception:  # noqa: BLE001
+                        pass
+                same._index = i
+                kids.append(same)
+                continue
+            kids.append(self._new_child(child, i))
+        return kids
 
     def _same_ref(self, a: int, b: int) -> bool:
         if a == b:
@@ -663,12 +748,19 @@ class JavaNode(AccessibleNode):
         return bool(self.bridge.dll.doAccessibleActions(self.vm, self.ac, byref(todo), byref(failure)))
 
     def click_action(self) -> Optional[str]:
-        """The action name that presses this control, if it has one."""
+        """The action name that presses this control, if it has one.
+
+        An English name from :data:`CLICK_ACTIONS` first; else, for a button, check box,
+        radio button, toggle button or menu item, its first action (Swing localises the
+        name: "Klicken", "cliquer", "hacer clic"...).
+        """
         acts = self.actions()
         low = {a.lower(): a for a in acts}
         for want in CLICK_ACTIONS:
             if want in low:
                 return low[want]
+        if acts and acts[0] and self.java_role in _PRESSABLE_ROLES:
+            return acts[0]
         return None
 
     def invoke(self) -> bool:
@@ -682,6 +774,7 @@ class JavaNode(AccessibleNode):
             return False
 
     def set_value(self, text: str) -> bool:
+        _check_settable(text)
         buf = (WCHAR * (len(text.encode("utf-16-le")) // 2 + 1))()
         _set_wstr(buf, text)
         try:
@@ -725,6 +818,15 @@ class JavaNode(AccessibleNode):
 
     def __repr__(self) -> str:
         return f"<JavaNode role={self.role!r} name={self.name!r} bounds={self.bounds}>"
+
+
+def _check_settable(text: str) -> None:
+    """``setTextContents`` copies into ``wchar_t text[MAX_STRING_SIZE]``: longer text is cut silently."""
+    units = len(text.encode("utf-16-le")) // 2
+    if units > MAX_STRING_SIZE - 1:
+        raise ValueError(f"set_text: {units} UTF-16 code units is longer than the Java Access Bridge's limit of "
+                         f"{MAX_STRING_SIZE - 1} (setTextContents would truncate it); click the field and type "
+                         "instead")
 
 
 # --------------------------------------------------------------------- elements
@@ -940,8 +1042,11 @@ class JavaElement:
 
         Raises :class:`NotSupported` when the bridge cannot set it (not an
         editable text component), :class:`ElementNotFound` for a disabled or
-        read-only field and :class:`ActionTimeout` when the read-back differs.
+        read-only field, :class:`ValueError` for text longer than the bridge's
+        1023-character limit (before anything is sent) and :class:`ActionTimeout`
+        when the read-back differs.
         """
+        _check_settable(str(text))
         st = self._live().states
         if "disabled" in st or "readonly" in st:
             raise ElementNotFound(f"{self!r} is disabled or read-only")

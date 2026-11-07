@@ -46,7 +46,8 @@ class WebSocket:
         self._parts_len = 0
         self.closed = False
         key = base64.b64encode(os.urandom(16)).decode()
-        req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        host_header = f"[{host}]" if ":" in host else host  # an IPv6 address goes in brackets
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host_header}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
         self._sock.sendall(req.encode("ascii"))
         head = self._read_until(b"\r\n\r\n", limit=65536).decode("latin-1")

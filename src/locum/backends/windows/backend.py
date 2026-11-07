@@ -49,8 +49,13 @@ class WindowsBackend(
 
     Args:
         dpi_aware: make the process per-monitor DPI aware (strongly recommended;
-            without it coordinates are virtualised on scaled displays).
+            without it coordinates are virtualised on scaled displays). When the
+            process awareness was already set elsewhere, every thread that calls
+            the backend is switched to per-monitor v2 on its first call.
         screenshot_method: ``"auto"`` (mss, falling back to GDI), ``"mss"`` or ``"gdi"``.
+            With ``dpi_aware=False``, ``"auto"`` uses GDI: mss makes the whole
+            process per-monitor DPI aware when it starts, so ``"mss"`` there
+            switches every coordinate to physical pixels.
         accessibility: enable UI Automation (needs ``comtypes``).
         uia_view: tree view for :class:`UIANode` children: ``"control"`` (default),
             ``"raw"`` or ``"content"``.
@@ -107,9 +112,14 @@ class WindowsBackend(
             raise
         except Exception as exc:  # pragma: no cover - platform specific
             raise BackendUnavailable(f"Cannot load the Win32 API: {exc}") from exc
+        self._dpi_local = threading.local()
         self.dpi_mode = enable_dpi_awareness(self._api if _api is not None else None) if dpi_aware else "unchanged"
         self._screenshot_method = screenshot_method
-        self._mss_broken = screenshot_method == "gdi"
+        # mss makes the whole *process* per-monitor DPI aware when it creates its
+        # grabber (SetProcessDpiAwareness, no opt-out), which would silently undo
+        # dpi_aware=False: the GDI grabber, which honours the current awareness, is
+        # used instead unless mss is asked for explicitly.
+        self._mss_broken = screenshot_method == "gdi" or (not dpi_aware and screenshot_method == "auto")
         self._mss_local = threading.local()
         self._mss_lock = threading.Lock()
         self._mss_closers: List[Any] = []  # weakref.finalize objects closing per-thread mss grabbers
@@ -179,6 +189,7 @@ class WindowsBackend(
     def _check(self) -> None:
         if self._closed:
             raise BackendError("Windows backend has been closed")
+        self._ensure_thread_dpi()  # every public entry point calls _check first
 
     def _error(self, what: str) -> BackendError:
         code = self._api.get_last_error()

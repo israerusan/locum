@@ -59,6 +59,34 @@ _POINTER_ACTIONS = frozenset({"left_click", "right_click", "middle_click", "doub
                               "left_click_drag", "left_mouse_down", "scroll"})
 _MAX_DURATION = 300.0
 
+#: Models that predate the toolset: ``model base id -> (tool type, beta header)``
+#: (Anthropic's computer-use docs, "Earlier tool versions"). Every newer model
+#: (Opus 4.8 and the Claude 5 family) takes :data:`TOOLSET_TYPE`.
+_LEGACY_TOOL_VERSIONS: Dict[str, Tuple[str, str]] = {
+    **{m: ("computer_20251124", "computer-use-2025-11-24")
+       for m in ("claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5")},
+    **{m: ("computer_20250124", "computer-use-2025-01-24")
+       for m in ("claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1", "claude-opus-4", "claude-opus-4-0",
+                 "claude-sonnet-4", "claude-sonnet-4-0")},
+}
+
+
+def _model_base(model: str) -> str:
+    """``model`` without platform prefix and snapshot suffix.
+
+    ``"us.anthropic.claude-sonnet-4-5-20250929-v1:0"`` / ``"claude-sonnet-4-5@20250929"``
+    -> ``"claude-sonnet-4-5"``.
+    """
+    import re
+
+    m = str(model or "").strip().lower()
+    m = m.rsplit("/", 1)[-1]
+    if "claude" in m:
+        m = m[m.index("claude"):]
+    m = re.sub(r"-v\d+(:\d+)?$", "", m)
+    m = re.sub(r"[-@]\d{8}$", "", m)
+    return m
+
 # xdotool keysym names (lowercased) -> locum canonical key names.
 _XDOTOOL_KEYS: Dict[str, str] = {
     "return": "enter", "enter": "enter", "kp_enter": "num_enter", "linefeed": "enter",
@@ -246,9 +274,41 @@ class ComputerUseAdapter:
             img = img.resize(size, _lanczos())
         return img
 
-    def tool_definition(self) -> Dict[str, Any]:
-        """The ``tools`` entry: ``{"type": "computer_toolset_20260801"}`` (no name, no display size)."""
-        d: Dict[str, Any] = {"type": TOOLSET_TYPE}
+    @staticmethod
+    def tool_version(model: Optional[str] = None) -> Tuple[str, Optional[str]]:
+        """``(tool type, beta header or None)`` of the computer tool ``model`` accepts.
+
+        The toolset (no beta header) for Opus 4.8, the Claude 5 family and unknown
+        (newer) models; ``computer_20251124`` / ``computer_20250124`` with their beta
+        headers for the older Claude 4 models. Raises ``ValueError`` for models
+        without computer use (Claude 3 and older).
+        """
+        if not model:
+            return TOOLSET_TYPE, None
+        base = _model_base(model)
+        if base in _LEGACY_TOOL_VERSIONS:
+            return _LEGACY_TOOL_VERSIONS[base]
+        if base.startswith(("claude-3", "claude-2", "claude-instant")):
+            raise ValueError(f"model {model!r} does not support a computer use tool locum can drive; "
+                             "use a Claude 4 or newer model, or mode='tools'")
+        return TOOLSET_TYPE, None
+
+    def tool_definition(self, model: Optional[str] = None) -> Dict[str, Any]:
+        """The ``tools`` entry for ``model`` (see :meth:`tool_version`).
+
+        ``{"type": "computer_toolset_20260801"}`` (no name, no display size) by default;
+        for an older model the legacy ``computer`` tool with the screenshot size as
+        its display size (send its beta header too).
+        """
+        tool_type, _beta = self.tool_version(model)
+        if tool_type != TOOLSET_TYPE:
+            iw, ih = self.image_size()
+            d: Dict[str, Any] = {"type": tool_type, "name": LEGACY_TOOL_NAME,
+                                 "display_width_px": iw, "display_height_px": ih}
+            if tool_type == "computer_20251124" and self.zoom_enabled:
+                d["enable_zoom"] = True
+            return d
+        d = {"type": TOOLSET_TYPE}
         if not self.zoom_enabled:
             d["configs"] = {"zoom": {"enabled": False}}
         return d

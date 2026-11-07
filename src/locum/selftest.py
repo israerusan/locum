@@ -644,7 +644,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         for i in (3, 2, 1):
             print(f"  starting in {i}...")
             time.sleep(1)
-    d = _mock_desktop() if (args.backend or "").lower() in ("mock", "demo") else Desktop(args.backend)
+    backend = (args.backend or os.environ.get("LOCUM_BACKEND") or "").strip().lower()
+    d = _mock_desktop() if backend in ("mock", "demo") else Desktop(args.backend)
     with d:
         print(f"backend: {d.backend.name}")
         st = SelfTest(d, out, retries=args.retries)

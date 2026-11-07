@@ -63,6 +63,7 @@ Two ways to decide what needs a human:
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import fnmatch
 import functools
@@ -82,14 +83,27 @@ from ..errors import PolicyViolation
 from ..types import Point, Rect, coerce_point
 
 def fold_text(text: str) -> str:
-    """``text`` without diacritics (NFKD, combining marks dropped, ``ß`` -> ``ss``).
+    """``text`` without diacritics (NFKD, combining marks dropped, ``ß`` -> ``ss``), invisible
+    format characters (soft hyphen, zero-width space/joiner, bidi marks) and ``&`` access-key
+    markers (``"De&lete"`` -> ``"Delete"``, ``"&&"`` -> ``"&"``).
 
     The keyword tripwire matches folded text against folded patterns, so
     ``"Überweisen"``, ``"uberweisen"`` and ``"Supprimer"``/``"Réglement"`` match
-    whatever accents the label (or the pattern) carries.
+    whatever accents the label (or the pattern) carries, and ``"Del\\u00adete"`` (a soft
+    hyphen) or ``"&Pay"`` still read as "Delete"/"Pay".
     """
+    return _MNEMONIC_RX.sub(lambda m: m.group(1), _fold(text))
+
+
+#: ``&`` marking an access key (``"&Pay"``), or ``&&`` (a literal ampersand).
+_MNEMONIC_RX = re.compile(r"&(&|(?=\S))")
+
+
+def _fold(text: str) -> str:
+    """:func:`fold_text` without the ``&`` handling (patterns are regexes: their ``&`` is literal)."""
     s = unicodedata.normalize("NFKD", str(text))
-    return "".join(c for c in s if not unicodedata.combining(c)).replace("ß", "ss").replace("ẞ", "SS")
+    s = "".join(c for c in s if not unicodedata.combining(c) and unicodedata.category(c) != "Cf")
+    return s.replace("ß", "ss").replace("ẞ", "SS")
 
 
 #: Keyword tripwire, per language (ISO 639-1 code -> regexes). Every entry is matched
@@ -286,7 +300,7 @@ def _compile_folded(patterns: Iterable[Union[str, Pattern]]) -> List[Pattern]:
     Used for ``confirm_patterns``, which are matched against folded text (and the
     original), so they match accented and unaccented spellings alike.
     """
-    return _compile(fold_text(p) if isinstance(p, str) else p for p in patterns)
+    return _compile(_fold(p) if isinstance(p, str) else p for p in patterns)
 
 
 def _text_variants(text: str) -> List[str]:
@@ -1952,13 +1966,39 @@ class GuardedDesktop(_GuardedProxy):
             ctx["target_unknown"] = True
         return ctx
 
-    def _focus_ctx(self, *, activating: bool, enter: bool = False, **extra: Any) -> Tuple[Dict[str, Any], bool]:
-        """Context for keyboard input (the focused control is the target) and whether it is a password field."""
+    def _held_modifiers(self) -> List[str]:
+        """Modifiers the desktop's keyboard holds down right now (``key_down``/``hold``)."""
+        from ..keys import MODIFIERS  # noqa: PLC0415
+
+        held = _safe_get(lambda: list(self._raw.keyboard._pressed), []) or []
+        return [k for k in held if k in MODIFIERS]
+
+    def _with_held(self, parts: Sequence[str]) -> List[str]:
+        """``parts`` as the application receives them: with the modifiers already held down."""
+        return [m for m in self._held_modifiers() if m not in parts] + list(parts)
+
+    def _held_text_keys(self, text: str) -> Optional[str]:
+        """With Ctrl/Alt/Cmd held, typed characters are shortcuts: the combos ``text`` presses."""
+        mods = [m for m in self._held_modifiers() if m not in ("shift", "shift_r")]
+        if not mods:
+            return None
+        names = {"\n": "enter", "\r": "enter", "\t": "tab", " ": "space"}
+        combos = []
+        for c in dict.fromkeys(str(text)):
+            name = names.get(c) or (c.lower() if c.isalnum() else None)
+            if name:
+                combos.append("+".join(mods + [name]))
+        return " ".join(combos) or None
+
+    def _focus_ctx(self, *, activating: bool, enter: bool = False, _node: Any = None,
+                   **extra: Any) -> Tuple[Dict[str, Any], bool]:
+        """Context for keyboard input (the focused control -- or ``_node``, the element the
+        keys are bound to -- is the target) and whether it is a password field."""
         from .._nodeinfo import is_password, node_app, owning_window, target_label  # noqa: PLC0415
 
         backend = self._raw.backend
         ctx = self._base_ctx()
-        node = _safe_get(lambda: backend.focused_element())
+        node = _node if _node is not None else _safe_get(lambda: backend.focused_element())
         secret = False
         if node is None:
             if activating:
@@ -2145,7 +2185,8 @@ class GuardedDesktop(_GuardedProxy):
         text = _plain_text(text)
         pieces = split_typed_text(text) or [""]
         first = pieces[0]
-        ctx, secret = self._focus_ctx(activating=typed_text_activates(first), enter="\n" in first or "\r" in first)
+        ctx, secret = self._focus_ctx(activating=typed_text_activates(first), enter="\n" in first or "\r" in first,
+                                      keys=self._held_text_keys(text))
         secret = secret or forced
         # Only the first piece lands in the focused control; later pieces (after a Tab/newline)
         # may land in a password field, so the log shows each piece in its own event.
@@ -2161,13 +2202,20 @@ class GuardedDesktop(_GuardedProxy):
 
     def _type_pieces(self, pieces: List[str], *, interval: float, mode: Optional[str],
                      first_done: bool, secret: bool = False) -> None:
+        """Type ``pieces`` (re-checking the policy before each one after the first).
+
+        Called inside an element's input binding (:meth:`GuardedElement.type`), the
+        keystrokes stay bound to that element's window: a window that takes the
+        foreground mid-text gets nothing (:class:`~locum.errors.TargetLost`).
+        """
         raw = self._raw
         forced = secret
         for i, piece in enumerate(pieces):
             if i == 0 and first_done:
                 continue
             if i:  # a Tab/newline was typed: the rest may land in another control
-                ctx, secret = self._focus_ctx(activating=typed_text_activates(piece), enter="\n" in piece or "\r" in piece)
+                ctx, secret = self._focus_ctx(activating=typed_text_activates(piece), enter="\n" in piece or "\r" in piece,
+                                              keys=self._held_text_keys(piece))
                 secret = secret or forced
                 self._gate("type_text", {"text": piece}, ctx,
                            f"type {'***' if secret else piece!r} (part {i + 1} of {len(pieces)})",
@@ -2175,43 +2223,60 @@ class GuardedDesktop(_GuardedProxy):
             raw.type(piece, interval=interval, mode=mode)
 
     def press(self, *keys: Any, presses: int = 1, interval: float = 0.0) -> None:
+        parsed = self._press_gate(keys, presses)
+        if parsed:
+            self._press_send(parsed, keys, presses=presses, interval=interval)
+        return None
+
+    def _press_gate(self, keys: Sequence[Any], presses: int, node: Any = None) -> Optional[List[List[str]]]:
+        """Check a key press against the policy; the parsed key actions when it may run, else ``None``.
+
+        Modifiers already held down (``key_down``/``hold``) are part of every combination
+        judged: ``hold("ctrl")`` + ``press("s")`` is Ctrl+S. ``node``: the element the
+        keys will go to (:meth:`GuardedElement.press`), instead of the focused control.
+        """
         from ..keys import press_actions  # noqa: PLC0415
         from .tools import _shortcut_targets  # noqa: PLC0415
 
         parsed = [parts for k in keys for parts in press_actions(k)]
         if not parsed:
             return None
-        combos = " ".join("+".join(p) for p in parsed)
-        activates = keys_activate(parsed)
-        pressed = _shortcut_targets(self._raw, parsed)
-        ctx, _ = self._focus_ctx(activating=activates, enter=any(p in ("enter", "num_enter") for ps in parsed for p in ps),
-                                 keys=combos, shortcut_targets=pressed or None)
+        judged = [self._with_held(p) for p in parsed]
+        combos = " ".join("+".join(p) for p in judged)
+        activates = keys_activate(judged)
+        pressed = _shortcut_targets(self._raw, judged)
+        ctx, _ = self._focus_ctx(activating=activates, enter=any(p in ("enter", "num_enter") for ps in judged for p in ps),
+                                 _node=node, keys=combos, shortcut_targets=pressed or None)
         desc = f"press {combos}" + (f" x{presses}" if presses > 1 else "") + (
             f" (presses {', '.join(map(repr, pressed))})" if pressed else "")
         if not self._gate("press_keys", {"keys": [str(k) for k in keys], "presses": presses}, ctx, desc):
             return None
+        return parsed
+
+    def _press_send(self, parsed: List[List[str]], keys: Sequence[Any], *, presses: int, interval: float) -> None:
         raw = self._raw
+        combos = " ".join("+".join(p) for p in parsed)
         moved = False
         first = True
         for _ in range(max(1, int(presses))):
             for parts in parsed:
-                k = "+".join(parts)
+                k = "+".join(self._with_held(parts))
                 if moved:  # an earlier key may have moved the focus: judge what this one acts on
-                    c, _ = self._focus_ctx(activating=keys_activate([parts]), enter=any(p in ("enter", "num_enter") for p in parts),
-                                           step_keys=k)
+                    judged = self._with_held(parts)
+                    c, _ = self._focus_ctx(activating=keys_activate([judged]),
+                                           enter=any(p in ("enter", "num_enter") for p in judged), step_keys=k)
                     self._gate("press_keys", {"keys": [k]}, c, f"press {k} (part of {combos!r})", count=False)
                 if not first and interval:
                     raw.sleep(interval)
                 raw.press(parts)
                 first = False
                 moved = moved or keys_may_move_focus(parts)
-        return None
 
     def hotkey(self, *keys: Any, interval: float = 0.0) -> None:
         from ..keys import parse_hotkey  # noqa: PLC0415
         from .tools import _shortcut_targets  # noqa: PLC0415
 
-        parts = parse_hotkey(keys[0] if len(keys) == 1 else [str(k) for k in keys])
+        parts = self._with_held(parse_hotkey(keys[0] if len(keys) == 1 else [str(k) for k in keys]))
         combo = "+".join(parts)
         pressed = _shortcut_targets(self._raw, [parts])
         ctx, _ = self._focus_ctx(activating=keys_activate([parts]), enter=any(p in ("enter", "num_enter") for p in parts),
@@ -2220,15 +2285,28 @@ class GuardedDesktop(_GuardedProxy):
         if self._gate("hotkey", {"combo": combo}, ctx, desc):
             self._raw.hotkey(*keys, interval=interval)
 
+    def _held_combo(self, keys: Sequence[Any]) -> Tuple[List[str], str]:
+        """The keys ``key_down``/``hold`` press, with the modifiers already held: (parts, combo)."""
+        from ..keys import parse_hotkey  # noqa: PLC0415
+
+        try:
+            parts = self._with_held(parse_hotkey(keys[0] if len(keys) == 1 else [str(k) for k in keys]))
+        except (ValueError, TypeError):
+            return [], "+".join(str(k) for k in keys)  # judged conservatively as text below
+        return parts, "+".join(parts)
+
     def key_down(self, key: str) -> None:
-        ctx, _ = self._focus_ctx(activating=keys_activate([key]), enter=str(key).lower() in ("enter", "return"), keys=str(key))
+        parts, combo = self._held_combo([key])
+        ctx, _ = self._focus_ctx(activating=keys_activate([parts or combo]),
+                                 enter=any(p in ("enter", "num_enter") for p in parts), keys=combo)
         if self._gate("key_down", {"key": str(key)}, ctx, f"hold down {key}"):
             self._raw.key_down(key)
 
     def hold(self, *keys: Any) -> Any:
-        combo = "+".join(str(k) for k in keys)
-        ctx, _ = self._focus_ctx(activating=keys_activate([combo]), keys=combo)
-        if not self._gate("hold_key", {"keys": combo}, ctx, f"hold {combo}"):
+        parts, combo = self._held_combo(keys)
+        ctx, _ = self._focus_ctx(activating=keys_activate([parts or combo]),
+                                 enter=any(p in ("enter", "num_enter") for p in parts), keys=combo)
+        if not self._gate("hold_key", {"keys": "+".join(str(k) for k in keys)}, ctx, f"hold {combo}"):
             import contextlib  # noqa: PLC0415
 
             return contextlib.nullcontext([])
@@ -2350,6 +2428,18 @@ class _GuardedKeyboard(_GuardedProxy):
         return object.__getattribute__(self, "_g_guard").hold(*keys)
 
 
+@contextlib.contextmanager
+def _element_input(el: Any) -> Any:
+    """Bind keyboard input to ``el`` and hold the input lock, exactly as the raw
+    :meth:`Element.press <locum.element.Element.press>`/``type`` do: keys that would reach
+    another window (or, before a Tab, another control) raise :class:`~locum.errors.TargetLost`."""
+    from .. import _inputlock, _target  # noqa: PLC0415
+
+    with _target.bind(el._input_target(True)):
+        with _inputlock.hold(el.desktop):
+            yield
+
+
 class GuardedElement(_GuardedProxy):
     """An :class:`~locum.element.Element` whose actions are checked by its :class:`GuardedDesktop`'s policy."""
 
@@ -2451,6 +2541,8 @@ class GuardedElement(_GuardedProxy):
         # password field.
         logged = {"text": mark(pieces[0] if len(pieces) > 1 else text)}
         enter = "\n" in pieces[0] or "\r" in pieces[0]
+        guard: GuardedDesktop = object.__getattribute__(self, "_g_guard")
+        held = guard._held_text_keys(text)  # Ctrl/Alt held down: the characters are shortcuts
         extra = None
         if enter:
             from .tools import _default_button  # noqa: PLC0415
@@ -2462,34 +2554,46 @@ class GuardedElement(_GuardedProxy):
                 extra = {"default_button": label, "target_node": button}
         if extra:
             # Enter in a single-line field presses the default button ("Pay now").
-            guard: GuardedDesktop = object.__getattribute__(self, "_g_guard")
             ctx = guard._element_ctx(self.unwrapped, activates=True)
             ctx["target"] = f"{ctx.get('target', '')} -> {extra['default_button']}".strip(" ->")
             ctx["target_node"] = extra["target_node"]
             ctx.pop("target_unknown", None)
+            if held:
+                ctx["keys"] = held
             from .._nodeinfo import is_password  # noqa: PLC0415
 
             ok = guard._gate("type_text", {"text": mark(text)}, ctx, f"type into {ctx['target']!r}",
                              secret=forced or is_password(self.unwrapped.node), log_args=logged)
         else:
-            ok = self._act("type_text", {"text": mark(text)}, "type into", activates=True, log_args=logged)
+            ok = self._act("type_text", {"text": mark(text)}, "type into", activates=True, log_args=logged,
+                           extra={"keys": held} if held else None)
         if not ok:
             return self
-        self.unwrapped.type(pieces[0], **kw)
-        if len(pieces) > 1:
-            guard = object.__getattribute__(self, "_g_guard")
-            guard._type_pieces(pieces, interval=float(kw.get("interval", 0.0) or 0.0), mode=kw.get("mode"), first_done=True,
-                               secret=forced)
+        # One binding for every piece: the text after a Tab/newline must not reach another window.
+        with _element_input(self.unwrapped):
+            self.unwrapped.type(pieces[0], **kw)
+            if len(pieces) > 1:
+                guard._type_pieces(pieces, interval=float(kw.get("interval", 0.0) or 0.0), mode=kw.get("mode"),
+                                   first_done=True, secret=forced)
         return self
 
-    def press(self, *keys: Any, **kw: Any) -> "GuardedElement":
+    def press(self, *keys: Any, require_focus: Optional[bool] = None, presses: int = 1,
+              interval: float = 0.0) -> "GuardedElement":
+        """Focus the element and press keys, policy first: the keys are judged against this
+        element, and a click needed to focus it is judged as a click on it before it happens.
+        The keys are bound to the element like :meth:`Element.press <locum.element.Element.press>`."""
+        guard: GuardedDesktop = object.__getattribute__(self, "_g_guard")
         el = self.unwrapped
-        focus = getattr(el, "_ensure_focus", None)
-        if callable(focus):
-            focus()
-        else:
-            el.focus()
-        object.__getattribute__(self, "_g_guard").press(*keys, **kw)
+        parsed = guard._press_gate(keys, presses, node=el.node)
+        if not parsed:
+            return self
+
+        def gate_click() -> None:
+            self._act("click", {"button": "left", "clicks": 1}, "click to focus", activates=True)
+
+        with _element_input(el):
+            el._ensure_focus(require_focus, before_click=gate_click)
+            guard._press_send(parsed, keys, presses=presses, interval=interval)
         return self
 
     def __repr__(self) -> str:

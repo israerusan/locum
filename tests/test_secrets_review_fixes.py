@@ -283,11 +283,11 @@ def test_default_screenshots_only_on_failure(pytester):
     result = pytester.runpytest(*MOCK, "--locum-trace", "on", "--locum-trace-dir", "tr")
     result.assert_outcomes(passed=1, failed=2)
     tr = pytester.path / "tr"
-    ok = (tr / "test_default_screenshots_only_on_failure.py_test_steps_without_screenshots.html").read_text("utf-8")
+    ok = next(tr.glob("test_default_screenshots_only_on_failure.py_test_steps_without_screenshots-*.html")).read_text("utf-8")
     assert "data:image/jpeg" not in ok
-    in_assert = (tr / "test_default_screenshots_only_on_failure.py_test_fails_in_assert.html").read_text("utf-8")
+    in_assert = next(tr.glob("test_default_screenshots_only_on_failure.py_test_fails_in_assert-*.html")).read_text("utf-8")
     assert in_assert.count("data:image/jpeg") == 1 and "Screen at failure" in in_assert
-    in_step = (tr / "test_default_screenshots_only_on_failure.py_test_fails_in_step.html").read_text("utf-8")
+    in_step = next(tr.glob("test_default_screenshots_only_on_failure.py_test_fails_in_step-*.html")).read_text("utf-8")
     # The failing step's screenshot, plus the final one.
     assert in_step.count("data:image/jpeg") == 2
 
@@ -322,9 +322,9 @@ def crowded():
 
 def test_heal_refuses_to_decide_on_a_truncated_scan(crowded):
     roots = crowded.accessibility_roots()
-    # The full scan sees both and refuses (too close to call)...
+    # The full scan sees both and picks the exact word match "Save"...
     full = heal('button "Save!"', roots, log=False)
-    assert not full and full.reason.startswith("ambiguous")
+    assert full and full.node.name == "Save" and not full.truncated
     # ...a scan cut after 5 nodes only saw "Save as" and must not call it a clear winner.
     cut = heal('button "Save!"', roots, options=HealOptions(max_nodes=5), log=False)
     assert not cut
@@ -341,4 +341,5 @@ def test_heal_partial_decisions_are_opt_in(crowded):
     out = heal('button "Save!"', roots, options=HealOptions(max_nodes=5, allow_partial=True), log=False)
     assert out and out.node.name == "Save as"
     # A scan that fits within max_nodes is not truncated.
-    assert heal('button "Save!"', roots, options=HealOptions(max_nodes=33), log=False).reason.startswith("ambiguous")
+    full = heal('button "Save!"', roots, options=HealOptions(max_nodes=33), log=False)
+    assert full and full.node.name == "Save" and not full.truncated

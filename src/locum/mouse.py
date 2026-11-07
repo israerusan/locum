@@ -19,7 +19,8 @@ from typing import Any, Callable, Optional, Union
 from . import _inputlock
 from ._cancel import check as _cancel_check
 from ._target import check_input as _target_check
-from .errors import NotSupported
+from ._target import current as _target_current
+from .errors import NotSupported, TargetLost
 from .failsafe import FailSafe
 from .motion import Humanize, fitts_duration, plan_path
 from .types import MouseButton, Point, coerce_point
@@ -145,6 +146,40 @@ class Mouse:
         p = self.backend.mouse_position()
         return Point(int(p[0]), int(p[1]))
 
+    def _live_point(self, fallback: Point) -> "tuple":
+        """Where a press would land *now*: the live cursor (the user may have moved it since
+        our last move), for the bound input target's check. ``fallback`` if unreadable."""
+        if _target_current() is None:
+            return (fallback.x, fallback.y)
+        try:
+            p = self.backend.mouse_position()
+            return (int(p[0]), int(p[1]))
+        except Exception:
+            return (fallback.x, fallback.y)
+
+    def _window_at(self, point: Any) -> Any:
+        try:
+            return self.backend.window_handle_at(int(point[0]), int(point[1]))
+        except Exception:
+            return None
+
+    def _check_drop(self, end: Point, drop_window: Any, origin: Optional[Point]) -> None:
+        """Right before a bound drag's release: the drop must land in the bound target's window
+        or in the window that was under ``end`` when the drag started (a cross-window drag);
+        not where the cursor drifted or a pop-up appeared. Otherwise the drag is carried back
+        to ``origin`` (the release there drops nothing elsewhere) and TargetLost raised."""
+        live = self._live_point(end)
+        try:
+            _target_check("button", point=live)
+        except TargetLost:
+            if drop_window is None or self._window_at(live) != drop_window:
+                if origin is not None:
+                    try:
+                        self.backend.mouse_move(origin.x, origin.y)
+                    except Exception:
+                        pass
+                raise
+
     @_inputlock.locked
     def move(
         self,
@@ -261,7 +296,7 @@ class Mouse:
             if i and interval > 0:
                 self._sleep(interval)
             self._check(ignore=target)
-            _target_check("button", point=(target.x, target.y))
+            _target_check("button", point=self._live_point(target))
             down = False
             try:
                 self.backend.mouse_down(btn)
@@ -325,6 +360,9 @@ class Mouse:
         target = self._point(end)
         _cancel_check()  # the move to ``start`` may have outlived the call's deadline
         _target_check("button")
+        bound = _target_current() is not None
+        origin = (at if at is not None else self.position()) if bound else None
+        drop_window = self._window_at(target) if bound else None  # the drop window that was approved
         down = False
         try:
             self.backend.mouse_down(btn)
@@ -335,6 +373,8 @@ class Mouse:
             self._travel(target, duration, tween, h if h is not None else False, ignore=at)
             if hold > 0:
                 self._sleep(hold)
+            if bound:
+                self._check_drop(target, drop_window, origin)
         except BaseException as exc:
             if down or not isinstance(exc, Exception):  # an interrupt may land after the press was sent
                 self._safe_up(btn)

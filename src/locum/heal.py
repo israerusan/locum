@@ -363,21 +363,59 @@ def _targets(sel: Any) -> List[_Target]:
 # ============================================================ scoring
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+_NEG_WORD_RE = re.compile(r"\w+(?:['’]\w+)*", re.UNICODE)
+# Words that turn a label into its opposite or into a way out ("Save" / "Don't Save",
+# "Order" / "Cancel order"): English, German, Spanish, French, apostrophes removed.
+_NEGATIONS = frozenset({
+    "not", "no", "dont", "doesnt", "didnt", "cant", "cannot", "wont", "never", "without", "none",
+    "cancel", "discard", "abort", "decline", "reject", "deny", "refuse", "undo", "un",
+    "nicht", "kein", "keine", "keinen", "keiner", "nein", "nie", "niemals", "ohne", "abbrechen",
+    "verwerfen", "ablehnen",
+    "nunca", "sin", "cancelar", "descartar", "abortar", "rechazar", "deshacer",
+    "ne", "pas", "non", "jamais", "sans", "annuler", "abandonner", "rejeter", "refuser", "ignorer",
+})
+_NEG_PREFIXES = ("un", "dis", "de", "non", "in")
+
+
+def _negations(name: str, other_words: frozenset) -> frozenset:
+    """The negating/cancelling words of ``name`` (``un``/``dis``... + a word of ``other_words`` included)."""
+    out = set()
+    for raw in _NEG_WORD_RE.findall(name):
+        w = raw.replace("'", "").replace("’", "")
+        if w in _NEGATIONS:
+            out.add(w)
+        elif any(w.startswith(p) and w[len(p):] in other_words for p in _NEG_PREFIXES):
+            out.add(w)  # "Unlock" vs "Lock", "Disconnect" vs "Connect"
+    return frozenset(out)
+
+
+def _negation_differs(a: str, b: str) -> bool:
+    """Whether one name negates/cancels what the other one does (``Save`` vs ``Don't Save``)."""
+    wa = frozenset(w.replace("'", "").replace("’", "") for w in _NEG_WORD_RE.findall(a))
+    wb = frozenset(w.replace("'", "").replace("’", "") for w in _NEG_WORD_RE.findall(b))
+    return _negations(a, wb) != _negations(b, wa)
 
 
 def name_similarity(a: str, b: str, *, partial: bool = False) -> float:
-    """0..1 similarity of two names (case-insensitive ratio, token overlap, word containment)."""
+    """0..1 similarity of two names (case-insensitive ratio, token overlap, word containment).
+
+    0 when one name adds a negating or cancelling word the other lacks (``Save`` vs
+    ``Don't Save``/``Nicht speichern``, ``Order`` vs ``Cancel order``): those are
+    opposite actions, never a rename. Extra or missing words get no bonus.
+    """
     a, b = (a or "").casefold().strip(), (b or "").casefold().strip()
     if not a or not b:
         return 0.0
     if a == b:
         return 1.0
+    if _negation_differs(a, b):
+        return 0.0
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
     ta, tb = set(_WORD_RE.findall(a)), set(_WORD_RE.findall(b))
     jac = len(ta & tb) / len(ta | tb) if ta and tb else 0.0
     best = max(ratio, jac)
-    if ta and tb and (ta <= tb or tb <= ta):
-        best = max(best, 0.85)  # "Save" -> "Save as", "Save as..." -> "Save as"
+    if ta and ta == tb:
+        best = max(best, 0.9)  # "Save as..." -> "Save as": same words, other punctuation
     if partial and a in b:
         best = max(best, 0.95)
     return best
@@ -428,6 +466,8 @@ def _score(t: _Target, fp: Fingerprint, window: str) -> Optional[float]:
         else:
             weight += _W_ID_MISMATCH * 0.5
     if t.name:
+        if _negation_differs(t.name.casefold(), (fp.name or "").casefold()):
+            return None  # "Save" -> "Don't Save" is the opposite action: never healed, whatever else matches
         total += _W_NAME * name_similarity(t.name, fp.name, partial=t.name_partial)
         weight += _W_NAME
     if t.class_name:
@@ -588,7 +628,8 @@ def heal(
             candidates=shown, truncated=True,
         )
     if not best:
-        return HealOutcome(reason="no candidate with a compatible role in the selector's scope", truncated=truncated)
+        return HealOutcome(reason="no candidate with a compatible role (and no negated or cancelling name) "
+                                  "in the selector's scope", truncated=truncated)
     top_score, top_e, top_t, top_win = ranked[0]
     runner = ranked[1][0] if len(ranked) > 1 else None
     if top_score < opts.threshold:

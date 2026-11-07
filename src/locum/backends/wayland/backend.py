@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
+import stat
 import subprocess
+import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 import weakref
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from ...errors import BackendError, NotSupported, warn_experimental
 from ...types import Monitor, MouseButton, Point, Rect, WindowInfo
@@ -47,6 +51,59 @@ _NO_GEOMETRY = (
     "Wayland does not tell applications where windows are or how they are stacked, so locum "
     "cannot tell which window is {what}"
 )
+
+#: Mutter's display configuration (GNOME): tells whether stage views are scaled.
+MUTTER_DISPLAY_CONFIG = "org.gnome.Mutter.DisplayConfig"
+MUTTER_DISPLAY_CONFIG_PATH = "/org/gnome/Mutter/DisplayConfig"
+#: ``layout-mode`` of GetCurrentState: 1 = logical (stage views scaled), 2 = physical.
+MUTTER_LAYOUT_LOGICAL = 1
+_NO_SUCH_NAME = ("org.freedesktop.DBus.Error.ServiceUnknown", "org.freedesktop.DBus.Error.NameHasNoOwner")
+_NOT_MUTTER = object()
+
+
+def _xdg_pictures_dir() -> str:
+    """``XDG_PICTURES_DIR`` from ``user-dirs.dirs`` (localized, e.g. ``~/Bilder``), else ``~/Pictures``."""
+    home = os.path.expanduser("~")
+    pictures = os.path.join(home, "Pictures")
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    try:
+        with open(os.path.join(cfg, "user-dirs.dirs"), "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("XDG_PICTURES_DIR="):
+                    val = line.split("=", 1)[1].strip().strip('"')
+                    if val.startswith("$HOME"):
+                        val = home + val[len("$HOME"):]
+                    if os.path.isabs(val):
+                        pictures = val
+    except (OSError, UnicodeDecodeError):
+        pass
+    return pictures
+
+
+def _is_portal_screenshot(path: str, since: float) -> bool:
+    """Whether ``path`` is a file the Screenshot portal just wrote, safe to delete.
+
+    Conservative: a regular file (not a link) owned by this user, written during
+    this request, directly in the temporary directory or inside the XDG Pictures
+    directory (GNOME Shell saves to it or its ``Screenshots`` folder).
+    """
+    try:
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_mtime < since - 5.0:
+        return False
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None and st.st_uid != getuid():
+        return False
+
+    def norm(p: str) -> str:
+        return os.path.normcase(os.path.realpath(p))
+
+    folder = norm(os.path.dirname(path))
+    pictures = norm(_xdg_pictures_dir())
+    return folder == norm(tempfile.gettempdir()) or folder == pictures or folder.startswith(pictures + os.sep)
 
 
 class _Stream:
@@ -97,16 +154,17 @@ def _cleanup(state: Dict[str, Any]) -> None:
     state["bus"] = None
     session = state.get("session")
     if session:
-        for keysym in list(state.get("keys", {}).values()):
-            try:
-                bus.call(P.PORTAL_PATH, P.REMOTE_DESKTOP, "NotifyKeyboardKeysym", "oa{sv}iu",
-                         (session, {}, int(keysym), P.STATE_RELEASED), timeout=2.0)
-            except Exception:
-                pass
-        for btn in list(state.get("buttons", ())):
+        # Reverse press order: buttons (pressed while modifiers were held), then keys.
+        for btn in reversed(list(state.get("buttons", ()))):
             try:
                 bus.call(P.PORTAL_PATH, P.REMOTE_DESKTOP, "NotifyPointerButton", "oa{sv}iu",
                          (session, {}, int(btn), P.STATE_RELEASED), timeout=2.0)
+            except Exception:
+                pass
+        for keysym in reversed(list(state.get("keys", {}).values())):
+            try:
+                bus.call(P.PORTAL_PATH, P.REMOTE_DESKTOP, "NotifyKeyboardKeysym", "oa{sv}iu",
+                         (session, {}, int(keysym), P.STATE_RELEASED), timeout=2.0)
             except Exception:
                 pass
         try:
@@ -144,7 +202,13 @@ class WaylandBackend(Backend):
 
     Coordinates are the compositor's *logical* layout (what the ScreenCast
     streams report): screenshots are scaled to it, so screenshot pixels and
-    pointer coordinates always agree, also on HiDPI monitors.
+    pointer coordinates agree, also on HiDPI monitors. Pointer offsets sent to
+    the portal are converted per stream: GNOME (mutter) with scaled stage views
+    (fractional scaling, ``scale-monitor-framebuffer``) reads them in physical
+    pixels (``layout.x + stream_x / scale``), so they are multiplied by the
+    monitor's scale, read from mutter's ``DisplayConfig`` or, if that is not
+    readable, from one screenshot. When the scale cannot be determined, absolute
+    moves raise :class:`~locum.errors.NotSupported` instead of missing.
 
     Args:
         bus: a :class:`~locum.backends.wayland._portal.PortalBus` (default: a
@@ -159,7 +223,10 @@ class WaylandBackend(Backend):
             from ``$LOCUM_WAYLAND_ATSPI_COORDS``.
         accessibility: enable AT-SPI (or pass an AT-SPI module, for tests).
         keep_screenshots: keep the files the Screenshot portal writes (GNOME
-            saves each one to ``~/Pictures/Screenshots``); default: delete them.
+            saves each one to ``~/Pictures/Screenshots``); default: delete the
+            returned file after it was decoded, if it is in the Pictures or
+            temporary directory and was written by this request (anything else
+            is left alone).
         approval_timeout: seconds to wait for the user to answer the session dialog.
         clipboard_tool: ``"wl-clipboard"`` (default when installed) or ``"none"``.
     """
@@ -195,8 +262,13 @@ class WaylandBackend(Backend):
         self._screen_coords = coords == "screen"
         self._keep_screenshots = bool(keep_screenshots)
         self._approval_timeout = float(approval_timeout)
+        # _lock guards input state and is only ever held briefly (never across a portal
+        # dialog), so release_all()/close() from another thread run at once; _start_lock
+        # serializes session starts, which wait for the approval dialog.
         self._lock = threading.RLock()
+        self._start_lock = threading.RLock()
         self._streams: List[_Stream] = []
+        self._scales: Optional[Dict[int, Optional[float]]] = None  # node id -> motion scale
         self._devices = 0
         self._pos: Optional[Point] = None
         self._versions: Dict[str, int] = {}
@@ -208,7 +280,7 @@ class WaylandBackend(Backend):
         self._clip = self._detect_clipboard(clipboard_tool)
         # Everything the finalizer needs, without a reference to self.
         self._state: Dict[str, Any] = {"bus": bus, "owns_bus": owns_bus, "session": None, "keys": {},
-                                       "buttons": set(), "closed_watch": None}
+                                       "buttons": {}, "closed_watch": None}  # dicts: press order
         self._finalizer = weakref.finalize(self, _cleanup, self._state)
 
     # ================================================================ lifecycle
@@ -252,6 +324,7 @@ class WaylandBackend(Backend):
         st["keys"].clear()
         st["buttons"].clear()
         self._streams = []
+        self._scales = None
         self._devices = 0
         self._pos = None
 
@@ -266,12 +339,17 @@ class WaylandBackend(Backend):
 
     def start_session(self) -> str:
         """Open the RemoteDesktop session now (shows the approval dialog unless a restore
-        token is accepted). Called automatically by the first input / monitor query."""
-        with self._lock:
-            self._check()
-            if self._state["session"]:
-                self._poll_closed()
-                return self._state["session"]
+        token is accepted). Called automatically by the first input / monitor query.
+
+        The dialog is waited for without the input lock: :meth:`release_all` and
+        :meth:`close` from another thread do not wait for the user's answer.
+        """
+        with self._start_lock:
+            with self._lock:
+                self._check()
+                if self._state["session"]:
+                    self._poll_closed()
+                    return self._state["session"]
             if not self._remote_desktop:
                 raise NotSupported("This Wayland backend was created with remote_desktop=False (no input session)")
             rd_version = self._version(P.REMOTE_DESKTOP)
@@ -312,13 +390,20 @@ class WaylandBackend(Backend):
             except BaseException:
                 self._portal.close_session(session)
                 raise
-            self._state["session"] = session
-            self._state["closed_watch"] = watch
             try:
-                self._devices = int(res.get("devices") or 0)
+                devices = int(res.get("devices") or 0)
             except (TypeError, ValueError):
-                self._devices = 0
-            self._streams = parse_streams(res.get("streams"))
+                devices = 0
+            with self._lock:
+                if self.closed:  # closed while the dialog was open
+                    watch.close()
+                    self._portal.close_session(session)
+                    self._check()
+                self._state["session"] = session
+                self._state["closed_watch"] = watch
+                self._devices = devices
+                self._streams = parse_streams(res.get("streams"))
+                self._scales = None
             token = res.get("restore_token")
             if isinstance(token, str) and token:
                 try:
@@ -373,7 +458,10 @@ class WaylandBackend(Backend):
             "no window geometry or stacking order: input bound to a window is refused when its "
             "destination cannot be verified",
             "the pointer position is only known after locum moved it (Wayland hides the global pointer)",
-            "the corner fail-safe cannot see the user moving the mouse; use the kill hotkey or abort()",
+            "no reliable emergency stop: the corner fail-safe cannot see the user moving the mouse and the "
+            "kill hotkey (X11/XWayland) only sees keys while an XWayland window has focus; stop with "
+            "Ctrl+C in the terminal, abort(), or by ending the screen sharing in the compositor (its "
+            "remote-desktop indicator), which closes the portal session",
             "typing is limited to characters on the active keyboard layout (others need clipboard mode)",
         ]
         if not self._screen_coords:
@@ -382,7 +470,9 @@ class WaylandBackend(Backend):
         if self._remote_desktop and not self._state["session"]:
             notes.append("input session not started yet: the first input asks for approval once")
         if self._version(P.SCREENSHOT) > 0:
-            notes.append("screenshots go through the Screenshot portal (slow; may ask for permission)")
+            notes.append("screenshots go through the Screenshot portal: slow, may ask for permission, and on "
+                         "GNOME every capture may flash the screen and writes a file (usually "
+                         "~/Pictures/Screenshots), which locum deletes after reading unless keep_screenshots=True")
         if self._clip is None:
             notes.append("no clipboard: install wl-clipboard (wl-copy / wl-paste)")
         return notes
@@ -393,6 +483,18 @@ class WaylandBackend(Backend):
         if not self._devices & device:
             raise NotSupported(f"The remote-desktop session was not granted {what} access")
         return session
+
+    @contextlib.contextmanager
+    def _input(self, device: int, what: str) -> Iterator[str]:
+        """Start the session (waiting for the dialog *without* the input lock), then
+        hold the input lock while the notifications are sent."""
+        self._session_for(device, what)
+        with self._lock:
+            self._check()
+            session = self._state["session"]
+            if not session:
+                raise BackendError("The remote-desktop session was closed; the next input call starts a new session.")
+            yield session
 
     def _notify(self, method: str, signature: str, args: Tuple[Any, ...]) -> None:
         session = self._state["session"]
@@ -425,6 +527,79 @@ class WaylandBackend(Backend):
         r = s.rect
         return s, min(max(x, r.left), r.right - 1), min(max(y, r.top), r.bottom - 1)  # type: ignore[union-attr]
 
+    # ------------------------------------------------------------ motion scale
+    def _motion_scales(self) -> Dict[int, Optional[float]]:
+        """Factor from logical offsets to the stream coordinates the portal expects, per stream
+        node id (``None``: unknown). Computed once per session, without the input lock."""
+        scales = self._scales
+        if scales is None:
+            streams = [s for s in self._streams if s.rect is not None]
+            scales = self._detect_scales(streams) if streams else {}
+            self._scales = scales
+        return scales
+
+    def _detect_scales(self, streams: List[_Stream]) -> Dict[int, Optional[float]]:
+        # The portal reports each stream's *logical* position and size. Mutter with scaled
+        # stage views ("logical" layout mode) maps NotifyPointerMotionAbsolute's stream
+        # coordinates to layout.x + stream_x / scale: it wants physical pixels. Other portals
+        # (KDE, ...) and mutter's "physical" layout mode take the coordinates as given.
+        state = self._mutter_display_state()
+        if state is _NOT_MUTTER:
+            return {s.node_id: 1.0 for s in streams}
+        if state is not None:
+            layout_mode, monitors = state  # type: ignore[misc]
+            if layout_mode != MUTTER_LAYOUT_LOGICAL:
+                return {s.node_id: 1.0 for s in streams}
+            out: Dict[int, Optional[float]] = {}
+            for s in streams:
+                if s.pos_known:
+                    found = [sc for (x, y, sc) in monitors if (x, y) == (s.rect.left, s.rect.top)]  # type: ignore[union-attr]
+                else:  # where it is is unknown: only an unambiguous scale will do
+                    found = sorted({sc for (_, _, sc) in monitors})
+                out[s.node_id] = found[0] if len(found) == 1 and found[0] > 0 else None
+            return out
+        # Mutter, but its configuration is not readable: the Screenshot portal captures the
+        # stage at the largest monitor scale, which is every stream's scale only when one
+        # monitor is shared or the image is not scaled at all.
+        ratio = self._capture_ratio(streams)
+        if ratio is not None and abs(ratio - 1.0) < 0.02:
+            return {s.node_id: 1.0 for s in streams}
+        if ratio is not None and len(streams) == 1:
+            return {streams[0].node_id: ratio}
+        return {s.node_id: None for s in streams}
+
+    def _mutter_display_state(self) -> Any:
+        """``_NOT_MUTTER``, ``None`` (mutter, configuration unreadable) or
+        ``(layout_mode, [(x, y, scale) per logical monitor])``."""
+        try:
+            reply = self._bus.call(MUTTER_DISPLAY_CONFIG_PATH, MUTTER_DISPLAY_CONFIG, "GetCurrentState", "", (),
+                                   destination=MUTTER_DISPLAY_CONFIG, timeout=5.0)
+        except P.PortalError as exc:
+            return _NOT_MUTTER if exc.name in _NO_SUCH_NAME else None
+        except BackendError:
+            return None
+        try:
+            _serial, _monitors, logical, props = reply
+            # No layout-mode property: a mutter without scaled stage views (physical).
+            mode = int(P.unwrap_vardict(props).get("layout-mode", 2))
+            monitors = [(int(lm[0]), int(lm[1]), float(lm[2])) for lm in logical]
+        except (TypeError, ValueError, IndexError):
+            return None
+        return mode, monitors
+
+    def _capture_ratio(self, streams: List[_Stream]) -> Optional[float]:
+        try:
+            img = self._capture()
+        except BackendError:
+            return None
+        layout = streams[0].rect
+        for s in streams[1:]:
+            layout = layout.union(s.rect)  # type: ignore[union-attr]
+        sx, sy = img.width / max(layout.width, 1), img.height / max(layout.height, 1)  # type: ignore[union-attr]
+        if abs(sx - sy) > 0.02 * max(sx, sy):
+            return None
+        return sx
+
     def mouse_position(self) -> Point:
         """The position locum last moved the pointer to.
 
@@ -439,13 +614,22 @@ class WaylandBackend(Backend):
         return self._pos
 
     def mouse_move(self, x: int, y: int) -> None:
-        with self._lock:
-            self._check()
-            self._session_for(P.DEVICE_POINTER, "pointer")
+        self._check()
+        self._session_for(P.DEVICE_POINTER, "pointer")
+        scales = self._motion_scales()  # may ask mutter / take one screenshot: not under the lock
+        with self._input(P.DEVICE_POINTER, "pointer"):
             s, cx, cy = self._stream_for(int(round(x)), int(round(y)))
+            scale = scales.get(s.node_id)
+            if scale is None:
+                raise NotSupported(
+                    f"Cannot tell the scale of the monitor of screen-cast stream {s.node_id}: GNOME with "
+                    "scaled monitors reads pointer positions in physical pixels, so an absolute move could "
+                    "land in the wrong place. Share a single monitor, or use a session where "
+                    "org.gnome.Mutter.DisplayConfig is readable."
+                )
             r = s.rect
             self._notify("NotifyPointerMotionAbsolute", "oa{sv}udd",
-                         (s.node_id, float(cx - r.left), float(cy - r.top)))  # type: ignore[union-attr]
+                         (s.node_id, float(cx - r.left) * scale, float(cy - r.top) * scale))  # type: ignore[union-attr]
             self._pos = Point(cx, cy)
 
     def _button(self, button: Any) -> int:
@@ -453,19 +637,17 @@ class WaylandBackend(Backend):
 
     def mouse_down(self, button: MouseButton = MouseButton.LEFT) -> None:
         btn = self._button(button)
-        with self._lock:
-            self._check()
-            self._session_for(P.DEVICE_POINTER, "pointer")
+        self._check()
+        with self._input(P.DEVICE_POINTER, "pointer"):
             self._notify("NotifyPointerButton", "oa{sv}iu", (btn, P.STATE_PRESSED))
-            self._state["buttons"].add(btn)
+            self._state["buttons"][btn] = None
 
     def mouse_up(self, button: MouseButton = MouseButton.LEFT) -> None:
         btn = self._button(button)
-        with self._lock:
-            self._check()
-            self._session_for(P.DEVICE_POINTER, "pointer")
+        self._check()
+        with self._input(P.DEVICE_POINTER, "pointer"):
             self._notify("NotifyPointerButton", "oa{sv}iu", (btn, P.STATE_RELEASED))
-            self._state["buttons"].discard(btn)
+            self._state["buttons"].pop(btn, None)
 
     def scroll(self, dx: int = 0, dy: int = 0) -> None:
         """Wheel notches (``dy > 0`` up, ``dx > 0`` right) via NotifyPointerAxisDiscrete.
@@ -474,9 +656,8 @@ class WaylandBackend(Backend):
         *down*, positive horizontal steps scroll right.
         """
         dx, dy = int(dx), int(dy)
-        with self._lock:
-            self._check()
-            self._session_for(P.DEVICE_POINTER, "pointer")
+        self._check()
+        with self._input(P.DEVICE_POINTER, "pointer"):
             if dy:
                 self._notify("NotifyPointerAxisDiscrete", "oa{sv}ui", (P.AXIS_VERTICAL, -dy))
             if dx:
@@ -493,43 +674,40 @@ class WaylandBackend(Backend):
         return key_to_keysym(key)
 
     def key_down(self, key: str) -> None:
-        with self._lock:
-            self._check()
-            held = self._state["keys"]
-            keysym = held.get(key)
-            if keysym is None:
-                keysym = self._keysym(key)
-            self._session_for(P.DEVICE_KEYBOARD, "keyboard")
+        self._check()
+        keysym = self._state["keys"].get(key)
+        if keysym is None:
+            keysym = self._keysym(key)  # ValueError before any session is opened
+        with self._input(P.DEVICE_KEYBOARD, "keyboard"):
             self._notify("NotifyKeyboardKeysym", "oa{sv}iu", (int(keysym), P.STATE_PRESSED))
-            held[key] = keysym
+            self._state["keys"][key] = keysym
 
     def key_up(self, key: str) -> None:
-        with self._lock:
-            self._check()
-            held = self._state["keys"]
-            keysym = held.get(key)
-            if keysym is None:
-                keysym = self._keysym(key)
-            self._session_for(P.DEVICE_KEYBOARD, "keyboard")
+        self._check()
+        keysym = self._state["keys"].get(key)
+        if keysym is None:
+            keysym = self._keysym(key)
+        with self._input(P.DEVICE_KEYBOARD, "keyboard"):
             self._notify("NotifyKeyboardKeysym", "oa{sv}iu", (int(keysym), P.STATE_RELEASED))
-            held.pop(key, None)
+            self._state["keys"].pop(key, None)
 
     def release_all(self) -> None:
-        """Release every key and button this backend holds down."""
+        """Release every key and button this backend holds down, in reverse press order
+        (buttons first: they were pressed while the modifiers were held)."""
         with self._lock:
             if self.closed or not self._state["session"]:
                 return
             first: Optional[BaseException] = None
-            for key, keysym in list(self._state["keys"].items()):
+            for btn in reversed(list(self._state["buttons"])):
+                try:
+                    self._notify("NotifyPointerButton", "oa{sv}iu", (btn, P.STATE_RELEASED))
+                    self._state["buttons"].pop(btn, None)
+                except BackendError as exc:
+                    first = first or exc
+            for key, keysym in reversed(list(self._state["keys"].items())):
                 try:
                     self._notify("NotifyKeyboardKeysym", "oa{sv}iu", (int(keysym), P.STATE_RELEASED))
                     self._state["keys"].pop(key, None)
-                except BackendError as exc:
-                    first = first or exc
-            for btn in list(self._state["buttons"]):
-                try:
-                    self._notify("NotifyPointerButton", "oa{sv}iu", (btn, P.STATE_RELEASED))
-                    self._state["buttons"].discard(btn)
                 except BackendError as exc:
                     first = first or exc
             if first is not None:
@@ -538,30 +716,35 @@ class WaylandBackend(Backend):
     # ================================================================== screen
     def monitors(self) -> List[Monitor]:
         """The monitors shared in the session, in the compositor's logical layout."""
+        self._check()
+        if not self._remote_desktop:
+            if self._image_layout is None:
+                self.screenshot()
+            return [Monitor(0, self._image_layout, 1.0, True, "screenshot")]  # type: ignore[arg-type]
+        self.start_session()  # the approval dialog is waited for without the input lock
         with self._lock:
-            self._check()
-            if not self._remote_desktop:
-                if self._image_layout is None:
-                    self.screenshot()
-                return [Monitor(0, self._image_layout, 1.0, True, "screenshot")]  # type: ignore[arg-type]
-            self.start_session()
             streams = [s for s in self._streams if s.rect is not None]
-            if not streams:
-                raise NotSupported("The portal session reports no monitor (no screen-cast stream with a size)")
-            if len(streams) > 1 and not all(s.pos_known for s in streams):
-                raise BackendError("The portal did not report where the shared monitors are; share a single "
-                                   "monitor (or all of them on a portal that reports positions)")
-            # Primary first: the monitor at the origin if there is one (the portal does not say).
-            streams.sort(key=lambda s: (not s.rect.contains((0, 0)), s.rect.top, s.rect.left))  # type: ignore[union-attr]
-            return [Monitor(i, s.rect, 1.0, i == 0, s.name or f"stream {s.node_id}")  # type: ignore[arg-type]
-                    for i, s in enumerate(streams)]
+        if not streams:
+            raise NotSupported("The portal session reports no monitor (no screen-cast stream with a size)")
+        if len(streams) > 1 and not all(s.pos_known for s in streams):
+            raise BackendError("The portal did not report where the shared monitors are; share a single "
+                               "monitor (or all of them on a portal that reports positions)")
+        # Primary first: the monitor at the origin if there is one (the portal does not say).
+        streams.sort(key=lambda s: (not s.rect.contains((0, 0)), s.rect.top, s.rect.left))  # type: ignore[union-attr]
+        return [Monitor(i, s.rect, 1.0, i == 0, s.name or f"stream {s.node_id}")  # type: ignore[arg-type]
+                for i, s in enumerate(streams)]
 
     def _capture(self) -> Any:
-        """Full-desktop screenshot from the Screenshot portal, as an RGB image."""
+        """Full-desktop screenshot from the Screenshot portal, as an RGB image.
+
+        The portal's file is deleted only after it was decoded, and only when it looks
+        like the file this request produced (see :func:`_is_portal_screenshot`).
+        """
         from PIL import Image
 
         if self._version(P.SCREENSHOT) <= 0:
             raise NotSupported("xdg-desktop-portal offers no Screenshot interface here")
+        started = time.time()
         res = self._portal.request(P.SCREENSHOT, "Screenshot", "sa{sv}", ("",),
                                    {"interactive": ("b", False), "modal": ("b", False)},
                                    timeout=self._approval_timeout)
@@ -576,14 +759,13 @@ class WaylandBackend(Backend):
             with Image.open(path) as im:
                 img = im.convert("RGB")
                 img.load()
-        except OSError as exc:
+        except OSError as exc:  # not an image: never delete it
             raise BackendError(f"Cannot read the portal screenshot {path!r}: {exc}") from exc
-        finally:
-            if not self._keep_screenshots:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        if not self._keep_screenshots and _is_portal_screenshot(path, started):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         return img
 
     def screenshot(self, region: Optional[Rect] = None) -> Any:
@@ -594,13 +776,12 @@ class WaylandBackend(Backend):
         """
         from PIL import Image
 
-        with self._lock:
-            self._check()
-            img = self._capture()
-            if self._remote_desktop:
-                layout = self.virtual_screen()
-            else:
-                layout = self._image_layout = Rect(0, 0, img.width, img.height)
+        self._check()
+        img = self._capture()  # a portal round trip (maybe a dialog): not under the input lock
+        if self._remote_desktop:
+            layout = self.virtual_screen()
+        else:
+            layout = self._image_layout = Rect(0, 0, img.width, img.height)
         sx, sy = img.width / max(layout.width, 1), img.height / max(layout.height, 1)
         if abs(sx - sy) > 0.02 * max(sx, sy):
             raise BackendError(

@@ -10,6 +10,156 @@ releases, which were the only record at the time. Those releases did not follow
 the versioning rules in docs/API.md (0.1.7 broke the CLI in a patch release).
 The rules apply from 0.3.0 on.
 
+## [Unreleased]
+
+A full review of 0.4.0 by seven independent reviewers found the defects below.
+Each one was reproduced first and now has a regression test that fails on
+0.4.0. The worst: with a policy on (the default for Robot and flows), input
+could reach a window other than the target, and `press()` clicked an element
+before the policy saw it.
+
+### Breaking
+
+These tighten safety behaviour, which docs/API.md allows in a patch release.
+
+- A flow's `exempt:` rules must name a specific control. `"*"`, a bare role
+  (`"button"`) or a wildcard name is rejected as "too broad". **Migration:**
+  name the control, e.g. `'button "Save"'`.
+- The shortcut tripwire counts modifiers that are already held:
+  `hold("ctrl")` + `press("s")` is checked as Ctrl+S, and `key_down`/`hold`
+  treat every Enter key (keypad Enter included) as Enter.
+- Self-healing refuses a candidate whose name negates or cancels the target
+  ("Save" → "Don't Save", "Order" → "Cancel order"; English, German, Spanish,
+  French), and added or missing words no longer earn a similarity bonus.
+  Some heals that used to succeed are now refused. **Migration:** fix the
+  selector instead of relying on the heal.
+- Credential names are case-insensitive on every store and are reported in
+  lower case by `Credential.name` and `list_credentials()`. Existing
+  mixed-case keyring entries are still found.
+- `locum.compat.pyautogui` no longer changes the fail-safe of a desktop passed
+  to `set_desktop()`. `FAILSAFE_POINTS` add to its corners, and its own
+  settings come back when it is replaced.
+- Java bridge: `set_text()` longer than the bridge's 1023-character limit
+  raises `ValueError`, and `JavaBridge.window(title, timeout>0)` raises
+  `WindowNotFound` instead of `ActionTimeout`.
+- pytest trace filenames always end in a hash of the test id.
+
+### Added
+
+- `ComputerUseAdapter.tool_version(model)`. `tool_definition(model=)` returns
+  the computer tool and beta header that the model supports, and raises a
+  clear error for models without computer use.
+- `Agent.keep_images` (default 3): older screenshots are replaced by a short
+  note so long computer-use runs stay under the API's image limits. This is
+  off for models whose thinking depends on unedited history (the Claude 5
+  family), as Anthropic's docs require.
+
+### Fixed
+
+Safety and input:
+
+- A guarded element's `press()`/`type()` is bound to its window like the
+  unguarded call. Keys and text after a Tab no longer reach a window that
+  took the focus; `TargetLost` is raised instead.
+- A guarded element's `press()` no longer clicks the element to focus it
+  before the policy check. That click is checked like any click on it.
+- Bound clicks check where the cursor really is, and bound drags check the
+  drop before releasing.
+- The keyword tripwire sees through soft hyphens, zero-width characters and
+  `&` mnemonics ("De&lete").
+- Unicode typing sends long text in chunks of 32 characters and re-checks the
+  target window and the fail-safe between them.
+
+Secrets and the credential vault:
+
+- Windows: names differing only in case no longer create hidden duplicate
+  credentials. Writes are read back and checked, and delete removes every
+  variant.
+- Verification errors no longer show a near-copy of a typed secret.
+- Observations (what an LLM sees), `Element` repr, every tool/MCP result, and
+  `last_verification` mask typed secrets.
+- Robot log messages are scrubbed. `scrubbing_errors` also scrubs chained
+  exceptions and exceptions with a custom `__str__`.
+- Traces scrub before truncating, so a cut can't leave part of a secret.
+- The env credential fallback also applies when keyring has no usable
+  backend (headless CI).
+- `${credential:x:-default}` falls back only when the credential is missing,
+  not on store errors.
+- HTML run reports no longer corrupt embedded screenshots.
+- The keyring name index survives concurrent writers. An over-long Windows
+  username gives a clear error.
+
+Windows:
+
+- Every thread calling the backend is per-monitor DPI aware, also when the
+  process awareness was set beforehand. DWM frame bounds are converted on
+  threads that are not.
+- `dpi_aware=False` is no longer undone by the first screenshot (mss made the
+  process DPI aware); auto mode uses GDI there.
+- `Window.move()`/`resize()` on a minimized window keep its normal size and
+  position instead of the parked caption rect.
+- `Window.exists`/`refresh()`/`wait_closed()` find untitled, tool, cloaked
+  and other-virtual-desktop windows by handle instead of reporting them
+  closed.
+- `capture_window(restore_minimized=True)` keeps a maximized window restoring
+  to maximized.
+- A PrintWindow capture with a black client area counts as a failure.
+- `wait_until(interval=0)` no longer busy-spins.
+- Bare-string selectors read an element's value only when its name doesn't
+  match, which is much cheaper on UIA.
+
+MCP, agent and browser:
+
+- MCP `wait` (and every `Desktop.sleep`) stops when the call times out or is
+  cancelled instead of blocking the server's worker.
+- A cancelled MCP request no longer gets a late timeout response.
+- Unknown arguments to built-in tools return "Unexpected argument(s) …" with
+  the valid ones instead of a Python `TypeError`.
+- `Page.navigate` raises `CDPError` when navigation fails, and waits for the
+  new document so the next observe sees the new page.
+- The DevTools WebSocket handshake brackets IPv6 hosts.
+
+RPA and tooling:
+
+- `WorkQueue.export_csv` neutralises cells starting with `=`, `+`, `-`, `@`,
+  tab or CR (CSV formula injection).
+- `locum run --dry-run` reports checks of simulated input as skipped instead
+  of failing the run.
+- pytest traces of parametrized tests no longer overwrite each other.
+- `python -m locum.selftest` with `LOCUM_BACKEND=mock` uses the simulated
+  editor. The pytest plugin accepts `demo` like the CLI.
+
+Experimental bridges and backends:
+
+- Java bridge: repeated lookups on JTable/JList/JTree no longer pin a new JVM
+  reference per cell (Swing creates new cell objects on every read).
+  Children there are kept by index, and replaced children are released at
+  once.
+- Java bridge: `click()` works when the Swing click action name is localised
+  ("Klicken", "cliquer"). The bridge DLL is found on `PATH`.
+- SAP: table-control rows that need a scroll work (the table is found again
+  by its stored id, not through the dead COM object). Reading off-screen rows
+  works under dry-run and allow-lists. ALV `rows()` reads the counts once per
+  page instead of about 4 COM calls per cell. Columns without a `Name` match
+  by title or first-cell name.
+- Wayland: pointer moves land correctly on GNOME with scaled monitors, and
+  are refused when the scale is unknown.
+- Wayland: `install_kill_hotkey()` warns that it only works in XWayland
+  windows, and the docs no longer present it as an emergency stop there.
+- Wayland: portal responses are accepted only from xdg-desktop-portal.
+  Screenshot files are deleted only after decoding and only when they are
+  the portal's own.
+- Wayland: an open approval dialog no longer blocks `release_all()`/`close()`
+  from other threads, and `abort()` ends the wait.
+- Wayland: fallback window handles no longer point to a sibling window, a
+  failed `AddMatch` no longer leaks a filter, and `release_all()` releases in
+  reverse order.
+
+### Tests
+
+- The real-JVM CI job covers a JTable, a JList and a JTree and checks that
+  the reference count stays flat.
+
 ## [0.4.0] - 2026-11-06
 
 ### Breaking

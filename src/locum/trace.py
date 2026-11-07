@@ -114,8 +114,8 @@ _ACTIVE_LOCK = threading.Lock()
 
 # ------------------------------------------------------------------- helpers
 
-def _short(text: str, limit: int = _MAX_REPR) -> str:
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+def _short(text: str, limit: Optional[int] = _MAX_REPR) -> str:
+    return text if limit is None or len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -175,14 +175,14 @@ def _describe_window(w: Any) -> str:
         return f"<window: {type(exc).__name__}>"
 
 
-def _fmt(value: Any) -> str:
-    """Short, human readable text for an argument or result."""
+def _fmt(value: Any, limit: Optional[int] = _MAX_REPR) -> str:
+    """Short, human readable text for an argument or result (``limit=None``: not shortened)."""
     from .types import Match, Point, Rect
 
     if value is None or isinstance(value, (bool, int, float)):
         return repr(value)
     if isinstance(value, str):
-        return _short(repr(value))
+        return _short(repr(value), limit)
     if _is_element(value):
         return _describe_node(value.node)
     if _is_window(value):
@@ -200,9 +200,9 @@ def _fmt(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         if not value:
             return "[]" if isinstance(value, list) else "()"
-        head = ", ".join(_fmt(v) for v in list(value)[:3])
+        head = ", ".join(_fmt(v, limit) for v in list(value)[:3])
         more = f", ... ({len(value)} items)" if len(value) > 3 else ""
-        return _short(f"[{head}{more}]")
+        return _short(f"[{head}{more}]", limit)
     size = getattr(value, "size", None)
     if isinstance(size, tuple) and len(size) == 2 and hasattr(value, "mode"):
         return f"<image {size[0]}x{size[1]}>"
@@ -214,7 +214,7 @@ def _fmt(value: Any) -> str:
     if callable(value):
         return f"<{getattr(value, '__qualname__', None) or type(value).__name__}>"
     try:
-        return _short(repr(value))
+        return _short(repr(value), limit)
     except Exception:
         return f"<{type(value).__name__}>"
 
@@ -594,7 +594,8 @@ class Tracer:
             params[text_param] = _Masked(len(secret))
         method = name if kind == "desktop" else f"{kind}.{name}"
         step = TraceStep(index=0, method=method, started_at=time.time())
-        step.args = {k: self._scrub(_fmt(v)) or "" for k, v in params.items()}
+        # Scrub, then shorten: a secret cut off by the shortening would no longer match.
+        step.args = {k: _short(self._scrub(_fmt(v, None)) or "") for k, v in params.items()}
         if kind != "desktop":
             self._note_target(step, owner)
         for p in _TARGET_PARAMS:
@@ -621,8 +622,8 @@ class Tracer:
             step.duration = time.perf_counter() - t0
             step.status = "failed"
             tb = "".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)[-12:])
-            step.error = {"type": type(exc).__name__, "message": self._scrub(_short(str(exc), 2000)) or "",
-                          "traceback": self._scrub(_short(tb, 8000)) or ""}
+            step.error = {"type": type(exc).__name__, "message": _short(self._scrub(str(exc)) or "", 2000),
+                          "traceback": _short(self._scrub(tb) or "", 8000)}
             raise
         else:
             step.duration = time.perf_counter() - t0
@@ -634,7 +635,7 @@ class Tracer:
                         self._secrets.add(result)
                 step.result = MASK
             else:
-                step.result = self._scrub(_fmt(result))
+                step.result = _short(self._scrub(_fmt(result, None)) or "")
             self._instrument_result(result)
             return result
         finally:
@@ -722,7 +723,7 @@ class Tracer:
             "time": record.created,
             "level": record.levelname,
             "logger": record.name,
-            "message": self._scrub(_short(message, 2000)),
+            "message": _short(self._scrub(message) or "", 2000),
         }
         stack = getattr(self._local, "stack", None)
         if stack:

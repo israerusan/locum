@@ -42,6 +42,9 @@ __all__ = ["wait_until", "wait_while", "retry", "retry_call", "Deadline", "NEVER
 #: safety-policy refusal must end the automation, not be retried until a timeout.
 NEVER_SWALLOWED: Tuple[Type[BaseException], ...] = (FailSafeTriggered, PolicyViolation)
 
+#: Shortest pause between two checks of :func:`wait_until` (``interval=0`` included).
+_MIN_POLL_INTERVAL = 0.01
+
 
 def _check_timeout(timeout: Optional[float]) -> Optional[float]:
     if timeout is None:
@@ -71,7 +74,8 @@ def wait_until(
         predicate: Zero-argument callable. Its first truthy return value is returned.
         timeout: Seconds to keep trying. ``0`` performs exactly one check;
             ``None`` waits forever.
-        interval: Initial delay between checks (seconds).
+        interval: Initial delay between checks (seconds; at least 0.01 is slept,
+            so ``0`` polls quickly without spinning a CPU core).
         message: Message of the :class:`ActionTimeout` raised on expiry.
         backoff: Multiplier applied to the interval after every failed check (``1`` = constant).
         max_interval: Upper bound for the (backed-off) interval.
@@ -129,7 +133,7 @@ def wait_until(
         now = clock()
         if deadline is not None and now >= deadline:
             break
-        pause = delay
+        pause = max(delay, _MIN_POLL_INTERVAL)  # interval=0 must not busy-spin a core
         if deadline is not None:
             pause = min(pause, max(0.0, deadline - now))
         if pause > 0:

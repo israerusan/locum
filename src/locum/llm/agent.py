@@ -54,6 +54,21 @@ _log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_MAX_TOKENS = 16000
+_PRUNED_IMAGE = "[earlier screenshot removed to save context; take a new one if needed]"
+#: Models whose thinking blocks stay valid after an earlier turn was edited. Not the
+#: Claude 5.5 / 5.1 models (thinking bound to the unedited history) nor unknown newer ones.
+_EDITABLE_HISTORY_MODELS = frozenset({"claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-mythos-5"})
+_EDITABLE_HISTORY_FAMILIES = ("claude-opus-4", "claude-sonnet-4", "claude-haiku-4", "claude-3")
+
+
+def _may_edit_history(model: str) -> bool:
+    """Whether earlier turns may be edited (screenshots pruned) without breaking ``model``'s thinking."""
+    from .computer_use import _model_base
+
+    base = _model_base(model)
+    return base in _EDITABLE_HISTORY_MODELS or base.startswith(_EDITABLE_HISTORY_FAMILIES)
+
+
 MODES = ("tools", "computer_use")
 DONE_TOOL_NAMES = ("done", "finish")
 
@@ -301,6 +316,10 @@ class Agent:
         max_continuations: Consecutive ``max_tokens`` stops tolerated before giving up.
     """
 
+    #: Screenshots kept in the history (older ones become a short note); ``None`` keeps all.
+    #: Not applied to models whose thinking is bound to the unedited history (see :meth:`_prune_images`).
+    keep_images: Optional[int] = 3
+
     def __init__(
         self,
         desktop: Optional["Desktop"] = None,
@@ -326,6 +345,8 @@ class Agent:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
         if int(max_steps) < 1:
             raise ValueError("max_steps must be >= 1")
+        if mode == "computer_use":
+            ComputerUseAdapter.tool_version(model)  # a model without computer use fails here, clearly
         if desktop is None:
             from ..desktop import Desktop
 
@@ -491,7 +512,7 @@ class Agent:
         """The ``tools`` list sent to the model."""
         defs: List[Dict[str, Any]] = []
         if self.mode == "computer_use":
-            defs.append(self.computer.tool_definition())
+            defs.append(self.computer.tool_definition(self.model))
         defs.extend(self.registry.to_anthropic())
         return defs
 
@@ -540,12 +561,48 @@ class Agent:
             output_config={"effort": self.effort},
         )
         kwargs.update(self.create_kwargs)
+        if self.mode == "computer_use":
+            _tool_type, cu_beta = self.computer.tool_version(self.model)
+            if cu_beta is not None:  # the legacy computer tool of an older model needs its beta header
+                betas = list(kwargs.get("betas") or [])
+                if cu_beta not in betas:
+                    betas.append(cu_beta)
+                kwargs["betas"] = betas
         if "betas" in kwargs:
             # ``messages.create`` rejects ``betas``; the SDK takes it on the beta resource.
             beta = getattr(getattr(self.client, "beta", None), "messages", None)
             if beta is not None and callable(getattr(beta, "create", None)):
                 return beta.create(**kwargs)
         return self.client.messages.create(**kwargs)
+
+    def _prune_images(self) -> None:
+        """Replace all but the last :attr:`keep_images` screenshots in the history by a short note.
+
+        Every screenshot/observe image otherwise stays in the conversation and is
+        re-sent (and billed) on every request. Only the image blocks are replaced, so
+        every tool_use/tool_result pair stays intact. Skipped for models that bind
+        their thinking blocks to the unedited history (Claude Opus 5.5, Sonnet 5.5,
+        Haiku 5.5, Fable 5.1, Mythos 5.1 and unknown newer models): editing an earlier
+        turn there invalidates every later thinking block (or is rejected) -- use
+        server-side tool-result clearing through ``create_kwargs`` instead.
+        """
+        keep = self.keep_images
+        if keep is None or not _may_edit_history(self.model):
+            return
+        found: List[tuple] = []  # (content list, index), oldest first
+        for msg in self.messages:
+            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+                continue
+            for i, block in enumerate(msg["content"]):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "image":
+                    found.append((msg["content"], i))
+                elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                    found.extend((block["content"], j) for j, b in enumerate(block["content"])
+                                 if isinstance(b, dict) and b.get("type") == "image")
+        for content, i in found[:max(0, len(found) - int(keep))]:
+            content[i] = {"type": "text", "text": _PRUNED_IMAGE}
 
     # --------------------------------------------------------------- execution
     def _is_computer(self, block: Any) -> bool:
@@ -659,6 +716,7 @@ class Agent:
             self.messages.append({"role": "user", "content": self._initial_content(task)})
             for index in range(self.max_steps):
                 started = time.monotonic()
+                self._prune_images()
                 try:
                     response = self._create()
                 except FailSafeTriggered:

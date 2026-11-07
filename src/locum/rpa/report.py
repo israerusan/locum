@@ -19,6 +19,7 @@ import io
 import json
 import os
 import pathlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Union
 
@@ -31,6 +32,9 @@ SKIPPED = "skipped"
 STATUSES = (PASSED, FAILED, SKIPPED)
 
 PathLike = Union[str, "os.PathLike[str]"]
+
+#: Embedded base64 images in the HTML report (left out of the secret scrub).
+_DATA_URL_RE = re.compile(r"(data:image/[a-z+]+;base64,[A-Za-z0-9+/=]+)")
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -311,7 +315,9 @@ class RunReport:
         """Render the report as a self-contained HTML document (see module docstring)."""
         from .._secret import scrub
 
-        return scrub(_render_html(self, thumbnail_size=thumbnail_size)) or ""
+        # Scrub the text, not the embedded screenshots: a short secret can occur in base64 by chance.
+        parts = _DATA_URL_RE.split(_render_html(self, thumbnail_size=thumbnail_size))
+        return "".join(p if i % 2 else (scrub(p) or "") for i, p in enumerate(parts))
 
     def save_html(self, path: PathLike, *, thumbnail_size: int = 480) -> str:
         """Write :meth:`to_html` to ``path`` (parent directories are created). Returns the path."""

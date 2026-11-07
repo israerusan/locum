@@ -81,6 +81,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional,
 
 from .. import failsafe as _failsafe
 from .._policy import DEFAULT_POLICY, policy_label, resolve_policy
+from .._secret import scrub, scrub_data
 from ..errors import ActionTimeout, FailSafeTriggered, PolicyViolation
 from .queue import TASK_DEADLINE_ATTR as _DEADLINE_ATTR
 from .queue import BusinessException
@@ -618,6 +619,10 @@ class Robot:
         lvl = _LEVELS.get(str(level).lower())
         if lvl is None:
             raise ValueError(f"Unknown log level {level!r}; expected one of {', '.join(sorted(_LEVELS))}")
+        # Every log line (failures and retries quote error messages) goes out with secrets masked.
+        message = scrub(message) or message
+        path = scrub(path) or path
+        fields = scrub_data(dict(fields))
         record: Dict[str, Any] = {
             "time": time.time(),
             "level": logging.getLevelName(lvl).lower(),
@@ -667,7 +672,7 @@ class Robot:
         if timeout is not None:
             frame.deadline = frame.extra["t0"] + timeout
         self._stack.append(frame)
-        self.logger.debug("[%s] started", path)
+        self.logger.debug("[%s] started", scrub(path))
         return frame
 
     def _close(
@@ -692,7 +697,7 @@ class Robot:
         if exc is None:
             r.status = PASSED
             r.error = r.error_type = r.traceback = None
-            self.logger.debug("[%s] passed in %.3fs", r.path, r.duration)
+            self.logger.debug("[%s] passed in %.3fs", scrub(r.path), r.duration)
             return False
         r.status = FAILED
         r.error = _exc_text(exc)
@@ -867,7 +872,7 @@ class Robot:
         self._stack = []
         if self.save_reports if save is None else save:
             self.save_report(report)
-        self.logger.log(logging.INFO if report.ok else logging.ERROR, "%s", report.summary())
+        self.logger.log(logging.INFO if report.ok else logging.ERROR, "%s", scrub(report.summary()))
         return report
 
     def save_report(self, report: Optional[RunReport] = None) -> Dict[str, str]:

@@ -121,6 +121,49 @@ def test_mouse_fallback_clicks_inside_the_java_window(window, probe):
     assert _until(lambda: _status(win).startswith("Saved: Mouse Inc")), _status(win)
 
 
+def test_table_cells_are_readable(window):
+    _jab, win = window
+    table = win.find("table")
+    cells = table.find_all("*[name]")
+    names = [c.name for c in cells]
+    assert len(names) >= 60 and "R0C0" in names and "R19C2" in names, names[:10]
+    cell = table.find('*[name="R3C1"]')
+    assert cell.text == "R3C1"
+
+
+def test_list_and_tree_items_are_found(window):
+    _jab, win = window
+    for item in ("Alpha", "Bravo", "Charlie"):
+        assert win.exists(f'list *[name="{item}"]'), win.find("list").tree()
+    for node in ("Sales", "Billing"):
+        assert win.exists(f'tree *[name="{node}"]'), win.find("tree").tree()
+
+
+def test_repeated_table_list_tree_lookups_keep_references_flat(probe):
+    # Swing returns a NEW AccessibleJTableCell / AccessibleJListChild / AccessibleJTreeNode on every
+    # getAccessibleChild: matching them with isSameObject never succeeds, and every lookup used to
+    # pin one more reference per cell.
+    from locum.bridges.java import JavaBridge
+
+    jab = JavaBridge()
+    try:
+        win = jab.window(probe[0], timeout=30.0)
+        table = win.find("table")
+        cell = table.find('*[name="R5C2"]')
+        win.tree(max_depth=64)
+        held = jab.live_references
+        for _ in range(5):
+            assert len(table.find_all("*[name]")) >= 60
+            win.find_all("*")
+            win.tree(max_depth=64)
+            assert win.exists('list *[name="Bravo"]') and win.exists('tree *[name="Billing"]')
+        assert jab.live_references == held, (held, jab.live_references)
+        assert cell.name == "R5C2"  # a held cell element survives the re-reads
+    finally:
+        jab.close()
+    assert jab.live_references == 0
+
+
 def test_references_are_released(probe):
     from locum.bridges.java import JavaBridge
 
