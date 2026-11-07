@@ -486,7 +486,9 @@ class JavaNode(AccessibleNode):
         #: The index this node was read at in its parent (``getAccessibleChildFromContext``).
         self._index = -1
         #: Live :class:`JavaElement` objects wrapping this node (a held node is never freed early).
-        self._holders = 0
+        # One token per live JavaElement wrapping this node. list.append/pop are atomic, so the
+        # finalizer (which may run during GC, on any thread) needs no lock that could deadlock.
+        self._holders: List[None] = []
 
     # ------------------------------------------------------------------ raw data
     @property
@@ -837,12 +839,18 @@ class JavaNode(AccessibleNode):
         return "".join(parts)
 
     def _subtree_held(self) -> bool:
-        if self._holders > 0:
+        if self._holders:
             return True
         return any(kid._subtree_held() for kid in self._kids or ())
 
+    def _hold(self) -> None:
+        self._holders.append(None)
+
     def _unhold(self) -> None:
-        self._holders -= 1
+        try:
+            self._holders.pop()
+        except IndexError:  # pragma: no cover - never more unholds than holds
+            pass
 
     def release(self) -> None:
         """Release this node's reference and those of its (already read) descendants."""
@@ -877,7 +885,7 @@ class JavaElement:
 
     def __init__(self, node: JavaNode) -> None:
         self.node = node
-        node._holders += 1
+        node._hold()
         weakref.finalize(self, node._unhold)
 
     @property

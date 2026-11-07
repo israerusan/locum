@@ -83,8 +83,8 @@ Secrets and the credential vault:
   scrubbed from names, titles and tool results (JSON stays valid). Short
   secrets such as PINs never change the numbers, titles or selectors the
   model reads. A field value that is a secret shown with separators
-  (`4111 1111 1111 1111`) or cut short by the field is masked too, and so is
-  the value `read_text` returns. `last_verification` masks secrets.
+  (`4111 1111 1111 1111`) is masked too, and so is the value `read_text`
+  returns. `last_verification` masks secrets.
 - Robot log messages and step errors are scrubbed. `scrubbing_errors` scrubs
   arguments and OSError filenames along the cause/context chain without
   changing the exception's type. Traces, run reports, robot logs and CLI

@@ -223,6 +223,9 @@ def test_read_text_and_reformatted_or_truncated_secrets_are_masked(orders):
     Secret("4111111111111111")
     Secret("Tr0ubdor-Vault-77")
     assert mask_value("4111 1111 1111 1111") == MASK  # the field groups the digits
-    assert mask_value("Tr0ubdor") == MASK  # a maxlength=8 field cut it short
+    # A prefix of a secret is ordinary text (review 11: "Invoice" vs "Invoice-2024-001").
+    Secret("Invoice-2024-001")
+    assert mask_value("Invoice") == "Invoice" and mask_value("Invoice-2024") == "Invoice-2024"
+    assert mask_value("411111") == "411111" and mask_value("Tr0ubdor") == "Tr0ubdor"
     assert mask_value("4821") == MASK
     assert mask_value("1920x1080") == "1920x1080" and mask_value("Total 4821.50") == "Total 4821.50"
