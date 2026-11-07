@@ -232,13 +232,19 @@ def test_cli_screenshot_window(scene, tmp_path):
     assert code == EXIT_OK
     data = json.loads(text)
     assert data["capture"] == "window" and (data["width"], data["height"]) == (300, 200)
+    assert data["capture_reason"] == "covered" and data["clipped"] is False
     assert Image.open(out).convert("RGB").getpixel((100, 100)) == GREEN
+    code, text, err = _run(["screenshot", "--window", "Target", "-o", str(out)], d)
+    assert code == EXIT_OK and text.startswith("saved 300x200 screenshot")
+    # A good capture never reads like a failure: it says why the window's own content was used.
+    assert "off-screen" not in text and "another window covers part of it" in err
     code, text, _ = _run(["--json", "screenshot", "--window", "Target", "--mode", "screen", "-o", str(out)], d)
-    assert code == EXIT_OK and json.loads(text)["capture"] == "screen"
+    data = json.loads(text)
+    assert code == EXIT_OK and data["capture"] == "screen" and data["capture_reason"] == "requested"
     assert Image.open(out).convert("RGB").getpixel((100, 100)) == RED
     d.window("Target").minimize()
-    code, text, _ = _run(["screenshot", "--window", "Target", "--restore-minimized", "-o", str(out)], d)
-    assert code == EXIT_OK and "off-screen" in text
+    code, text, err = _run(["screenshot", "--window", "Target", "--restore-minimized", "-o", str(out)], d)
+    assert code == EXIT_OK and "it is minimized: captured the window's own content" in err
     assert _run(["screenshot", "--window", "Target", "--region", "0,0,5,5"], d)[0] == EXIT_USAGE
     assert _run(["screenshot", "--mode", "window"], d)[0] == EXIT_USAGE
 

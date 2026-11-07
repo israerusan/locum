@@ -53,7 +53,7 @@ import os
 import pathlib
 import re
 import time
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import failsafe as _failsafe_mod
 from ._cancel import check as _cancel_check
@@ -97,6 +97,72 @@ _FATAL = FATAL_ERRORS
 _QUOTED_RE = re.compile(r'"((?:[^"\\]|\\.)*)"|\'((?:[^\'\\]|\\.)*)\'')
 _BARE_ATTR_RE = re.compile(r"\[\s*(?:name|title|text|aaname|value)\s*[!*^$~%]?=\s*([^\]\s\"']+)", re.I)
 _LEAD_ROLE_RE = re.compile(r"^\s*([A-Za-z_][\w\-]*)")
+
+
+def _fmt_handle(handle: Any) -> str:
+    return f"{handle:#x}" if isinstance(handle, int) else repr(handle)
+
+
+def _window_summary(info: Any) -> Dict[str, Any]:
+    return {"title": info.title, "app": info.app or None, "pid": info.pid, "handle": info.handle}
+
+
+def _window_line(info: Any) -> str:
+    return f"{info.title!r} (app={info.app or '?'}, pid={info.pid}, handle={_fmt_handle(info.handle)})"
+
+
+def _window_not_found(backend: Any, requested: Dict[str, Any], timeout: float, limit: int = 5) -> WindowNotFound:
+    """A :class:`WindowNotFound` that says what was asked for, the closest windows open now,
+    the active window and the shortest way to recover; ``exc.details`` has the same as data."""
+    crit = ", ".join(f"{k}={v!r}" for k, v in requested.items()) or "any"
+    try:
+        infos = [i for i in backend.list_windows() if (i.title or "").strip()]
+    except Exception:
+        infos = []
+    try:
+        active = backend.active_window()
+    except Exception:
+        active = None
+    want = requested.get("title")
+    want = getattr(want, "pattern", want)
+    want_s = str(want).lower() if want is not None else ""
+    want_app = str(requested.get("app") or "").lower()
+    words = [w for w in re.split(r"[^\w]+", want_s) if len(w) >= 3]
+
+    def score(info: Any) -> float:
+        t = (info.title or "").lower()
+        s = difflib.SequenceMatcher(None, want_s, t).ratio() if want_s else 0.0
+        s += 0.5 * sum(1 for w in words if w in t) / max(len(words), 1)
+        if want_app and want_app in (info.app or "").lower():
+            s += 1.0
+        return s
+
+    order = {id(i): n for n, i in enumerate(infos)}
+    closest = sorted(infos, key=lambda i: (-score(i), order[id(i)]))[:limit]
+    parts = [f"No window matching {crit} within {timeout:g}s."]
+    if closest:
+        more = len(infos) - len(closest)
+        parts.append("Closest current windows: " + "; ".join(_window_line(i) for i in closest)
+                     + (f" (+{more} more)" if more > 0 else "") + ".")
+    else:
+        parts.append("No titled windows are open.")
+    if active is not None:
+        parts.append(f"Active window: {_window_line(active)}.")
+    hint = ("Window titles often change with the app's state (a document or page name): match a stable part "
+            "of the title (a substring or glob) or the app, and list the windows with `locum windows`.")
+    top = closest[0] if closest else None
+    stem = os.path.splitext(os.path.basename(top.app or ""))[0] if top is not None else ""
+    if want_s and stem and len(stem) >= 3 and stem.lower() in (top.title or "").lower() and stem.lower() != want_s:
+        hint += f" For example {stem!r} matches {top.title!r}."
+    parts.append(hint)
+    exc = WindowNotFound(" ".join(parts))
+    exc.details = {  # type: ignore[attr-defined]
+        "requested": {k: getattr(v, "pattern", v) for k, v in requested.items()},
+        "closest": [_window_summary(i) for i in closest],
+        "active": _window_summary(active) if active is not None else None,
+        "hint": hint,
+    }
+    return exc
 
 
 def _describe_image(image: Any) -> str:
@@ -713,26 +779,51 @@ class Desktop:
         password fields, text with Tab/Enter key presses) is typed unverified,
         as before. ``verify=False`` always types raw keystrokes.
 
+        **Unverified typing is best-effort**: a busy application can drop or
+        garble keystrokes and nothing notices. When the exact text matters, type
+        into an element (``d.find(sel).type(text)``, which refuses to report
+        success it cannot prove with ``verify="exact"``/``"amount"``), use
+        :meth:`Element.set_text`, or ``mode="clipboard"`` into a readable field.
+
         ``text`` may be a :class:`~locum.rpa.credentials.Secret`: it is revealed only
         to type it, and an error message never shows it.
         """
         from ._secret import is_secret, reveal, scrubbing_errors
+        from .element import VerifyResult
 
         secret = is_secret(text)
         text = reveal(text)
         mode = mode or self.typing_mode
         el: Optional[Element] = None
         before: Optional[str] = None
+        why = ""
         with scrubbing_errors(secret):
-            if verify and text and self.has(CAP_ACCESSIBILITY):
+            if not verify:
+                why = "verify=False"
+            elif not text:
+                why = "there is nothing to type"
+            elif not self.has(CAP_ACCESSIBILITY):
+                why = f"the {getattr(self.backend, 'name', '?')} backend cannot read the field back"
+            else:
                 try:
                     el = self.focused()
                     before = el._verify_snapshot(text, mode) if el is not None else None
-                except Exception:
+                    if el is None:
+                        why = "no element reports the keyboard focus"
+                    elif before is None:
+                        why = el._verify_skip_reason(text, mode)
+                except Exception as exc:  # noqa: BLE001 - typing goes ahead unverified
                     el, before = None, None
+                    why = f"the focused element could not be read ({type(exc).__name__})"
             self.keyboard.type(text, interval=interval, mode=mode)
             if el is not None and before is not None:
                 el._verify_typed(before, text)
+                result = el.last_verification or VerifyResult("verified", "normalized", text)
+            else:
+                result = VerifyResult("skipped" if not verify else "unverified", None if not verify else "normalized",
+                                      text, None, why)
+            # Read by the CLI to say whether the text was proven (not public API).
+            self._last_type_result = result
 
     def press(self, *keys: Any, presses: int = 1, interval: float = 0.0) -> None:
         """Tap keys in sequence: ``press("tab", "tab", "enter")``; combos like ``"ctrl+a"`` act as hotkeys."""
@@ -1283,15 +1374,9 @@ class Desktop:
         try:
             return self._poll(probe, t, "window not found", events=True)
         except ActionTimeout as exc:
-            crit = ", ".join(
-                f"{k}={v!r}" for k, v in (("title", title), ("app", app), ("class_name", class_name), ("pid", pid)) if v is not None
-            ) or "any"
-            try:
-                titles = [w.title for w in self.backend.list_windows()]
-            except Exception:
-                titles = []
-            listing = ", ".join(repr(x) for x in titles[:15]) if titles else "none"
-            raise WindowNotFound(f"No window matching {crit} within {t:g}s. Open windows: {listing}") from exc
+            requested = {k: v for k, v in (("title", title), ("app", app), ("class_name", class_name), ("pid", pid))
+                         if v is not None}
+            raise _window_not_found(self.backend, requested, t) from exc
 
     def active_window(self) -> Optional[Window]:
         """The foreground window, or ``None``."""

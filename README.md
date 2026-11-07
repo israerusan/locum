@@ -516,7 +516,10 @@ Read this before you depend on locum.
   field back and repairs a bad result, or raises), `set_text` with
   verification, or `mode="clipboard"`. For amounts and document numbers, use
   `verify="amount"` or `verify="exact"` ([details](#humanized-layout-independent-input)).
-  A bare `d.type()` into whatever has focus is not verified.
+  `d.type()` reads the focused field back when it can (a readable text field
+  without Tab/Enter in the text). Anything else is typed unverified (a button,
+  an app with no accessibility, a password field), and the CLI prints
+  `(NOT verified)` with the reason.
 * **A solo project, built with heavy AI assistance.** One maintainer, with
   much of the code, review and fixing done with Claude (commits carry a
   `Co-Authored-By` line). Every fix has a regression test, and real-desktop
@@ -653,10 +656,43 @@ and the LLM tools bind each input to the window the policy judged.
 `Desktop.type()` without an element goes to the focus, as documented.
 
 **`--json` is a contract.** stdout carries exactly one JSON document, also on
-failure (`{"ok": false, "error": {"type", "message", "exit_code"}}`); diagnostics
-go to stderr; the exit code is non-zero on failure. Non-ASCII text is escaped
+failure, usage errors included:
+`{"ok": false, "error": {"type", "label", "message", "exit_code", "hint"?, "details"?}}`.
+`message` says what locum tried and what it found, `hint` gives the shortest way
+to recover, and `details` holds data such as the closest windows. Diagnostics go
+to stderr (`locum: <label>: <message>`, then `locum: hint: ...`), and the exit
+code is non-zero on failure. Non-ASCII text is escaped
 (`\u280b`) unless stdout is UTF-8, and text output never fails on a legacy
 console code page (characters it cannot show become `?`).
+
+**Window titles change.** Many apps put the document or page in the title
+(`Welcome - Vault - Obsidian` becomes `Review queue - Vault - Obsidian`). `--window`
+matches a substring or glob, so pass a stable part (`--window Obsidian`). When
+no window matches, the error lists the closest current windows (title, app, pid,
+handle) and the active window, and suggests a stable part when it can.
+
+**Unverified typing is labelled.** `type` reports `(read back and verified)` only
+when the field was read back. Otherwise it says `(NOT verified)` and prints the
+reason on stderr (`"verified": false` and `"unverified_reason"` with `--json`).
+Use `--into SELECTOR` when the exact text matters.
+
+**Electron and custom-drawn apps.** Some apps expose only their top-level window
+to accessibility, so a selector cannot reach their content. The error says so,
+and coordinates inside the window (`click --window T X,Y`), images and
+`hotkey`/`press` keep working.
+
+**Window screenshots say how they were taken.** `screenshot --window T` captures
+the window's own content when it is covered, partly off-screen or minimized, and
+says why on stderr. That is a normal, complete capture, not a failure. If that
+capture fails and locum grabs the screen area instead, or the image holds only
+the on-screen part, the note says so (`capture_reason`, `clipped` and
+`fallback_error` with `--json`).
+
+**Which locum is this?** `locum --version` prints the version, the executable
+that ran, the package directory, the Python interpreter and what `locum`
+resolves to on PATH. It warns when another installation shadows this one, for
+example an old `pip install` ahead of a `uv tool` install. `locum info` shows
+the same.
 
 `observe --window T` shows that window only: no other window's title, and the
 parts of it covered by other windows are blanked out of the screenshot.

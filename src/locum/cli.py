@@ -50,6 +50,7 @@ import argparse
 import contextlib
 import datetime as _dt
 import importlib.util
+import io
 import json
 import math
 import os
@@ -617,6 +618,55 @@ def _unscoped_target(ctx: _Ctx) -> Any:
 # =============================================================================== commands
 
 
+def provenance() -> Dict[str, Any]:
+    """Which locum this is and where it runs from: the answer to "I upgraded, why is it still old?"
+
+    ``executable`` is the program that started this process, ``package`` the directory the
+    ``locum`` package was imported from, ``python`` the interpreter, and ``on_path`` what
+    ``locum`` resolves to on ``PATH`` -- when that is another installation, a plain
+    ``locum`` command runs the other one (``path_mismatch``)."""
+    import shutil
+
+    exe = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] not in ("", "-c") else None
+    on_path = shutil.which("locum")
+    on_path = os.path.abspath(on_path) if on_path else None
+
+    def norm(path: Optional[str]) -> str:
+        return os.path.normcase(os.path.splitext(path or "")[0])
+
+    mismatch = bool(exe and on_path and os.path.basename(norm(exe)) == "locum" and norm(exe) != norm(on_path))
+    return {
+        "version": __version__,
+        "executable": exe,
+        "package": os.path.dirname(os.path.abspath(__file__)),
+        "python": sys.executable,
+        "python_version": platform.python_version(),
+        "on_path": on_path,
+        "path_mismatch": mismatch,
+    }
+
+
+def _provenance_lines(info: Dict[str, Any]) -> List[str]:
+    lines = [f"locum {info['version']}",
+             f"  executable: {info['executable'] or '(none: imported as a library)'}",
+             f"  package:    {info['package']}",
+             f"  python:     {info['python']} ({info['python_version']})",
+             f"  on PATH:    {info['on_path'] or '(no locum command on PATH)'}"]
+    if info["path_mismatch"]:
+        lines.append("  warning:    a plain `locum` command runs the PATH entry above, not this one: another "
+                     "installation shadows it. Remove the old one or put this one first on PATH.")
+    return lines
+
+
+class _VersionAction(argparse.Action):
+    """``--version``: the version plus where it is installed (computed only when asked)."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: Any, values: Any, option_string: Any = None) -> None:
+        for line in _provenance_lines(provenance()):
+            print(line)
+        parser.exit()
+
+
 def cmd_info(ctx: _Ctx) -> int:
     d = ctx.desktop
     be = d.backend
@@ -631,9 +681,15 @@ def cmd_info(ctx: _Ctx) -> int:
     active = safe(d.active_window)
     cursor = safe(d.position)
     deps = {mod: importlib.util.find_spec(mod) is not None for mod, _ in OPTIONAL_DEPENDENCIES}
+    prov = provenance()
     data = {
         "version": __version__,
         "python": platform.python_version(),
+        "executable": prov["executable"],
+        "package": prov["package"],
+        "python_executable": prov["python"],
+        "on_path": prov["on_path"],
+        "path_mismatch": prov["path_mismatch"],
         "platform": sys.platform,
         "os": platform.platform(),
         "backend": getattr(be, "name", type(be).__name__),
@@ -652,6 +708,12 @@ def cmd_info(ctx: _Ctx) -> int:
         ctx.emit_json(data)
         return EXIT_OK
     ctx.print(f"locum {__version__} on Python {data['python']} ({data['os']})")
+    ctx.print(f"executable:   {prov['executable'] or '(none)'}")
+    ctx.print(f"package:      {prov['package']}")
+    ctx.print(f"python:       {prov['python']}")
+    ctx.print(f"on PATH:      {prov['on_path'] or '(no locum command on PATH)'}")
+    if prov["path_mismatch"]:
+        ctx.info("warning: a plain `locum` command runs the PATH entry above, not this installation")
     ctx.print(f"backend:      {data['backend']} ({data['backend_class']})")
     ctx.print(f"capabilities: {', '.join(data['capabilities']) or 'none'}")
     for m in monitors:
@@ -675,11 +737,12 @@ def cmd_screenshot(ctx: _Ctx) -> int:
     mode = getattr(a, "mode", "auto")
     restore_minimized = bool(getattr(a, "restore_minimized", False))
     how = None
+    report: Dict[str, Any] = {}
     if window is not None:
         if a.region or a.monitor is not None:
             raise _UsageError("--window cannot be combined with --region or --monitor")
         win = ctx.desktop.window(window, timeout=0)
-        img, how = win._capture(mode, restore_minimized=restore_minimized)
+        img, how, report = win._capture_report(mode, restore_minimized=restore_minimized)
         p = os.path.expanduser(out)
         os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
         if os.path.splitext(p)[1]:
@@ -696,11 +759,46 @@ def cmd_screenshot(ctx: _Ctx) -> int:
         data = {"path": path, "width": img.size[0], "height": img.size[1]}
         if how is not None:
             data["capture"] = how
+            data["capture_reason"] = report.get("reason")
+            data["clipped"] = bool(report.get("clipped"))
+            if report.get("fallback_error"):
+                data["fallback_error"] = report["fallback_error"]
         ctx.emit_json(data)
     else:
-        via = " (window captured off-screen)" if how == "window" else ""
-        ctx.print(f"saved {img.size[0]}x{img.size[1]} screenshot to {path}{via}")
+        ctx.print(f"saved {img.size[0]}x{img.size[1]} screenshot to {path}")
+        note = _capture_note(how, report)
+        if note:
+            ctx.info(note)
     return EXIT_OK
+
+
+#: What each capture outcome means, in words that do not read as a failure when the image is fine.
+_CAPTURE_NOTES = {
+    ("window", "requested"): "captured the window's own content (--mode window)",
+    ("window", "covered"): "another window covers part of it: captured the window's own content instead of the screen",
+    ("window", "off_screen"): "part of it is off-screen: captured the window's own content, so the image is complete",
+    ("window", "minimized"): "it is minimized: captured the window's own content",
+    ("screen", "requested"): "grabbed its area of the screen (--mode screen): anything covering it is in the image",
+    ("screen", "no_window_capture"): "grabbed its area of the screen (this backend cannot capture a window's own "
+                                     "content): anything covering it is in the image",
+}
+
+
+def _capture_note(how: Optional[str], report: Dict[str, Any]) -> str:
+    """One line on stderr explaining a window capture, or ``""`` when there is nothing to say."""
+    if how is None:
+        return ""
+    reason = report.get("reason")
+    parts = []
+    if reason == "fallback":
+        parts.append(f"capturing the window's own content failed ({report.get('fallback_error')}); grabbed its area "
+                     "of the screen instead: anything covering it is in the image")
+    elif (how, reason) in _CAPTURE_NOTES:
+        parts.append(_CAPTURE_NOTES[(how, reason)])
+    if how == "screen" and report.get("clipped"):
+        parts.append("part of the window is off-screen, so the image holds only the on-screen part "
+                     "(--mode window captures all of it where the backend can)")
+    return "note: " + "; ".join(parts) if parts else ""
 
 
 def cmd_windows(ctx: _Ctx) -> int:
@@ -840,7 +938,6 @@ def cmd_type(ctx: _Ctx) -> int:
         raise _UsageError("--replace needs --into SELECTOR")
     _require_scope(ctx, "Typed keystrokes", flag="focused", allowed="--window TITLE or --into SELECTOR")
     window = _target_window(ctx) if a.window else None
-    verified: Optional[bool] = None
     if a.into:
         # The element (inside --window when given) keeps the input: every keystroke is
         # checked against its window and focus, and the field is read back afterwards.
@@ -850,17 +947,27 @@ def cmd_type(ctx: _Ctx) -> int:
                 el.set_text(text)
             else:
                 el.type(text, interval=a.interval, mode=a.mode)
-        verified = el._value_for_verify() is not None
+        result = el.last_verification
     else:
+        d._last_type_result = None
         with (_bound(ctx, window) if window is not None else _unscoped_target(ctx)):
             d.type(text, interval=a.interval, mode=a.mode)
+        result = getattr(d, "_last_type_result", None)
+    verified = bool(result is not None and result.verified)
+    why = (result.reason if result is not None else "") or "the typed text was not read back"
     if ctx.json:
-        ctx.emit_json({"typed": len(text), "into": a.into, "window": window.title if window is not None else None,
-                       "verified": verified})
+        data = {"typed": len(text), "into": a.into, "window": window.title if window is not None else None,
+                "verified": verified}
+        if not verified:
+            data["unverified_reason"] = why
+        ctx.emit_json(data)
     else:
         ctx.print(f"typed {len(text)} character(s)" + (f" into {a.into!r}" if a.into else "")
                   + (f" in {window.title!r}" if window is not None else "")
-                  + (" (read back and verified)" if verified else ""))
+                  + (" (read back and verified)" if verified else " (NOT verified)"))
+        if not verified:
+            ctx.info(f"warning: the text was not read back ({why}); the app may have dropped or garbled keystrokes. "
+                     "To prove it: --into SELECTOR (reads the field back) or --into SELECTOR --replace")
     return EXIT_OK
 
 
@@ -1403,7 +1510,8 @@ def build_parser() -> argparse.ArgumentParser:
             "3 unavailable, 4 fail-safe abort, 130 interrupted. Docs: README.md, docs/LLM.md."
         ),
     )
-    parser.add_argument("--version", action="version", version=f"locum {__version__}")
+    parser.add_argument("--version", action=_VersionAction, nargs=0,
+                        help="show the version, where it is installed and which Python runs it")
     parser.add_argument("--backend", metavar="NAME",
                         help="backend: windows, macos, x11, or mock (in-memory demo desktop); "
                              "default: $LOCUM_BACKEND or the platform backend")
@@ -1437,8 +1545,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--monitor", type=int, metavar="N", help="capture monitor N (0 = primary)")
     p.add_argument("--window", metavar="TITLE", help="capture this window (even when covered by other windows)")
     p.add_argument("--mode", choices=("auto", "screen", "window"), default="auto",
-                   help="with --window: auto (default; off-screen capture when covered/off-screen/minimized), "
-                        "screen (grab its screen rectangle) or window (always capture off-screen)")
+                   help="with --window: auto (default: the window's own content when it is covered, partly "
+                        "off-screen or minimized; else its screen area), screen (grab its screen area) or window "
+                        "(always the window's own content)")
     p.add_argument("--restore-minimized", action="store_true",
                    help="with --window: briefly show a minimized window without activating it to capture it")
 
@@ -1706,14 +1815,25 @@ def main(
     err = _SafeText(stderr if stderr is not None else sys.stderr)
     inp = stdin if stdin is not None else sys.stdin
     parser = build_parser()
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    wants_json = "--json" in argv_list[: argv_list.index("--") if "--" in argv_list else len(argv_list)]
+    usage_err = io.StringIO()
     try:
         # argparse prints --help/--version to sys.stdout and usage errors to sys.stderr:
         # route them to the streams this call was given.
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(usage_err):
+            args = parser.parse_args(argv_list)
     except SystemExit as exc:  # argparse: --help/--version (0) or usage error (2)
+        err.write(usage_err.getvalue())
         code = exc.code
-        return code if isinstance(code, int) else (EXIT_OK if code is None else EXIT_USAGE)
+        code = code if isinstance(code, int) else (EXIT_OK if code is None else EXIT_USAGE)
+        if code != EXIT_OK and wants_json:
+            lines = [ln for ln in usage_err.getvalue().splitlines() if ln.strip()]
+            message = lines[-1].split(": error: ", 1)[-1] if lines else "invalid command line"
+            _emit_error_json(out, "UsageError", "error", message, code,
+                             hint="run `locum --help` or `locum COMMAND --help` for the arguments")
+        return code
+    err.write(usage_err.getvalue())
     if not args.command:
         parser.print_help(out)
         return EXIT_USAGE
@@ -1721,6 +1841,8 @@ def main(
         args.timeout = None
     if args.timeout is not None and args.timeout < 0:
         print("locum: error: --timeout must be >= 0", file=err)
+        if wants_json:
+            _emit_error_json(out, "UsageError", "error", "--timeout must be >= 0", EXIT_USAGE)
         return EXIT_USAGE
 
     ctx = _Ctx(args, out, err, inp, desktop=desktop, client=client)
@@ -1738,6 +1860,11 @@ def main(
         return handler(ctx)
     except KeyboardInterrupt:
         print("locum: interrupted", file=err)
+        if ctx.json and not ctx.json_emitted and handler is not cmd_mcp:
+            try:
+                ctx.emit_json(_error_doc("KeyboardInterrupt", "interrupted", "interrupted", EXIT_INTERRUPTED))
+            except Exception:
+                pass
         return EXIT_INTERRUPTED
     except Exception as exc:
         if args.debug:
@@ -1745,18 +1872,73 @@ def main(
 
             traceback.print_exc(file=err)
         code, label = _classify(exc)
-        print(f"locum: {label}: {_describe(exc)}", file=err)
+        message = _describe(exc)
+        hint = _recovery_hint(exc, args)
+        print(f"locum: {label}: {message}", file=err)
+        if hint and hint not in message:
+            print(f"locum: hint: {hint}", file=err)
         if ctx.json and not ctx.json_emitted and handler is not cmd_mcp:
             # --json is a contract: stdout carries exactly one JSON document, also when
             # the command failed (the diagnostic stays on stderr).
             try:
-                ctx.emit_json({"ok": False, "error": {"type": type(exc).__name__, "label": label,
-                                                      "message": _describe(exc), "exit_code": code}})
+                ctx.emit_json(_error_doc(type(exc).__name__, label, message, code, hint=hint,
+                                         details=getattr(exc, "details", None)))
             except Exception:
                 pass
         return code
     finally:
         ctx.close()
+
+
+def _error_doc(kind: str, label: str, message: str, code: int, *, hint: Optional[str] = None,
+               details: Any = None) -> Dict[str, Any]:
+    """The one JSON document a failed ``--json`` command writes: ``{"ok": false, "error": {...}}``.
+
+    ``error`` always has ``type``, ``label``, ``message`` and ``exit_code``; ``hint`` (the
+    shortest way to recover) and ``details`` (what was looked for and found, e.g. the closest
+    windows) when known."""
+    error: Dict[str, Any] = {"type": kind, "label": label, "message": message, "exit_code": code}
+    if hint:
+        error["hint"] = hint
+    if isinstance(details, dict) and details:
+        error["details"] = details
+    return {"ok": False, "error": error}
+
+
+def _emit_error_json(out: TextIO, kind: str, label: str, message: str, code: int, **kw: Any) -> None:
+    from ._secret import scrub_data
+
+    try:
+        out.write(json.dumps(scrub_data(_error_doc(kind, label, message, code, **kw)), ensure_ascii=True))
+        out.write("\n")
+    except Exception:  # pragma: no cover - a broken stdout
+        pass
+
+
+def _recovery_hint(exc: BaseException, args: argparse.Namespace) -> Optional[str]:
+    """The shortest way to recover from a failed command, when the message does not say."""
+    from .errors import (  # noqa: PLC0415
+        ActionTimeout, AmbiguousElement, ElementNotFound, ImageNotFound, TargetLost, WindowNotFound,
+    )
+
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict) and details.get("hint"):
+        return str(details["hint"])
+    window = getattr(args, "window", None)
+    where = f" --window {window!r}" if isinstance(window, str) and window else " --window TITLE"
+    if isinstance(exc, WindowNotFound):
+        return "list the open windows with `locum windows` and match a stable part of the title"
+    if isinstance(exc, (ElementNotFound, AmbiguousElement)):
+        return (f"see what the window exposes with `locum tree{where}` and copy a selector from "
+                "`locum find --all SELECTOR`")
+    if isinstance(exc, TargetLost):
+        return "keep the target window in front and run the command again"
+    if isinstance(exc, ImageNotFound):
+        return ("retake the image at the current display scale and theme; `locum locate IMAGE --confidence 0.8` "
+                "shows whether a weaker match exists")
+    if isinstance(exc, ActionTimeout):
+        return "raise --timeout, or check that the application is responding"
+    return None
 
 
 def _describe(exc: BaseException) -> str:

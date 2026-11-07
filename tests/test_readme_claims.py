@@ -30,7 +30,7 @@ def test_limitations_section_states_the_known_gaps():
     section = README.split("## Limitations and known gaps", 1)[1].split("\n## ", 1)[0]
     for claim in ("pin the exact version", "never run on a real compositor", "never run against a real SAP GUI",
                   "image matching and OCR only", "No orchestrator", "refuses network shares",
-                  "A bare `d.type()` into whatever has focus is not verified", "heavy AI assistance"):
+                  "Anything else is typed unverified", "`(NOT verified)` with the reason", "heavy AI assistance"):
         assert claim in section, claim
     assert "real JVM runs are still to come" not in README  # stale since 0.4.0 (blocking real-JVM CI)
 

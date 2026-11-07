@@ -365,29 +365,49 @@ class Window:
 
     def _capture(self, mode: str = "auto", *, restore_minimized: bool = False) -> "tuple":
         """:meth:`screenshot`, returning ``(image, how)`` with ``how`` in {"screen", "window"}."""
+        img, how, _report = self._capture_report(mode, restore_minimized=restore_minimized)
+        return img, how
+
+    def _capture_report(self, mode: str = "auto", *, restore_minimized: bool = False) -> "tuple":
+        """``(image, how, report)``: ``report`` says why that method was used and what the image holds.
+
+        ``report["reason"]``: ``"requested"`` (``mode`` named the method), ``"in_view"`` (nothing
+        covers the window), ``"covered"`` / ``"off_screen"`` / ``"minimized"`` (the window's own
+        content was captured because the screen does not show all of it), ``"no_window_capture"``
+        (the backend cannot capture a window's own content) or ``"fallback"`` (that capture
+        failed; ``report["fallback_error"]`` says why). ``report["clipped"]`` is true when a
+        screen grab holds only the on-screen part of the window."""
         m = str(mode).strip().lower()
         if m not in self.SCREENSHOT_MODES:
             raise ValueError(f"Unknown screenshot mode {mode!r}; use one of {', '.join(self.SCREENSHOT_MODES)}")
         self.refresh()
         if m == "screen":
-            return self._screen_grab(), "screen"
+            return self._screen_report("requested")
         if m == "window":
-            return self._window_grab(restore_minimized), "window"
+            return self._window_grab(restore_minimized), "window", {"reason": "requested", "clipped": False}
         # auto
         if self.is_minimized:
             if not self._can_capture_window():
                 raise NotSupported(f"Window {self.title!r} is minimized; restore it before taking a screenshot "
                                    f"(the {getattr(self.backend, 'name', '?')} backend cannot capture windows off-screen)")
-            return self._window_grab(restore_minimized), "window"
-        if self._in_plain_view() or not self._can_capture_window():
-            return self._screen_grab(), "screen"
+            return self._window_grab(restore_minimized), "window", {"reason": "minimized", "clipped": False}
+        on_screen = self.is_on_screen()
+        covered = self.is_covered()
+        if on_screen and not covered:
+            return self._screen_report("in_view")
+        if not self._can_capture_window():
+            return self._screen_report("no_window_capture")
         try:
-            return self._window_grab(False), "window"
-        except NotSupported:
-            pass
-        except BackendError:
-            pass
-        return self._screen_grab(), "screen"
+            return self._window_grab(False), "window", {"reason": "off_screen" if not on_screen else "covered",
+                                                        "clipped": False}
+        except (NotSupported, BackendError) as exc:
+            return self._screen_report("fallback", fallback_error=str(exc) or type(exc).__name__)
+
+    def _screen_report(self, reason: str, **extra: Any) -> "tuple":
+        img = self._screen_grab()
+        # Judged on geometry, not the image size (a Retina grab has twice the pixels).
+        clipped = not self.is_on_screen()
+        return img, "screen", dict({"reason": reason, "clipped": clipped}, **extra)
 
     def _can_capture_window(self) -> bool:
         try:
@@ -506,6 +526,33 @@ class Window:
                 continue
         return None
 
+    #: How many nodes :meth:`_sparse_tree_hint` looks at before calling a tree normal.
+    SPARSE_TREE_SCAN = 200
+
+    def _sparse_tree_hint(self) -> str:
+        """Why a selector cannot work here when the window exposes nothing usable to
+        accessibility -- no node below its root has a name or a value, as with Electron/Chromium
+        apps that have not turned accessibility on (a few unnamed panes), custom-drawn UIs and
+        games -- and what still works; ``""`` for a normal tree (a two-button dialog included)."""
+        try:
+            root = self._root_node()
+            if root is None:
+                return (" (the window has no accessibility root at all: use coordinates inside it, an image or "
+                        "the keyboard)")
+            below = 0
+            for i, node in enumerate(root.walk(max_depth=16)):
+                if i == 0:
+                    continue  # walk() yields the root first
+                below += 1
+                if below > self.SPARSE_TREE_SCAN or (getattr(node, "name", "") or getattr(node, "value", "")):
+                    return ""
+        except Exception:
+            return ""
+        return (f" (the window exposes only {below} unnamed accessibility element(s) below its root: its content "
+                "is not in the accessibility tree, as with Electron/Chromium apps that have not turned "
+                "accessibility on and custom-drawn UIs. A selector cannot reach it; click coordinates inside the "
+                "window, match an image, or use keyboard shortcuts)")
+
     @property
     def element(self) -> "Element":
         """The window's accessibility root (matched by handle, then by title)."""
@@ -538,6 +585,7 @@ class Window:
         except ActionTimeout as exc:
             raise ElementNotFound(
                 f"No element matching {_selector_text(selector, sel)!r} in window {self.title!r} within {timeout:g}s"
+                + self._sparse_tree_hint()
             ) from exc
         return Element(node, self.desktop, selector=_selector_text(selector, sel), scope=self)
 

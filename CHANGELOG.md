@@ -12,6 +12,59 @@ The rules apply from 0.3.0 on.
 
 ## [Unreleased]
 
+Diagnostics and honest reporting, from a critique of a real Obsidian run on
+Windows. No new capabilities: the changes are in what a failing or partly
+successful command says.
+
+### Changed
+
+- **`locum type` says when typing was not verified.** It prints
+  `(read back and verified)` only when the field was read back. Otherwise it
+  prints `(NOT verified)`, and stderr gives the reason (the focus is on a
+  button, the text holds Tab/Enter, a password field, no accessibility...) and
+  the fix (`--into SELECTOR`). With `--json`, `verified` is now `false` instead
+  of `null` when nothing was read back, and `unverified_reason` says why. The
+  `Desktop.type` docstring now says unverified typing is best-effort.
+- **`locum screenshot --window` no longer says "captured off-screen"** for a
+  normal capture. A note on stderr says why the window's own content was used
+  (it is covered, partly off-screen or minimized), or that its capture failed
+  and the screen area was grabbed instead, or that the image holds only the
+  on-screen part. `--json` adds `capture_reason`, `clipped` and
+  `fallback_error`.
+- **`locum --version` shows where locum is installed:** the version, the
+  executable that ran, the package directory, the Python interpreter, and what
+  `locum` resolves to on PATH. It warns when another installation shadows this
+  one. The first line is still `locum X.Y.Z`. `locum info` (text and `--json`)
+  shows the same.
+
+### Fixed
+
+- **A window that is not found** now gets an error naming the requested
+  criteria, the closest current windows (title, app, pid, handle) and the active
+  window. It explains that titles change with app state, and suggests a stable
+  part of the title when one is evident ("'Obsidian' matches 'Review queue -
+  Vault - Obsidian'"). With `--json`, `error.details` carries the same data.
+- **A selector that fails in a window whose content is not in the
+  accessibility tree** (nothing below the root has a name or value, as with
+  Electron/Chromium apps that have not turned accessibility on) now says so,
+  and names what still works: coordinates inside the window, images, the
+  keyboard.
+- **Failure contract.** With `--json`, usage errors (an unknown command, a
+  missing argument, a bad `--timeout`) and interrupts also write the one JSON
+  error document. The error document gains `label`, `hint` (the shortest
+  recovery) and `details`. stderr adds a `locum: hint:` line for not-found,
+  ambiguous, timeout, target-lost and image errors.
+- The README said a bare `d.type()` is never verified. In fact it reads back a
+  readable focused field. Corrected.
+
+### Tests
+
+- Regression fixtures for title drift (Welcome → Review queue → a note's name)
+  and for an Electron-style sparse tree: the selector fails with an actionable
+  error, while coordinates, hotkeys and `tree` still work. Plus tests for the
+  typing labels, capture notes, version provenance and JSON usage errors
+  (`tests/test_review14_cli_diagnostics.py`).
+
 ## [0.4.2] - 2026-11-07
 
 A security fix for confirmation callbacks, and an honest limitations section in the README.

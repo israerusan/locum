@@ -1421,8 +1421,8 @@ class Element:
             self.last_verification = VerifyResult("skipped", None, text, reason="verify=False")
         elif before is None:
             # Strict modes raise here, before a single key is sent.
-            self._conclude(text, vmode, dec, None, "the field's result cannot be read back (not a readable text "
-                           "field, a password, disabled/read-only, or Tab/Enter typed as key presses)")
+            self._conclude(text, vmode, dec, None, "the field's result cannot be read back: "
+                           + self._verify_skip_reason(text, kw["mode"]))
         elif vmode == "amount" and before != "":
             raise ValueError(f"{self!r}: verify='amount' types into an empty field only (it holds {before!r}); "
                              "use set_text(..., verify='amount') to replace the value")
@@ -1448,6 +1448,29 @@ class Element:
         if "disabled" in st or "readonly" in st:
             return None
         return self._value_for_verify()
+
+    def _verify_skip_reason(self, text: str, mode: Optional[str]) -> str:
+        """Why typing ``text`` here cannot be read back (when :meth:`_verify_snapshot` is ``None``)."""
+        from ._nodeinfo import is_password
+
+        if not text:
+            return "there is nothing to type"
+        if mode != "clipboard" and any(c in text for c in "\t\r\n"):
+            return "the text holds Tab/Enter key presses, which may move the focus or submit"
+        st = _safe(lambda: self.states, frozenset())
+        if "disabled" in st or "readonly" in st:
+            return "the field is disabled or read-only"
+        if _safe(lambda: is_password(self._node), True):
+            return "it is a password field (never read back)"
+        role = _safe(lambda: self.role, "") or "unknown"
+        if role not in ("edit", "document"):
+            return f"the focused element is a {role!r}, not a text field locum can read"
+        v = _safe(lambda: self.value, None)
+        if not isinstance(v, str):
+            return "the field does not expose its text to accessibility"
+        if len(v) > self.TYPE_VERIFY_MAX_CHARS:
+            return f"the field holds more than {self.TYPE_VERIFY_MAX_CHARS} characters"
+        return "the field cannot be read back"
 
     #: fields longer than this are not read back by :meth:`type` (cost of the round trip)
     TYPE_VERIFY_MAX_CHARS = 200_000
