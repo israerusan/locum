@@ -10,7 +10,7 @@ releases, which were the only record at the time. Those releases did not follow
 the versioning rules in docs/API.md (0.1.7 broke the CLI in a patch release).
 The rules apply from 0.3.0 on.
 
-## [Unreleased]
+## [0.4.0] - 2026-11-06
 
 ### Breaking
 
@@ -397,5 +397,6 @@ Check it on your machine: `python -m locum.selftest` (opens its own Notepad tab,
 [0.1.2]: https://github.com/israerusan/locum/releases/tag/v0.1.2
 [0.1.1]: https://github.com/israerusan/locum/releases/tag/v0.1.1
 [0.1.0]: https://github.com/israerusan/locum/releases/tag/v0.1.0
-[Unreleased]: https://github.com/israerusan/locum/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/israerusan/locum/releases/tag/v0.4.0
 [0.3.0]: https://github.com/israerusan/locum/releases/tag/v0.3.0
