@@ -1863,10 +1863,11 @@ class GuardedDesktop(_GuardedProxy):
         logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in shown.items()}
         policy = self.policy
         try:
-            # Never judge (or ask a human) while holding the desktop input lock: a confirmation
-            # prompt would block every other worker, and one that needs the desktop would deadlock.
-            with _unlocked_for_gate(self._raw):
-                policy.check(tool, clean, context=ctx, count=count, confirm=self.confirm)
+            # The gate runs with this thread's input lock and bindings still in place, also while
+            # a human confirms: releasing them would let another worker type into this field or
+            # press keys while our modifiers are held (desktop_input()/hold() promise one block).
+            # Other workers wait (DesktopBusy after input_lock_timeout) while the prompt is open.
+            policy.check(tool, clean, context=ctx, count=count, confirm=self.confirm)
         except PolicyViolation as exc:
             msg = str(exc)
             if getattr(exc, "needs_confirmation", None):
@@ -2448,29 +2449,6 @@ class _GuardedKeyboard(_GuardedProxy):
 
     def hold(self, *keys: Any) -> Any:
         return object.__getattribute__(self, "_g_guard").hold(*keys)
-
-
-@contextlib.contextmanager
-def _unlocked_for_gate(desktop: Any) -> Any:
-    """Suspend this thread's desktop input lock and input bindings around a policy gate.
-
-    A gate can run in the middle of a bound, locked action (after a Tab, before a
-    focusing click). The lock is re-taken and the bindings restored afterwards, so the
-    input that follows is checked against the element's window again; the caller
-    re-checks what may have changed meanwhile (:meth:`GuardedDesktop._recheck_focus`).
-    """
-    from .. import _inputlock, _target  # noqa: PLC0415
-
-    stack = getattr(_target._local, "stack", None)
-    saved = list(stack) if stack else []
-    if saved:
-        del stack[:]
-    try:
-        with _inputlock.released(desktop):
-            yield
-    finally:
-        if saved:
-            stack[0:0] = saved
 
 
 @contextlib.contextmanager

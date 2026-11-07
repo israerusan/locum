@@ -74,7 +74,7 @@ def _scrub_result_text(text: Any) -> Any:
     Only unambiguous (``MODEL_MIN_SCRUB``\\ +) secrets are replaced -- a PIN must not turn
     ``Clicked at (1234, 250)`` into ``(***, 250)`` -- and a JSON payload is scrubbed value
     by value after parsing, so it stays valid JSON. A text that *is* a secret is masked."""
-    from .._secret import MODEL_MIN_SCRUB, mask_value, scrub_data
+    from .._secret import _scrub_data, mask_value
 
     if not isinstance(text, str) or not text:
         return text
@@ -84,7 +84,8 @@ def _scrub_result_text(text: Any) -> Any:
         except ValueError:
             pass
         else:
-            clean = scrub_data(data, min_len=MODEL_MIN_SCRUB)
+            # Each string leaf like a field value: masked whole when it is a secret.
+            clean = _scrub_data(data, mask_value, 0)
             return text if clean == data else json.dumps(clean, ensure_ascii=False)
     return mask_value(text) or text
 
@@ -2323,6 +2324,10 @@ class DesktopToolkit:
                 value = oe.node.value
                 if secret and value not in (None, ""):
                     value = "***"  # the model and the audit log never see passwords
+                else:
+                    from .._secret import mask_value  # noqa: PLC0415
+
+                    value = mask_value(value)  # a secret typed into an ordinary field
             else:
                 secret = oe.value == "***"
                 value = oe.value

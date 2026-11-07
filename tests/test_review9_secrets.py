@@ -107,7 +107,8 @@ def test_tool_result_keeps_numbers_and_json_valid():
     payload = json.dumps({"value": f"pw={PW}", "pin": "1234", "nested": [PW, 1234]})
     out = ToolResult(payload).text
     data = json.loads(out)  # still JSON
-    assert data == {"value": f"pw={MASK}", "pin": "1234", "nested": [MASK, 1234]}
+    # A JSON string leaf is a value: masked whole when it is a secret, even a short one.
+    assert data == {"value": f"pw={MASK}", "pin": MASK, "nested": [MASK, 1234]}
     weird = Secret('a", "b": "cc')  # a long secret that spans JSON structure when quoted
     text = json.dumps({"a": weird.reveal()})
     assert json.loads(ToolResult(text).text) == {"a": MASK}
@@ -213,3 +214,15 @@ def test_scrub_pattern_is_built_once_and_observations_scrubbed_once(orders, monk
         obs.text()
     assert len(built) <= 2  # one per strength, then cached
     assert len(calls) == 3  # once per Observation.to_dict, not once per element too
+
+
+def test_read_text_and_reformatted_or_truncated_secrets_are_masked(orders):
+    from locum._secret import mask_value
+
+    Secret("4821")
+    Secret("4111111111111111")
+    Secret("Tr0ubdor-Vault-77")
+    assert mask_value("4111 1111 1111 1111") == MASK  # the field groups the digits
+    assert mask_value("Tr0ubdor") == MASK  # a maxlength=8 field cut it short
+    assert mask_value("4821") == MASK
+    assert mask_value("1920x1080") == "1920x1080" and mask_value("Total 4821.50") == "Total 4821.50"

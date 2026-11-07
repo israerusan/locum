@@ -228,9 +228,28 @@ def mask_value(value: Any) -> Any:
         return MASK
     if not isinstance(value, str) or not value:
         return value
-    if value in _known_set:
+    if value in _known_set or _looks_like_a_secret(value):
         return MASK
     return scrub_for_model(value)
+
+
+_SEPARATORS = str.maketrans("", "", " \t-._/")
+#: A field value this long (separators removed) that is a secret reformatted or cut short
+#: by the field (a maxlength) is masked as well.
+_MIN_PARTIAL = 6
+
+
+def _looks_like_a_secret(value: str) -> bool:
+    """``value`` is a registered secret shown with separators (``4111 1111 1111 1111``) or
+    truncated by the field (the first 8 characters of a longer password)."""
+    v = value.translate(_SEPARATORS)
+    if len(v) < _MIN_PARTIAL:
+        return False
+    for known in list(_known_set):
+        k = known.translate(_SEPARATORS)
+        if v == k or (len(k) >= MODEL_MIN_SCRUB and k.startswith(v)):
+            return True
+    return False
 
 
 def scrub_data(value: Any, _depth: int = 0, *, min_len: int = MIN_SCRUB) -> Any:

@@ -326,7 +326,7 @@ def hold(obj: Any, timeout: Optional[float] = None) -> Iterator[None]:
     try:
         yield
     finally:
-        if lock.held_here:  # not held after a failed re-acquire in released()
+        if lock.held_here:
             lock.release()
 
 
@@ -337,35 +337,6 @@ def _busy(obj: Any, t: float) -> DesktopBusy:
         + "; another worker is using the mouse/keyboard. Raise Desktop(input_lock_timeout=...) "
         "or run the workers' input one after another"
     )
-
-
-@contextlib.contextmanager
-def released(obj: Any, timeout: Optional[float] = None) -> Iterator[bool]:
-    """Give up this thread's hold on ``obj``'s lock (at any nesting depth) for the block.
-
-    For work that must not keep the other workers waiting -- a human confirmation
-    prompt in the middle of a compound action. Yields whether the lock was held
-    (and so released); afterwards it is held again at the same depth (waiting for it
-    like :func:`hold`, :class:`DesktopBusy` on timeout). Anything another worker
-    did meanwhile is the caller's to re-check before sending more input.
-    """
-    lock = _lock_for(obj) if enabled() else None
-    if lock is None or not lock.held_here:
-        yield False
-        return
-    depth = lock.depth
-    lock.depth = 1
-    lock.release()
-    try:
-        yield True
-    except BaseException:
-        if lock.acquire(_timeout_of(obj, timeout)):  # best effort: the block's error wins
-            lock.depth = depth
-        raise
-    t = _timeout_of(obj, timeout)
-    if not lock.acquire(t):
-        raise _busy(obj, t)
-    lock.depth = depth
 
 
 def desktop_input(desktop: Any, timeout: Optional[float] = None) -> "contextlib.AbstractContextManager[None]":

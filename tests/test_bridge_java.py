@@ -600,6 +600,10 @@ def test_jtable_cells_are_one_shared_renderer_restamped_per_fetch(fake):
         held = win.find('table text "cell 7"')
         assert win.find('table text "cell 42"').name == "cell 42"
         assert held.name == "cell 7"  # re-fetched by index, not whatever the renderer shows now
+        for i, cell in enumerate(table.kids):
+            cell.text = f"amount {i}"
+        texts = [c.text() for c in win.find("table").node.children()]
+        assert texts == [f"amount {i}" for i in range(60)]  # node-level reads, not only elements
         refs = jab.live_references
         for _ in range(3):
             assert len(win.find_all("table text")) == 60

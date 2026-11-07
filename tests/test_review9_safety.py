@@ -1,7 +1,7 @@
 """Regressions of the review-8 fixes found in review 9 (2026-11-06).
 
-* Confirmation prompts ran while the desktop input lock was held (a human confirm
-  blocked every other worker; a confirm UI needing the desktop deadlocked).
+* Input after a gate re-checks the focus (TargetLost if a prompt let it move). The lock
+  itself stays held across the gate (review 10: releasing it broke desktop_input()/hold()).
 * A flow's exempt rule counted ``[name*="e"]``, ``^=``, ``~=``, ``%=`` and ``:has-text``
   as naming a control.
 * CSV export prefixed ``'`` to plain negative/signed numbers.
@@ -50,46 +50,30 @@ def _keys(be):
     return [e[1] for e in be.events if e[0] == "key_down"]
 
 
-# ============================================================ 3: confirm without the input lock
-def test_confirm_after_a_tab_runs_without_the_input_lock():
+# ============================================================ 3: confirm keeps the block atomic
+# Review 10: releasing the lock around the gate let another worker type into this field or
+# press keys while this worker's modifiers were held. The lock stays held while a human
+# confirms; other workers wait instead of interleaving.
+def test_confirm_after_a_tab_keeps_the_input_lock():
     be, d, card, pay, _ = _shop()
     seen = []
 
     def confirm(desc, details):
-        seen.append((desc, _inputlock.holder(d), _other_thread_can_take_the_lock(d)))
+        seen.append((_inputlock._lock_for(d).held_here, _other_thread_can_take_the_lock(d)))
         return True
 
     GuardedDesktop(d, Policy.default(), confirm=confirm).find('edit "Card"').type("4111\t\n", verify=False)
-    assert seen and all(holder == "" and free for _, holder, free in seen), seen
-    assert card.value == "4111" and pay.clicks == 1  # the input still went through
+    assert seen and all(held and not free for held, free in seen), seen
+    assert card.value == "4111" and pay.clicks == 1
     assert not _inputlock._lock_for(d).held_here
 
 
-def test_confirm_before_a_focusing_click_runs_without_the_input_lock(monkeypatch):
-    be, d, _, pay, _ = _shop()
-
-    def no_native_focus(self):
-        raise NotImplementedError
-
-    monkeypatch.setattr(MockNode, "focus", no_native_focus)  # forces the focusing click
-    seen = []
-
-    def confirm(desc, details):
-        seen.append((desc, _inputlock.holder(d)))
-        return True
-
-    GuardedDesktop(d, Policy.default(), confirm=confirm).find('button "Pay now"').press("space")
-    clicks = [s for s in seen if s[0].startswith("click")]
-    assert clicks and all(h == "" for _, h in seen), seen
-    assert pay.clicks >= 1
-
-
-def test_a_lock_held_by_the_caller_is_released_for_confirm_and_restored():
+def test_a_callers_desktop_input_block_stays_atomic_across_a_gate():
     be, d, card, pay, _ = _shop()
     seen = []
 
     def confirm(desc, details):
-        seen.append(_inputlock.holder(d))
+        seen.append(_other_thread_can_take_the_lock(d))
         return True
 
     g = GuardedDesktop(d, Policy.default(), confirm=confirm)
@@ -97,7 +81,17 @@ def test_a_lock_held_by_the_caller_is_released_for_confirm_and_restored():
     with _inputlock.desktop_input(d), _inputlock.desktop_input(d):
         g.find('edit "Card"').type("4111\t\n", verify=False)
         assert lock.held_here and lock.depth == 2
-    assert seen == [""] and not lock.held_here and lock.owner is None
+    assert seen and not any(seen) and not lock.held_here and lock.owner is None
+
+
+def test_held_modifier_is_not_shared_with_another_worker_during_a_gate():
+    be, d, card, pay, _ = _shop()
+    g = GuardedDesktop(d, Policy.permissive())
+    other = []
+    with g.hold("ctrl"):
+        g.press("b")
+        other.append(_other_thread_can_take_the_lock(d))
+    assert other == [False]
 
 
 def test_focus_moved_during_confirm_stops_the_rest_of_the_input():

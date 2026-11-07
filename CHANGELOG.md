@@ -82,14 +82,17 @@ Secrets and the credential vault:
   field value equal to a secret is masked, and secrets of 8+ characters are
   scrubbed from names, titles and tool results (JSON stays valid). Short
   secrets such as PINs never change the numbers, titles or selectors the
-  model reads. `last_verification` masks secrets.
+  model reads. A field value that is a secret shown with separators
+  (`4111 1111 1111 1111`) or cut short by the field is masked too, and so is
+  the value `read_text` returns. `last_verification` masks secrets.
 - Robot log messages and step errors are scrubbed. `scrubbing_errors` scrubs
   arguments and OSError filenames along the cause/context chain without
   changing the exception's type. Traces, run reports, robot logs and CLI
   errors scrub exceptions with a custom `__str__`.
-- Policy checks and confirmation prompts never run while the desktop input
-  lock is held. Input after a mid-action prompt stops with `TargetLost` if
-  the focus moved.
+- Input after a policy check in the middle of an action (after a Tab, before
+  a focusing click) stops with `TargetLost` if the focus moved meanwhile.
+  The desktop input lock stays held through the check, also while a human
+  confirms, so other workers wait instead of typing between the steps.
 - Traces scrub before truncating, so a cut can't leave part of a secret.
 - The env credential fallback also applies when keyring has no usable
   backend (headless CI).
@@ -146,6 +149,8 @@ Experimental bridges and backends:
   reference per cell (Swing creates new cell objects on every read).
   Children there are kept by index, and replaced children are released at
   once.
+- Java bridge: held elements stay valid when their panel is rebuilt, and
+  children that went away are released unless the caller still holds them.
 - Java bridge: JTable cells read their own data. Over the Access Bridge every
   cell is one shared renderer object that holds the data of the cell fetched
   last (found on a real JVM), so each cell is now read as it is fetched, and

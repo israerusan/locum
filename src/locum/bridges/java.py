@@ -812,6 +812,8 @@ class JavaNode(AccessibleNode):
 
     def text(self, chunk: int = 1000) -> str:
         """The accessible text (``getAccessibleTextInfo`` + ``getAccessibleTextRange``), else the name."""
+        if self._index >= 0 and self._parent is not None and self._parent._index_addressed():
+            self._refetch()  # a JTable cell is the shared renderer: stamp it with this cell first
         info = self.info
         if info is None or not info.accessibleText:
             return self.name
