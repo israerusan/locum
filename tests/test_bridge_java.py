@@ -646,7 +646,7 @@ def test_unmatched_children_of_an_ordinary_container_are_released(fake):
     assert fake.refs == {} and jab.live_references == 0
 
 
-def test_removed_child_reference_is_released_on_close(fake):
+def test_removed_child_reference_is_released_at_once(fake):
     panel = fake.roots[HWND].kids[0]
     jab = bridge()
     win = jab.from_hwnd(HWND)
@@ -654,7 +654,22 @@ def test_removed_child_reference_is_released_on_close(fake):
     held = jab.live_references
     del panel.kids[0]
     assert not win.exists('text "Customer:"')
-    assert jab.live_references == held  # dropped from the tree, freed on close
+    assert jab.live_references == held - 1  # nobody holds it: freed now, not on close
+    jab.close()
+    assert fake.refs == {} and jab.live_references == 0
+
+
+def test_removed_child_held_by_the_caller_is_kept_until_close(fake):
+    panel = fake.roots[HWND].kids[0]
+    jab = bridge()
+    win = jab.from_hwnd(HWND)
+    label = win.find('text "Customer:"')
+    held = jab.live_references
+    del panel.kids[0]
+    assert not win.exists('text "Customer:"')
+    assert jab.live_references == held  # the caller's element keeps its reference
+    assert label.name == "Customer:"
+    del label
     jab.close()
     assert fake.refs == {} and jab.live_references == 0
 

@@ -43,6 +43,7 @@ import struct
 import sys
 import threading
 import time
+import weakref
 from ctypes import POINTER, Structure, byref, c_int, c_int32, c_int64, c_long, c_short, c_uint16, c_void_p
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -484,6 +485,8 @@ class JavaNode(AccessibleNode):
         self._released = False
         #: The index this node was read at in its parent (``getAccessibleChildFromContext``).
         self._index = -1
+        #: Live :class:`JavaElement` objects wrapping this node (a held node is never freed early).
+        self._holders = 0
 
     # ------------------------------------------------------------------ raw data
     @property
@@ -519,8 +522,9 @@ class JavaNode(AccessibleNode):
         Names, states, values and bounds are read again. The child lists are
         checked against the JVM: unchanged children keep their node (so
         elements already handed out stay valid), new ones are added, and the
-        ones that went away are dropped from the tree (their references are
-        released on :meth:`JavaBridge.close`). Cells, list items and tree nodes
+        ones that went away are dropped from the tree and their references
+        released, except where the caller still holds an element in that
+        subtree (those are released on :meth:`JavaBridge.close`). Cells, list items and tree nodes
         below a table, list or tree are kept by index (Swing hands out a new
         proxy object on every read): a held cell element stays valid and reads
         whatever is at its position now; the swapped-out references are
@@ -630,11 +634,15 @@ class JavaNode(AccessibleNode):
                     if id(old) not in kept:
                         old.release()
             else:
-                # An unmatched old child may still exist (moved beyond the match window, or held
-                # by the caller): the bridge has no reliable "gone" signal, so its reference stays
-                # tracked and JavaBridge.close() releases it. Freeing it here would kill a held
-                # element that a fresh lookup still finds.
+                # An unmatched old child is gone, or is a fresh proxy of a component that hands
+                # out new objects on every read. Free it now, unless the caller still holds an
+                # element in its subtree: that one may still exist (moved beyond the match
+                # window), so its reference stays tracked and JavaBridge.close() releases it.
                 kids = self._read_matched(count, prev)
+                kept = {id(k) for k in kids}
+                for old in prev:
+                    if id(old) not in kept and not old._subtree_held():
+                        old.release()
             self._kids = kids
             self._kids_stale = False
         return self._kids
@@ -826,6 +834,14 @@ class JavaNode(AccessibleNode):
             start = end + 1
         return "".join(parts)
 
+    def _subtree_held(self) -> bool:
+        if self._holders > 0:
+            return True
+        return any(kid._subtree_held() for kid in self._kids or ())
+
+    def _unhold(self) -> None:
+        self._holders -= 1
+
     def release(self) -> None:
         """Release this node's reference and those of its (already read) descendants."""
         for kid in self._kids or ():
@@ -859,6 +875,8 @@ class JavaElement:
 
     def __init__(self, node: JavaNode) -> None:
         self.node = node
+        node._holders += 1
+        weakref.finalize(self, node._unhold)
 
     @property
     def bridge(self) -> JavaBridge:
