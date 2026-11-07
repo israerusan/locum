@@ -73,7 +73,8 @@ def _scrub_result_text(text: Any) -> Any:
 
     Only unambiguous (``MODEL_MIN_SCRUB``\\ +) secrets are replaced -- a PIN must not turn
     ``Clicked at (1234, 250)`` into ``(***, 250)`` -- and a JSON payload is scrubbed value
-    by value after parsing, so it stays valid JSON. A text that *is* a secret is masked."""
+    by value after parsing (a secret that appears as a JSON number becomes a bare ***,
+    which is no longer valid JSON: masking wins). A text that *is* a secret is masked."""
     from .._secret import _scrub_data, mask_value, scrub_for_model
 
     if not isinstance(text, str) or not text:

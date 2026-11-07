@@ -302,7 +302,19 @@ def _compile_folded(patterns: Iterable[Union[str, Pattern]]) -> List[Pattern]:
     Used for ``confirm_patterns``, which are matched against folded text (and the
     original), so they match accented and unaccented spellings alike.
     """
-    return _compile(_fold(p) if isinstance(p, str) else p for p in patterns)
+    out: List[Pattern] = []
+    for p in patterns:
+        if isinstance(p, str):
+            try:
+                out.append(re.compile(_fold(p), re.IGNORECASE))
+                continue
+            except re.error:
+                # Folding can break a valid pattern (a combining mark alone in a character
+                # class, "[ंँ]"): keep the pattern as written; it still matches the
+                # original text, which is checked too.
+                pass
+        out.extend(_compile([p]))
+    return out
 
 
 def _text_variants(text: str) -> List[str]:

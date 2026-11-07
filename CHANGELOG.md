@@ -10,7 +10,7 @@ releases, which were the only record at the time. Those releases did not follow
 the versioning rules in docs/API.md (0.1.7 broke the CLI in a patch release).
 The rules apply from 0.3.0 on.
 
-## [Unreleased]
+## [0.4.1] - 2026-11-07
 
 A full review of 0.4.0 by seven independent reviewers found the defects below.
 Each one was reproduced first and now has a regression test that fails on
@@ -203,6 +203,8 @@ Hardening pass before release:
   another cell's data.
 - Self-healing no longer takes the French/Spanish article "un" for a
   negation; "Un-lock" and "De-select" are still refused.
+- A custom policy pattern with a combining mark inside a character class
+  compiles again (folding had turned it into an invalid regex).
 
 ### Tests
 
@@ -596,6 +598,7 @@ Check it on your machine: `python -m locum.selftest` (opens its own Notepad tab,
 [0.1.2]: https://github.com/israerusan/locum/releases/tag/v0.1.2
 [0.1.1]: https://github.com/israerusan/locum/releases/tag/v0.1.1
 [0.1.0]: https://github.com/israerusan/locum/releases/tag/v0.1.0
-[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/israerusan/locum/releases/tag/v0.4.1
 [0.4.0]: https://github.com/israerusan/locum/releases/tag/v0.4.0
 [0.3.0]: https://github.com/israerusan/locum/releases/tag/v0.3.0

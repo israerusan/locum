@@ -100,3 +100,12 @@ def test_guarded_mouse_up_is_not_refused_by_the_action_budget(limit, via):
     assert [e[0] for e in be.events if e[0] in ("down", "up")] == ["down", "up"]
     with pytest.raises(PolicyViolation):
         g.move(60, 60)  # the budget still holds for everything else
+
+
+def test_custom_pattern_with_a_mark_in_a_character_class_still_compiles():
+    # Release gate: folding stripped the marks and left "[]", which raised re.error when the
+    # Policy was built (0.4.0 accepted the pattern).
+    from locum.llm.safety import _compile_folded
+
+    pats = _compile_folded(["हटाए[ंँ]"])
+    assert pats[0].search("हटाएं")
