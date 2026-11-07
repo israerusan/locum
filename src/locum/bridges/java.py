@@ -489,15 +489,29 @@ class JavaNode(AccessibleNode):
     @property
     def info(self) -> Optional[AccessibleContextInfo]:
         if self._info is None and not self._released:
-            info = AccessibleContextInfo()
-            try:
-                ok = self.bridge.dll.getAccessibleContextInfo(self.vm, self.ac, byref(info))
-            except Exception:  # noqa: BLE001
-                ok = False
-            if not ok:
-                return None
-            self._info = info
+            if self._index >= 0 and self._parent is not None and self._parent._index_addressed():
+                # A JTable cell over JAB is Swing's shared renderer component: it holds this
+                # cell's data only right after the cell was fetched. Fetch it again by index.
+                self._refetch()
+            self._info = self._read_info()
         return self._info
+
+    def _read_info(self) -> Optional[AccessibleContextInfo]:
+        info = AccessibleContextInfo()
+        try:
+            ok = self.bridge.dll.getAccessibleContextInfo(self.vm, self.ac, byref(info))
+        except Exception:  # noqa: BLE001
+            ok = False
+        return info if ok else None
+
+    def _refetch(self) -> None:
+        parent = self._parent
+        if parent is None or parent._released:
+            return
+        child = parent._child(self._index)
+        if child:
+            self.bridge._track(self.vm, child)
+            self._rebind(child)
 
     def refresh(self) -> "JavaNode":
         """Re-read this node and everything below it from the JVM on next access.
@@ -649,20 +663,22 @@ class JavaNode(AccessibleNode):
                 continue
             old = by_index.get(i)
             if old is None:
-                kids.append(self._new_child(child, i))
-                continue
-            self.bridge._track(self.vm, child)
-            old._rebind(child)
-            kids.append(old)
+                node = self._new_child(child, i)
+            else:
+                self.bridge._track(self.vm, child)
+                old._rebind(child)
+                node = old
+            # Read it now: a JTable cell is the shared renderer, which the next fetch restamps.
+            node._info = node._read_info()
+            kids.append(node)
         return kids
 
     def _rebind(self, ac: int) -> None:
         """Point this node at a new reference to (the proxy at) its position; free the old one."""
-        for kid in self._kids or ():
-            kid.release()
         old, self.ac = self.ac, ac
-        self._kids = None
-        self._kids_stale = False
+        if self._kids is not None:
+            # Keep the children (held elements stay valid); they are re-read by index next time.
+            self._kids_stale = True
         self._info = None
         self.bridge.release(self.vm, old)
 

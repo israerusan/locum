@@ -74,7 +74,8 @@ def test_wide_string_round_trip():
 # ---------------------------------------------------------------------- fake DLL
 class Obj:
     def __init__(self, name: str, role: str, states: str, rect=(0, 0, 0, 0), kids=None, actions=(),
-                 text: Optional[str] = None, editable_text: bool = False, fresh_kids: bool = False) -> None:
+                 text: Optional[str] = None, editable_text: bool = False, fresh_kids: bool = False,
+                 shared_renderer: bool = False) -> None:
         self.name, self.role, self.states, self.rect = name, role, states, rect
         self.kids: List[Obj] = list(kids or [])
         self.actions = list(actions)
@@ -84,6 +85,10 @@ class Obj:
         #: Like Swing's AccessibleJTable/JList/JTree: every getAccessibleChildFromContext returns a NEW
         #: proxy object (isSameObject never matches an earlier read of the same cell).
         self.fresh_kids = fresh_kids
+        #: Like a real JTable over JAB: every cell is ONE shared renderer object that the fetch of a
+        #: cell restamps with that cell's data (isSameObject matches all of them, indexInParent -1).
+        self.shared_renderer = shared_renderer
+        self.renderer: Optional["Obj"] = None
 
 
 class Proxy:
@@ -163,6 +168,13 @@ class FakeDll:
         o = self._obj(ac)
         if not 0 <= i < len(o.kids):
             return 0
+        if o.shared_renderer:
+            if o.renderer is None:
+                o.renderer = Obj("", "label", "", (0, 0, 0, 0))
+            cell = o.kids[i]
+            o.renderer.name, o.renderer.role, o.renderer.states = cell.name, cell.role, cell.states
+            o.renderer.rect, o.renderer.text = cell.rect, cell.text
+            return self._ref(o.renderer)
         return self._ref(Proxy(o.kids[i]) if o.fresh_kids else o.kids[i])
 
     def getAccessibleActions(self, vm, ac, acts_ref) -> int:
@@ -572,6 +584,26 @@ def test_table_cells_are_fresh_proxies_and_references_stay_bounded(fake):
         assert cell.name == "cell 7"  # a held cell element stays valid (it is kept by index)
         table.kids[7].name = "cell 7 (edited)"
         assert cell.name == "cell 7 (edited)"
+    assert fake.refs == {}
+
+
+def test_jtable_cells_are_one_shared_renderer_restamped_per_fetch(fake):
+    # What a real JVM does (seen in CI): every JTable child is the same renderer object, holding
+    # the data of the cell fetched last. Reading a cell later must fetch it again by its index.
+    table = Obj("Orders", "table", "enabled,visible,showing", (0, 0, 300, 300), kids=_cells(60),
+                shared_renderer=True)
+    fake.roots[HWND].kids[0].kids.append(table)
+    with bridge() as jab:
+        win = jab.from_hwnd(HWND)
+        cells = win.find_all("table text")
+        assert [c.name for c in cells] == [f"cell {i}" for i in range(60)]
+        held = win.find('table text "cell 7"')
+        assert win.find('table text "cell 42"').name == "cell 42"
+        assert held.name == "cell 7"  # re-fetched by index, not whatever the renderer shows now
+        refs = jab.live_references
+        for _ in range(3):
+            assert len(win.find_all("table text")) == 60
+        assert jab.live_references == refs and len(fake.refs) == refs
     assert fake.refs == {}
 
 
