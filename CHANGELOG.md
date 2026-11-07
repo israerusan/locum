@@ -135,6 +135,10 @@ Experimental bridges and backends:
   reference per cell (Swing creates new cell objects on every read).
   Children there are kept by index, and replaced children are released at
   once.
+- Java bridge: JTable cells read their own data. Over the Access Bridge every
+  cell is one shared renderer object that holds the data of the cell fetched
+  last (found on a real JVM), so each cell is now read as it is fetched, and
+  read again by fetching its index.
 - Java bridge: `click()` works when the Swing click action name is localised
   ("Klicken", "cliquer"). The bridge DLL is found on `PATH`.
 - SAP: table-control rows that need a scroll work (the table is found again
