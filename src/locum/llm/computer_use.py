@@ -511,6 +511,13 @@ class ComputerUseAdapter:
                 w = None
         return str(w.title or "") if w is not None else ""
 
+    def _mark_secret(self, ctx: Dict[str, Any], params: Dict[str, Any]) -> None:
+        """Text typed into a password field is sensitive: no confirmation callback may see it."""
+        if getattr(self._local, "secret", False) and params.get("text") is not None:
+            from .safety import _add_sensitive  # noqa: PLC0415
+
+            _add_sensitive(ctx, params, ("text",))
+
     def _recheck_focus(self, action: str, params: Dict[str, Any], activates: bool, description: str, *,
                        enter: bool = False, activating: Optional[bool] = None, **extra: Any) -> None:
         """Re-run the policy for the next part of a keyboard action after focus may have moved.
@@ -521,6 +528,7 @@ class ComputerUseAdapter:
         """
         ctx = self._keyboard_context(activates, enter=enter, activating=activating, **extra)
         ctx["description"] = description
+        self._mark_secret(ctx, params)
         try:
             self.policy.check(action, params, context=ctx, count=False)
         except PolicyViolation as exc:
@@ -578,6 +586,7 @@ class ComputerUseAdapter:
                                                      "was checked", strict=True)
         except Exception:
             bind = None
+        self._mark_secret(ctx, params)
         self.policy.check(action, params, context=ctx)
         if self.policy.dry_run and action not in READ_ONLY_ACTIONS:
             note = f" (this would require human confirmation: {ctx['needs_confirmation']})" if ctx.get("needs_confirmation") else ""

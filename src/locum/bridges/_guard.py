@@ -115,6 +115,10 @@ class ActionGate:
         ctx.setdefault("description", description)
         clean = {k: v for k, v in args.items() if v is not None}
         logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in clean.items()}
+        if secret:
+            from ..llm.safety import _add_sensitive  # noqa: PLC0415
+
+            _add_sensitive(ctx, clean)
         try:
             self.policy.check(tool, clean, context=ctx, confirm=self.confirm)
         except PolicyViolation as exc:

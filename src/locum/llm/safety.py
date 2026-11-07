@@ -1271,7 +1271,12 @@ class Policy:
         ``enter`` / ``enter_target`` (the action presses Enter, and what that
         activates -- e.g. a browser form's default button "Pay now" or its action
         URL; matched against ``confirm_patterns`` like a target),
-        ``require_confirmation`` (always ask, e.g. ``ToolSpec(confirm=True)``).
+        ``require_confirmation`` (always ask, e.g. ``ToolSpec(confirm=True)``),
+        ``sensitive_args`` (names of arguments that must never be shown, e.g. a
+        PIN) and ``password_field`` (the text/value goes into a password field;
+        also inferred from ``target_node``). The ``details`` a confirmation
+        callback gets are scrubbed: sensitive arguments, :class:`Secret` values
+        and registered credentials read ``***`` everywhere in them.
         For allow rules: ``target_node`` (the accessibility node acted on,
         matched against rule selectors), ``target_window`` (title of the window
         the action lands in), ``keys`` / ``step_keys`` (key combinations
@@ -1290,6 +1295,8 @@ class Policy:
         """
         args = dict(args or {})
         ctx = context if context is not None else {}
+        # Before anything is judged: which arguments must never be shown (a password field's text).
+        _mark_sensitive(tool_name, args, ctx)
         if not self.tool_allowed(tool_name):
             raise PolicyViolation(f"Tool {tool_name!r} is not allowed by the policy")
         if self.is_read_only(tool_name):
@@ -1419,24 +1426,26 @@ class Policy:
             if self.dry_run:
                 ctx["needs_confirmation"] = reason
             else:
-                description = ctx.get("description") or f"{tool_name} {json.dumps(args, default=str)[:200]}"
                 confirm_cb = confirm if confirm is not None else self.confirm
-                from .._secret import scrub, scrub_data  # noqa: PLC0415
-
+                masked_args, sensitive = _mask_sensitive_args(args, ctx)
+                raw_description = ctx.get("description") or f"{tool_name} {json.dumps(masked_args, default=str)[:200]}"
                 # The human (or the error) sees what is being done, never a credential typed by it.
-                description = scrub(description) or description
+                description = _scrub_shown(raw_description, sensitive)
+                shown_reason = _scrub_shown(reason, sensitive)
                 if confirm_cb is None:
                     exc = PolicyViolation(
-                        f"Action {description!r} needs human confirmation ({reason}) but no confirm callback is configured"
+                        f"Action {description!r} needs human confirmation ({shown_reason}) but no confirm callback "
+                        "is configured"
                     )
                     exc.needs_confirmation = reason  # type: ignore[attr-defined]
                     raise exc
-                details = {"tool": tool_name, "args": scrub_data(dict(args)), "reason": reason}
-                details.update({k: v for k, v in ctx.items() if k not in ("desktop",)})
+                details = _confirm_details(tool_name, masked_args, shown_reason, description, ctx, sensitive)
                 try:
                     approved = bool(confirm_cb(description, details))
                 except Exception as exc:
-                    raise PolicyViolation(f"Confirmation failed for {description!r}: {exc}") from exc
+                    raise PolicyViolation(
+                        f"Confirmation failed for {description!r}: {_scrub_shown(str(exc), sensitive)}"
+                    ) from None
                 self.confirmations.append((description, approved))
                 if not approved:
                     raise PolicyViolation(f"Action {description!r} was declined by the user")
@@ -1453,6 +1462,177 @@ class Policy:
             f"<Policy preset={self.preset or 'custom'} mode={mode} exempt={len(self.exempt)} dry_run={self.dry_run} allow_tools={self.allow_tools} deny={self.deny_tools} "
             f"actions={self.action_count}/{self.max_actions}>"
         )
+
+
+#: Arguments that carry what lands in the target field (masked when the field is a password field).
+_FIELD_TEXT_ARGS = ("text", "value")
+
+
+def _add_sensitive(ctx: Dict[str, Any], args: Dict[str, Any], names: Iterable[str] = _FIELD_TEXT_ARGS) -> None:
+    """Mark these arguments (when present) as text no confirmation, log or error may show."""
+    current = ctx.get("sensitive_args")
+    marked = {k for k, v in args.items() if isinstance(v, str)} if current is True else set(current or ())
+    marked.update(k for k in names if args.get(k) is not None)
+    if marked:
+        ctx["sensitive_args"] = tuple(sorted(marked))
+
+
+def _mark_sensitive(tool_name: str, args: Dict[str, Any], ctx: Dict[str, Any]) -> None:
+    """Add ``ctx["sensitive_args"]`` for text that must never be shown: the text/value of an action
+    on a password field (``target_node``, or ``ctx["password_field"]``) and every :class:`Secret`."""
+    from .._nodeinfo import is_password  # noqa: PLC0415
+    from .._secret import contains_secret, is_secret  # noqa: PLC0415
+
+    marked = ctx.get("sensitive_args")
+    names = set(k for k, v in args.items() if isinstance(v, str)) if marked is True else set(marked or ())
+    node = ctx.get("target_node")
+    if ctx.get("password_field") or (node is not None and _safe_get(lambda: is_password(node), False)):
+        names.update(k for k in _FIELD_TEXT_ARGS if args.get(k) is not None)
+    for k, v in args.items():
+        if is_secret(v) or (isinstance(v, str) and _safe_get(lambda v=v: contains_secret(v), False)):
+            names.add(k)
+    if names:
+        ctx["sensitive_args"] = tuple(sorted(names))
+    text = args.get("text")
+    if tool_name in _TYPING_TOOLS and isinstance(text, str) and "text" not in names:
+        later = _later_pieces(text)
+        if later:
+            # Text after a Tab/newline lands in a control nobody can know yet (a password field):
+            # a human confirming this call sees only the first piece.
+            ctx["sensitive_texts"] = tuple(later)
+
+
+#: Tools whose ``text`` is typed: a Tab/newline in it moves the focus to another control.
+_TYPING_TOOLS = frozenset({"type_text", "browser_type", "type"})
+
+_PIECE_BREAK = re.compile(r"[\t\r\n]+")
+
+
+def _later_pieces(text: str) -> List[str]:
+    """The parts of typed ``text`` after its first Tab/newline."""
+    return [p for p in _PIECE_BREAK.split(text)[1:] if p]
+
+
+def _first_piece_only(text: str) -> str:
+    """``"alice\\tS3cret"`` -> ``"alice\\t***"``: the separators kept, everything after them masked."""
+    from .._secret import MASK  # noqa: PLC0415
+
+    m = _PIECE_BREAK.search(text)
+    if m is None or not text[m.end():]:
+        return text
+    return text[:m.end()] + MASK
+
+
+def _sensitive_values(value: Any) -> List[str]:
+    """The strings to mask for a sensitive argument: the whole value and each typed piece."""
+    from .._secret import reveal  # noqa: PLC0415
+
+    value = reveal(value)
+    if isinstance(value, (list, tuple)):
+        return [s for v in value for s in _sensitive_values(v)]
+    if not isinstance(value, str) or not value:
+        return []
+    out = [value]
+    out.extend(p for p in re.split(r"[\t\r\n]+", value) if p and p != value)
+    return out
+
+
+def _mask_sensitive_args(args: Dict[str, Any], ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """``(args for a human, the sensitive strings)``: sensitive arguments become ``***``, every
+    other value is scrubbed of registered secrets."""
+    from .._secret import MASK, scrub_data  # noqa: PLC0415
+
+    names = set(ctx.get("sensitive_args") or ())
+    sensitive: List[str] = [str(t) for t in (ctx.get("sensitive_texts") or ()) if t]
+    for k in names:
+        sensitive.extend(_sensitive_values(args.get(k)))
+    masked = {k: (MASK if k in names and v is not None else v) for k, v in args.items()}
+    if ctx.get("sensitive_texts") and isinstance(masked.get("text"), str):
+        masked["text"] = _first_piece_only(masked["text"])
+    masked = scrub_data(masked)
+    if sensitive:
+        masked = _scrub_any(masked, sensitive)
+    return masked, sorted(set(sensitive), key=len, reverse=True)
+
+
+def _scrub_shown(text: Any, sensitive: Sequence[str]) -> Any:
+    """``text`` without registered secrets or the ``sensitive`` strings of this action."""
+    from .._secret import MASK, scrub  # noqa: PLC0415
+
+    if not isinstance(text, str) or not text:
+        return text
+    text = scrub(text, sensitive) or text
+    # ``scrub`` skips strings shorter than 3 characters (they would garble the text); a value
+    # known to be sensitive is masked whatever its length: better a garbled prompt than a leak.
+    for value in sorted({v for v in sensitive if v}, key=len, reverse=True):
+        if value in text and value != MASK:
+            text = text.replace(value, MASK)
+    return text
+
+
+def _scrub_any(value: Any, sensitive: Sequence[str]) -> Any:
+    from .._secret import _scrub_data  # noqa: PLC0415
+
+    return _scrub_data(value, lambda s: _scrub_shown(s, sensitive), 0)
+
+
+class _ShownNode:
+    """A node handed to a confirmation callback: its text attributes are scrubbed, and the
+    value of a password field reads as ``***``."""
+
+    __slots__ = ("_node", "_sensitive", "_password")
+
+    def __init__(self, node: Any, sensitive: Sequence[str]) -> None:
+        from .._nodeinfo import is_password  # noqa: PLC0415
+
+        object.__setattr__(self, "_node", node)
+        object.__setattr__(self, "_sensitive", tuple(sensitive))
+        object.__setattr__(self, "_password", bool(_safe_get(lambda: is_password(node), False)))
+
+    @property
+    def unwrapped(self) -> Any:
+        """The real node (for code that needs it; its text is not scrubbed)."""
+        return object.__getattribute__(self, "_node")
+
+    def __getattr__(self, name: str) -> Any:
+        from .._secret import MASK  # noqa: PLC0415
+
+        node = object.__getattribute__(self, "_node")
+        if name in ("value", "text") and object.__getattribute__(self, "_password"):
+            return MASK
+        value = getattr(node, name)
+        if isinstance(value, str):
+            return _scrub_shown(value, object.__getattribute__(self, "_sensitive"))
+        return value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("a node shown to a confirmation callback is read-only")
+
+    def __repr__(self) -> str:
+        return _scrub_shown(repr(object.__getattribute__(self, "_node")), object.__getattribute__(self, "_sensitive"))
+
+
+#: Context keys holding accessibility nodes.
+_NODE_KEYS = frozenset({"target_node"})
+
+
+def _confirm_details(tool_name: str, masked_args: Dict[str, Any], reason: Any, description: str,
+                     ctx: Dict[str, Any], sensitive: Sequence[str]) -> Dict[str, Any]:
+    """The ``details`` a confirmation callback gets: the whole payload scrubbed of registered
+    secrets and of this action's sensitive text (password-field values, credentials)."""
+    details: Dict[str, Any] = {}
+    for k, v in ctx.items():
+        if k == "desktop":
+            continue
+        if k in _NODE_KEYS and v is not None:
+            details[k] = _ShownNode(v, sensitive)
+        elif k == "description":
+            details[k] = description
+        else:
+            details[k] = _scrub_any(v, sensitive)
+    details.update({"tool": tool_name, "args": masked_args, "reason": reason, "description": description})
+    details["sensitive"] = bool(ctx.get("sensitive_args") or ctx.get("sensitive_texts"))
+    return details
 
 
 _MOD_ALIASES = ("mod", "primary", "cmdorctrl", "commandorcontrol")
@@ -1875,6 +2055,8 @@ class GuardedDesktop(_GuardedProxy):
         if extra:
             ctx["exempt_rules"] = extra
         logged = {k: ("***" if secret and isinstance(v, str) else v) for k, v in shown.items()}
+        if secret:
+            _add_sensitive(ctx, clean)
         policy = self.policy
         try:
             # The gate runs with this thread's input lock and bindings still in place, also while

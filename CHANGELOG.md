@@ -10,6 +10,29 @@ releases, which were the only record at the time. Those releases did not follow
 the versioning rules in docs/API.md (0.1.7 broke the CLI in a patch release).
 The rules apply from 0.3.0 on.
 
+## [Unreleased]
+
+### Security
+
+- **Confirmation callbacks could receive a password in plain text.** When an
+  action needed a human confirmation, `details["args"]` was scrubbed of
+  registered secrets only. Text typed into a password field is not a
+  registered secret, so it reached the callback verbatim. The raw context was
+  also merged into `details` (window title, target, description, the target
+  node), and registered secrets in those fields passed through too. Affected:
+  browser password entry (`browser_type`), `GuardedDesktop`/`GuardedElement`
+  input, `DesktopToolkit` `type_text`/`set_value`, and computer use. Now the
+  policy marks password-field values sensitive before it judges the action
+  (from the target node, and from each gate's own password check). The whole
+  callback payload is scrubbed: sensitive values read `***` in `args`,
+  `description`, `reason` and every context field. Text after a Tab or newline
+  is masked (its field is not known yet). `target_node` is a read-only view
+  whose `value` is `***` on a password field, and `details["sensitive"]` says
+  whether anything was masked. An error raised by the callback is no longer
+  chained into the `PolicyViolation`, because it could carry the payload. New
+  context keys `sensitive_args` and `password_field` let integrations that
+  call `policy.check` directly mark their own arguments.
+
 ## [0.4.1] - 2026-11-07
 
 A full review of 0.4.0 by seven independent reviewers found the defects below.

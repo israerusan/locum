@@ -428,6 +428,17 @@ nobody authorized; it is not a sandbox against code that reaches
   is not matched; the click that submits it is. A click on an element is
   judged by what the mouse really hits: clicking a group or toolbar whose
   centre lies on a "Pay now" button counts as clicking "Pay now".
+* **What the callback sees.** `details` holds `tool`, `args`, `reason`,
+  `description`, `sensitive` and the action's context (`window_title`,
+  `target`, `target_node`...). The whole payload is scrubbed before the
+  callback gets it. Text typed or set into a password field becomes `***` in
+  `args` and everywhere else in `details`, and so does every
+  `Secret`/registered credential. Text after a Tab or newline is masked too
+  (`"alice\t***"`), because the policy cannot yet know which field it will
+  land in. `target_node` is a read-only view whose `value` reads `***` on a
+  password field. `details["sensitive"]` is `True` when something was masked.
+  An integration that calls `policy.check` itself can mark arguments with
+  `context={"sensitive_args": ("pin",)}` or `{"password_field": True}`.
 * **Shortcuts.** A shortcut that presses a control is judged by that
   control's label: `alt+p` on a "&Pay now" button (its access key), or a
   menu item's accelerator (`Ctrl+S` next to "Post"), needs the same

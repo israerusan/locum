@@ -911,6 +911,14 @@ class DesktopToolkit:
             spec.fn = self._wrap(name, method)
             self.registry.add(spec)
 
+    def _mark_redacted(self, ctx: Dict[str, Any]) -> None:
+        """Tell the policy which arguments of the running call are a password (redacted from the
+        audit log): a confirmation callback must not get them either."""
+        pending = getattr(self._local, "redact", None)
+        if pending:
+            marked = ctx.get("sensitive_args")
+            ctx["sensitive_args"] = True if marked is True else tuple(sorted(set(marked or ()) | set(pending)))
+
     def _redact(self, *arg_names: str) -> None:
         """Keep these arguments of the running tool call (a password) out of the audit log."""
         pending = getattr(self._local, "redact", None)
@@ -1317,6 +1325,7 @@ class DesktopToolkit:
         that takes the focus between the check and the input -- or during it -- gets none.
         """
         ctx.setdefault("description", description)
+        self._mark_redacted(ctx)
         self.policy.check(tool, {k: v for k, v in args.items() if v is not None}, context=ctx)
         if self.policy.dry_run:
             note = f" (this would require human confirmation: {ctx['needs_confirmation']})" if ctx.get("needs_confirmation") else ""
@@ -1363,6 +1372,7 @@ class DesktopToolkit:
         """
         ctx = self._context(self._focus_target(activates, enter, activating=activating), **extra)
         ctx["description"] = description
+        self._mark_redacted(ctx)
         try:
             self.policy.check(tool, {k: v for k, v in args.items() if v is not None}, context=ctx, count=False)
         except PolicyViolation as exc:
