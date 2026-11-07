@@ -392,7 +392,7 @@ class Mouse:
         self._check(ignore=target)
         dy, dx = int(dy), int(dx)
         if dy or dx:
-            _target_check("scroll", point=(target.x, target.y) if target is not None else None)
+            _target_check("scroll", point=self._live_point(target) if target is not None else None)
             self.backend.scroll(dx=dx, dy=dy)
         self._pause()
 

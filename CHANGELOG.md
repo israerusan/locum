@@ -175,6 +175,35 @@ Experimental bridges and backends:
   failed `AddMatch` no longer leaks a filter, and `release_all()` releases in
   reverse order.
 
+Hardening pass before release:
+
+- Bound scrolls check where the cursor really is, like clicks.
+- The keyword tripwire also sees through the combining grapheme joiner and
+  variation selectors.
+- A guarded mouse release is never refused by the action budget or rate
+  limit, which used to leave the button held down.
+- Windows: element bounds read on another thread than the one that created
+  the backend use per-monitor DPI coordinates, so clicks no longer miss.
+- `Window.move()`/`resize()` check their arguments before restoring a
+  minimized window, and a window handle that Windows reused for another
+  process's window counts as closed.
+- Windows credentials named like "Straße" by 0.4.0 are found and deleted
+  again (names are lower-cased, matching how Windows compares them).
+- A short secret (a 6-digit PIN) no longer masks a value that spells it with
+  a separator, such as the amount "4821.50".
+- Scrub patterns no longer pile up in the `re` module's cache over a long
+  run (memory growth, and copies of the secrets).
+- `Tracer(redact=...)` scrubs values that appear quoted or escaped in
+  arguments and errors (a password with a backslash).
+- Tool results in JSON no longer carry a long secret in a key.
+- Java bridge: an element whose Java object was released (its row removed,
+  `release()`, `release_all()` or `close()`) never passes the freed
+  reference to the JVM; reads return empty and actions raise
+  `ElementNotFound`. A held JTable cell of a removed row no longer reads
+  another cell's data.
+- Self-healing no longer takes the French/Spanish article "un" for a
+  negation; "Un-lock" and "De-select" are still refused.
+
 ### Tests
 
 - The real-JVM CI job covers a JTable, a JList and a JTree and checks that

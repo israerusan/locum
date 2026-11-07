@@ -368,20 +368,26 @@ _NEG_WORD_RE = re.compile(r"\w+(?:['’]\w+)*", re.UNICODE)
 # "Order" / "Cancel order"): English, German, Spanish, French, apostrophes removed.
 _NEGATIONS = frozenset({
     "not", "no", "dont", "doesnt", "didnt", "cant", "cannot", "wont", "never", "without", "none",
-    "cancel", "discard", "abort", "decline", "reject", "deny", "refuse", "undo", "un",
+    "cancel", "discard", "abort", "decline", "reject", "deny", "refuse", "undo",
     "nicht", "kein", "keine", "keinen", "keiner", "nein", "nie", "niemals", "ohne", "abbrechen",
     "verwerfen", "ablehnen",
     "nunca", "sin", "cancelar", "descartar", "abortar", "rechazar", "deshacer",
     "ne", "pas", "non", "jamais", "sans", "annuler", "abandonner", "rejeter", "refuser", "ignorer",
 })
 _NEG_PREFIXES = ("un", "dis", "de", "non", "in")
+# "Un-lock" / "De-select": the prefix joined to its word ("un" alone is not a negation: it is
+# the French / Spanish article in "Ajouter un fichier" / "Añadir un archivo").
+_NEG_HYPHEN_RE = re.compile(r"\b(un|dis|de|in)-(?=\w)", re.UNICODE)
+
+
+def _neg_words(name: str) -> List[str]:
+    return [w.replace("'", "").replace("’", "") for w in _NEG_WORD_RE.findall(_NEG_HYPHEN_RE.sub(r"\1", name))]
 
 
 def _negations(name: str, other_words: frozenset) -> frozenset:
     """The negating/cancelling words of ``name`` (``un``/``dis``... + a word of ``other_words`` included)."""
     out = set()
-    for raw in _NEG_WORD_RE.findall(name):
-        w = raw.replace("'", "").replace("’", "")
+    for w in _neg_words(name):
         if w in _NEGATIONS:
             out.add(w)
         elif any(w.startswith(p) and w[len(p):] in other_words for p in _NEG_PREFIXES):
@@ -391,8 +397,7 @@ def _negations(name: str, other_words: frozenset) -> frozenset:
 
 def _negation_differs(a: str, b: str) -> bool:
     """Whether one name negates/cancels what the other one does (``Save`` vs ``Don't Save``)."""
-    wa = frozenset(w.replace("'", "").replace("’", "") for w in _NEG_WORD_RE.findall(a))
-    wb = frozenset(w.replace("'", "").replace("’", "") for w in _NEG_WORD_RE.findall(b))
+    wa, wb = frozenset(_neg_words(a)), frozenset(_neg_words(b))
     return _negations(a, wb) != _negations(b, wa)
 
 

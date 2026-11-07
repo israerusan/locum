@@ -470,7 +470,13 @@ class UIANode(AccessibleNode):
 
     @property
     def bounds(self) -> Optional[Rect]:
-        r = self._get("CurrentBoundingRectangle")
+        # UIA converts the rectangle to the DPI awareness of the thread *reading* it:
+        # read it in the backend's DPI scope, like every other backend coordinate.
+        scoped = getattr(self._ctx, "dpi_call", None)
+        if callable(scoped):
+            r = scoped(lambda: self._get("CurrentBoundingRectangle"))
+        else:
+            r = self._get("CurrentBoundingRectangle")
         if r is None:
             return None
         try:

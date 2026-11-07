@@ -130,8 +130,10 @@ def _check_name(name: Any) -> str:
     if any(ord(c) < 32 for c in n) or "*" in n:
         raise ValueError(f"credential name {n!r} contains a control character or '*'")
     # Names are case-insensitive everywhere (Windows Credential Manager target names are):
-    # "ERP" and "erp" are one credential on every store.
-    return n.casefold()
+    # "ERP" and "erp" are one credential on every store. lower(), not casefold(): Windows
+    # compares upper-cased characters, so "straße" finds an entry written as "Straße" but
+    # casefold's "strasse" does not.
+    return n.lower()
 
 
 # =============================================================================== Windows
@@ -206,7 +208,7 @@ class WindowsCredentialStore:
 
     def get(self, name: str) -> Optional[Tuple[str, str]]:
         pcred = _PCRED()
-        if not self._dll.CredReadW(TARGET_PREFIX + name.casefold(), CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)):
+        if not self._dll.CredReadW(TARGET_PREFIX + name.lower(), CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)):
             if int(self._last_error() or 0) == ERROR_NOT_FOUND:
                 return None
             raise self._fail("CredReadW")
@@ -219,7 +221,7 @@ class WindowsCredentialStore:
             self._dll.CredFree(pcred)
 
     def set(self, name: str, username: str, password: str) -> None:
-        name = name.casefold()
+        name = name.lower()
         blob = password.encode("utf-16-le")
         if len(blob) > CRED_MAX_CREDENTIAL_BLOB_SIZE:
             raise ValueError(f"password is too long for Windows Credential Manager "
@@ -258,7 +260,7 @@ class WindowsCredentialStore:
 
     def delete(self, name: str) -> bool:
         """Remove ``name`` -- every case variant of it (each ``CredDeleteW`` removes one)."""
-        target = TARGET_PREFIX + name.casefold()
+        target = TARGET_PREFIX + name.lower()
         found = False
         for _ in range(_MAX_VARIANTS):
             if self._dll.CredDeleteW(target, CRED_TYPE_GENERIC, 0):
@@ -282,7 +284,7 @@ class WindowsCredentialStore:
                 c = pcreds[i].contents
                 target = c.TargetName or ""
                 if int(c.Type) == CRED_TYPE_GENERIC and target.startswith(TARGET_PREFIX):
-                    out.append(target[len(TARGET_PREFIX):].casefold())
+                    out.append(target[len(TARGET_PREFIX):].lower())
             return sorted(set(out))
         finally:
             self._dll.CredFree(pcreds)
@@ -348,10 +350,10 @@ class KeyringCredentialStore:
 
     def _variants(self, name: str) -> List[str]:
         """Names in the index that differ from ``name`` only in case (written before names were normalised)."""
-        return [n for n in self._index() if n != name and n.casefold() == name]
+        return [n for n in self._index() if n != name and n.lower() == name]
 
     def get(self, name: str) -> Optional[Tuple[str, str]]:
-        name = name.casefold()
+        name = name.lower()
         raw = self._get_raw(TARGET_PREFIX + name)
         if raw is None:
             for legacy in self._variants(name):
@@ -367,13 +369,13 @@ class KeyringCredentialStore:
             raise LocumError(f"credential {name!r} in the keyring is not a locum credential") from None
 
     def set(self, name: str, username: str, password: str) -> None:
-        name = name.casefold()
+        name = name.lower()
         self._call(self._kr.set_password, TARGET_PREFIX + name, _KEYRING_ACCOUNT,
                    json.dumps({"username": username, "password": password}))
         self._update_index(add=name)
 
     def delete(self, name: str) -> bool:
-        name = name.casefold()
+        name = name.lower()
         errors = getattr(self._kr, "errors", None)
         delete_error = getattr(errors, "PasswordDeleteError", None) if errors is not None else None
         variants = [name] + self._variants(name)
@@ -390,7 +392,7 @@ class KeyringCredentialStore:
         return found
 
     def names(self) -> List[str]:
-        return sorted({n.casefold() for n in self._index()})
+        return sorted({n.lower() for n in self._index()})
 
 
 # =============================================================================== environment

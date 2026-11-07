@@ -203,6 +203,11 @@ def _scope_public_methods(cls: type) -> type:
 class _ScreenMixin:
     """Virtual screen, monitors and screenshots of :class:`WindowsBackend`."""
 
+    @_dpi_scoped
+    def _dpi_call(self, fn: Callable[[], Any]) -> Any:
+        """``fn()`` in the backend's DPI scope (for coordinates read outside a backend call)."""
+        return fn()
+
     # =================================================================== screen
     def virtual_screen(self) -> Rect:
         self._check()

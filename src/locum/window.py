@@ -203,7 +203,11 @@ class Window:
             except BackendError:
                 info = None  # vanished mid-read / unsupported: fall back to the listing
             else:
-                return info if info.is_visible else None
+                if not info.is_visible:
+                    return None
+                if self.pid and info.pid and info.pid != self.pid:
+                    return None  # the handle was reused by another process's window
+                return info
         for w in self.backend.list_windows():
             if w.handle == self.handle:
                 return w
@@ -304,12 +308,16 @@ class Window:
         return self.rect
 
     def move(self, x: int, y: int) -> "Window":
+        x, y = int(x), int(y)  # bad arguments fail before a minimized window is restored
         r = self._current_rect()  # keeps the current size
-        return self.set_rect(Rect(int(x), int(y), r.width, r.height))
+        return self.set_rect(Rect(x, y, r.width, r.height))
 
     def resize(self, width: int, height: int) -> "Window":
+        width, height = int(width), int(height)
+        if width <= 0 or height <= 0:  # before a minimized window is restored
+            raise ValueError(f"Window size must be positive, got {width}x{height}")
         r = self._current_rect()  # keeps the current position
-        return self.set_rect(Rect(r.left, r.top, int(width), int(height)))
+        return self.set_rect(Rect(r.left, r.top, width, height))
 
     #: Accepted values of :meth:`screenshot`'s ``mode``.
     SCREENSHOT_MODES = ("auto", "screen", "window")

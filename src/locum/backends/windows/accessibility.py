@@ -131,6 +131,11 @@ class _AccessibilityMixin:
                 ctx.app_name = self._app_for_pid  # lets UIANode report its process name
             except Exception:
                 pass
+        if getattr(ctx, "dpi_call", None) is None:
+            try:
+                ctx.dpi_call = self._dpi_call  # UIANode.bounds is read after the backend call returned
+            except Exception:
+                pass
         return ctx
 
     def _app_for_pid(self, pid: int) -> str:

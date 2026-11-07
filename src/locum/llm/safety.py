@@ -102,7 +102,9 @@ _MNEMONIC_RX = re.compile(r"&(&|(?=\S))")
 def _fold(text: str) -> str:
     """:func:`fold_text` without the ``&`` handling (patterns are regexes: their ``&`` is literal)."""
     s = unicodedata.normalize("NFKD", str(text))
-    s = "".join(c for c in s if not unicodedata.combining(c) and unicodedata.category(c) != "Cf")
+    # Mn/Me as well as combining(): the grapheme joiner and variation selectors are
+    # invisible marks of combining class 0 (U+034F, U+FE00-U+FE0F, U+E0100-U+E01EF).
+    s = "".join(c for c in s if not unicodedata.combining(c) and unicodedata.category(c) not in ("Cf", "Mn", "Me"))
     return s.replace("ß", "ss").replace("ẞ", "SS")
 
 
@@ -2099,7 +2101,9 @@ class GuardedDesktop(_GuardedProxy):
     def mouse_up(self, button: str = "left") -> None:
         point = self._raw.position()
         ctx = self._point_ctx(point, activates=False)
-        if self._gate("mouse_up", {"button": str(button)}, ctx, f"release the {button} mouse button"):
+        # count=False: the release completes the press already counted; an exhausted budget or
+        # rate limit must not leave the button held down.
+        if self._gate("mouse_up", {"button": str(button)}, ctx, f"release the {button} mouse button", count=False):
             self._raw.mouse_up(button)
 
     def move(self, target: Any, y: Optional[float] = None, **kw: Any) -> Any:
@@ -2229,7 +2233,7 @@ class GuardedDesktop(_GuardedProxy):
             raw.type(piece, interval=interval, mode=mode)
 
     def _recheck_focus(self, judged: Any, what: str) -> None:
-        """After a gate in the middle of a key sequence (run without the input lock): refuse to
+        """After a gate in the middle of a key sequence (the input lock stays held; a prompt may have let the focus move): refuse to
         go on if the focus moved away from the control the gate judged."""
         if judged is None:
             return
@@ -2411,7 +2415,8 @@ class _GuardedMouse(_GuardedProxy):
     def up(self, button: Any = "left") -> None:
         guard = object.__getattribute__(self, "_g_guard")
         ctx = guard._point_ctx(guard._raw.position(), activates=False)
-        if guard._gate("mouse_up", {"button": str(button)}, ctx, f"release the {button} mouse button"):
+        if guard._gate("mouse_up", {"button": str(button)}, ctx, f"release the {button} mouse button",
+                       count=False):  # as GuardedDesktop.mouse_up: a budget never keeps a button held
             self.unwrapped.up(button)
 
     def move(self, x: Any = None, y: Optional[float] = None, **kw: Any) -> Any:

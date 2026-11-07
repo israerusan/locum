@@ -167,13 +167,28 @@ def _forms(s: str) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _compile(secrets: Any, min_len: int) -> Tuple[Optional[Pattern[str]], int]:
+def _compile(secrets: Any, min_len: int, cached: bool = True) -> Tuple[Optional[Pattern[str]], int]:
     """One alternation of every form of every secret of ``min_len`` or more characters
     (longest first, so the longest match wins at a position) and the shortest form's length."""
     forms = sorted({f for s in secrets if len(s) >= min_len for f in _forms(s)}, key=len, reverse=True)
     if not forms:
         return None, 0
-    return re.compile("|".join(map(re.escape, forms))), len(forms[-1])
+    pattern = "|".join(map(re.escape, forms))
+    return (re.compile(pattern) if cached else _compile_uncached(pattern)), len(forms[-1])
+
+
+def _compile_uncached(pattern: str) -> Pattern[str]:
+    """``re.compile(pattern)`` without a copy in the ``re`` module's cache. The registry pattern
+    is cached in ``_patterns``; every registration makes a new, longer alternation, and ``re``
+    would keep hundreds of those (each holding the secrets) for the rest of the process."""
+    try:
+        from re import _compiler as sre  # type: ignore[attr-defined]  # Python 3.11+
+    except ImportError:  # pragma: no cover - Python < 3.11
+        import sre_compile as sre  # type: ignore[no-redef]
+    try:
+        return sre.compile(pattern, 0)
+    except Exception:  # pragma: no cover - a changed private API
+        return re.compile(pattern)
 
 
 def _pattern(min_len: int) -> Tuple[Optional[Pattern[str]], int]:
@@ -182,7 +197,7 @@ def _pattern(min_len: int) -> Tuple[Optional[Pattern[str]], int]:
     cached = _patterns.get(min_len)
     if cached is not None and cached[0] == snap:
         return cached[1], cached[2]
-    pat, shortest = _compile(snap, min_len)
+    pat, shortest = _compile(snap, min_len, False)  # not kept by re: see _compile_uncached
     with _lock:
         _patterns[min_len] = (snap, pat, shortest)
     return pat, shortest
@@ -234,8 +249,9 @@ def mask_value(value: Any) -> Any:
 
 
 _SEPARATORS = str.maketrans("", "", " \t-._/")
-#: Shortest value (separators removed) compared against the secrets that way.
-_MIN_PARTIAL = 6
+#: Shortest value (separators removed) compared against the secrets that way: a short secret
+#: (a 6-digit PIN) must not mask an amount that spells it with a separator ("4821.50").
+_MIN_PARTIAL = MODEL_MIN_SCRUB
 
 
 def _looks_like_a_secret(value: str) -> bool:

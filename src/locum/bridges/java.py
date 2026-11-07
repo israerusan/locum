@@ -493,11 +493,14 @@ class JavaNode(AccessibleNode):
     # ------------------------------------------------------------------ raw data
     @property
     def info(self) -> Optional[AccessibleContextInfo]:
-        if self._info is None and not self._released:
+        if self._info is None and self._usable():
             if self._index >= 0 and self._parent is not None and self._parent._index_addressed():
                 # A JTable cell over JAB is Swing's shared renderer component: it holds this
                 # cell's data only right after the cell was fetched. Fetch it again by index.
-                self._refetch()
+                if not self._refetch():
+                    # Its row is gone: the reference still held would read whatever cell the
+                    # shared renderer was stamped with last, so the cell reads as gone.
+                    return None
             self._info = self._read_info()
         return self._info
 
@@ -509,14 +512,23 @@ class JavaNode(AccessibleNode):
             ok = False
         return info if ok else None
 
-    def _refetch(self) -> None:
+    def _usable(self) -> bool:
+        """Whether this node's reference may still be passed to the bridge: not released by
+        :meth:`release`, :meth:`JavaBridge.release_all` or :meth:`JavaBridge.close` (a deleted
+        JNI global reference must never reach the JVM)."""
+        return not self._released and not self.bridge._closed and (self.vm, self.ac) in self.bridge._live
+
+    def _refetch(self) -> bool:
+        """Re-fetch this node by its index in its parent; ``False`` when nothing is there now."""
         parent = self._parent
         if parent is None or parent._released:
-            return
+            return False
         child = parent._child(self._index)
-        if child:
-            self.bridge._track(self.vm, child)
-            self._rebind(child)
+        if not child:
+            return False
+        self.bridge._track(self.vm, child)
+        self._rebind(child)
+        return True
 
     def refresh(self) -> "JavaNode":
         """Re-read this node and everything below it from the JVM on next access.
@@ -559,6 +571,8 @@ class JavaNode(AccessibleNode):
             if n.hwnd is not None:
                 return n.hwnd
             n = n._parent
+        if not self._usable():
+            return None
         try:
             return self.bridge.dll.getHWNDFromAccessibleContext(self.vm, self.ac)
         except Exception:  # noqa: BLE001
@@ -650,6 +664,8 @@ class JavaNode(AccessibleNode):
         return self._kids
 
     def _child(self, i: int) -> int:
+        if not self._usable():
+            return 0
         try:
             return int(self.bridge.dll.getAccessibleChildFromContext(self.vm, self.ac, i) or 0)
         except Exception:  # noqa: BLE001
@@ -736,6 +752,8 @@ class JavaNode(AccessibleNode):
     def _same_ref(self, a: int, b: int) -> bool:
         if a == b:
             return True
+        if self.bridge._closed:
+            return False
         try:
             return bool(self.bridge.dll.isSameObject(self.vm, a, b))
         except Exception:  # noqa: BLE001
@@ -750,6 +768,8 @@ class JavaNode(AccessibleNode):
             return False
         if other.ac == self.ac:
             return True
+        if not (self._usable() and other._usable()):
+            return False
         try:
             return bool(self.bridge.dll.isSameObject(self.vm, self.ac, other.ac))
         except Exception:  # noqa: BLE001
@@ -774,6 +794,8 @@ class JavaNode(AccessibleNode):
         todo.actionsCount = 1
         _set_wstr(todo.actions[0].name, name)
         failure = jint(-1)
+        if not self._usable():
+            return False
         # ``failure`` receives the index of the first action that failed; the BOOL result says it all.
         return bool(self.bridge.dll.doAccessibleActions(self.vm, self.ac, byref(todo), byref(failure)))
 
@@ -798,6 +820,8 @@ class JavaNode(AccessibleNode):
         return self.do_action(name) if name else False
 
     def focus(self) -> bool:
+        if not self._usable():
+            return False
         try:
             return bool(self.bridge.dll.requestFocus(self.vm, self.ac))
         except Exception:  # noqa: BLE001
@@ -807,6 +831,8 @@ class JavaNode(AccessibleNode):
         _check_settable(text)
         buf = (WCHAR * (len(text.encode("utf-16-le")) // 2 + 1))()
         _set_wstr(buf, text)
+        if not self._usable():
+            return False
         try:
             return bool(self.bridge.dll.setTextContents(self.vm, self.ac, buf))
         except Exception:  # noqa: BLE001
@@ -817,7 +843,7 @@ class JavaNode(AccessibleNode):
         if self._index >= 0 and self._parent is not None and self._parent._index_addressed():
             self._refetch()  # a JTable cell is the shared renderer: stamp it with this cell first
         info = self.info
-        if info is None or not info.accessibleText:
+        if info is None or not info.accessibleText or not self._usable():
             return self.name
         ti = AccessibleTextInfo()
         try:
@@ -901,6 +927,17 @@ class JavaElement:
         """
         self.node._info = None
         return self.node
+
+    def _present(self) -> JavaNode:
+        """:meth:`_live`, raising :class:`ElementNotFound` when the element is gone: its reference
+        was released (the UI changed, :meth:`release`, :meth:`JavaBridge.close`) or its table row
+        no longer exists. Actions never run on such a reference (it would reach the JVM deleted,
+        or name another cell)."""
+        node = self._live()
+        if node.info is None:
+            raise ElementNotFound(f"{self!r} is gone: its Java object was released or no longer exists "
+                                  "(the UI changed or the bridge was closed); look it up again")
+        return node
 
     # ------------------------------------------------------------------ properties
     @property
@@ -1044,7 +1081,7 @@ class JavaElement:
         ``True``: the action only (:class:`NotSupported` without one);
         ``False``: the mouse only.
         """
-        if "disabled" in self._live().states:
+        if "disabled" in self._present().states:
             raise ElementNotFound(f"{self!r} is disabled")
         action = self.node.click_action() if native is not False else None
         if native is True and action is None:
@@ -1095,7 +1132,7 @@ class JavaElement:
         when the read-back differs.
         """
         _check_settable(str(text))
-        st = self._live().states
+        st = self._present().states
         if "disabled" in st or "readonly" in st:
             raise ElementNotFound(f"{self!r} is disabled or read-only")
         secret = "password" in st
@@ -1115,6 +1152,7 @@ class JavaElement:
         return self
 
     def focus(self) -> "JavaElement":
+        self._present()
         ctx = self._ctx(activates=False)
         if self.bridge.gate.allow("focus", {"target": ctx.get("target")}, ctx, f"focus {ctx.get('target') or self.role!r}"):
             if not self.node.focus():
@@ -1123,6 +1161,7 @@ class JavaElement:
 
     def do_action(self, name: str) -> "JavaElement":
         """Run a named AccessibleAction (``"toggle expand"``, ``"togglePopup"``...)."""
+        self._present()
         ctx = self._ctx(activates=True)
         what = ctx.get("target") or self.role
         ctx["arg_texts"] = [name]

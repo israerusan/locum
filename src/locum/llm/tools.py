@@ -74,7 +74,7 @@ def _scrub_result_text(text: Any) -> Any:
     Only unambiguous (``MODEL_MIN_SCRUB``\\ +) secrets are replaced -- a PIN must not turn
     ``Clicked at (1234, 250)`` into ``(***, 250)`` -- and a JSON payload is scrubbed value
     by value after parsing, so it stays valid JSON. A text that *is* a secret is masked."""
-    from .._secret import _scrub_data, mask_value
+    from .._secret import _scrub_data, mask_value, scrub_for_model
 
     if not isinstance(text, str) or not text:
         return text
@@ -86,7 +86,9 @@ def _scrub_result_text(text: Any) -> Any:
         else:
             # Each string leaf like a field value: masked whole when it is a secret.
             clean = _scrub_data(data, mask_value, 0)
-            return text if clean == data else json.dumps(clean, ensure_ascii=False)
+            # Then the text itself: keys and duplicate keys never reach ``clean``. Replacing a
+            # long secret (or its JSON-escaped form) inside a string keeps the JSON valid.
+            return scrub_for_model(text if clean == data else json.dumps(clean, ensure_ascii=False))
     return mask_value(text) or text
 
 

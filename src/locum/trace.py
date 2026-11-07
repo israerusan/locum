@@ -569,15 +569,13 @@ class Tracer:
     def _scrub(self, text: Optional[str]) -> Optional[str]:
         if not text:
             return text
-        for s in sorted(self._secrets, key=len, reverse=True):
-            if len(s) >= _MIN_SCRUB and s in text:
-                text = text.replace(s, MASK)
-                for form in (repr(s), json.dumps(s)):
-                    text = text.replace(form, repr(MASK))
-        # Values held in a Secret (credentials) anywhere in the process.
+        # This tracer's secrets and the values held in a Secret anywhere in the process, in
+        # every form (as is, quoted by repr/JSON: "dom\\pw" shows as 'dom\\\\pw' in an argument).
         from ._secret import scrub
 
-        return scrub(text)
+        with self._lock:
+            mine = tuple(self._secrets)
+        return scrub(text, mine, min_len=_MIN_SCRUB)
 
     def _call(self, owner: Any, kind: str, name: str, orig: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
         stack = self._stack()
