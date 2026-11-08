@@ -783,6 +783,22 @@ def test_keep_screenshots_and_capture_only_mode(tmp_path):
         be.mouse_move(1, 1)
 
 
+def test_portal_without_remote_desktop_still_takes_screenshots(tmp_path):
+    """xdg-desktop-portal-hyprland (and -wlr) offer Screenshot but no RemoteDesktop: the
+    default backend must not throw the captured image away asking for an input session."""
+    path = _png(tmp_path, (800, 600))
+    versions = {P.SCREEN_CAST: 4, P.SCREENSHOT: 2}  # no RemoteDesktop, as on Hyprland
+    be, bus = make(bus=FakeBus(screenshot_path=path, versions=versions), keep_screenshots=True)
+    assert CAP_SCREENSHOT in be.capabilities
+    assert be.screenshot(Rect(0, 0, 10, 10)).getpixel((1, 1)) == (255, 0, 0)
+    assert [m.rect for m in be.monitors()] == [Rect(0, 0, 800, 600)]
+    assert "CreateSession" not in bus.members()
+    notes = " ".join(be.limitations())
+    assert "no input" in notes and "approval" not in notes
+    with pytest.raises(NotSupported, match="hyprland"):
+        be.mouse_move(1, 1)
+
+
 def test_screenshot_files_are_deleted_only_when_they_are_the_portals(tmp_path, monkeypatch):
     pictures, other = tmp_path / "Bilder", tmp_path / "elsewhere"
     shots = pictures / "Bildschirmfotos"

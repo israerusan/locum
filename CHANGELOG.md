@@ -56,9 +56,27 @@ successful command says.
   ambiguous, timeout, target-lost and image errors.
 - The README said a bare `d.type()` is never verified. In fact it reads back a
   readable focused field. Corrected.
+- **Wayland: screenshots failed on portals without RemoteDesktop**
+  (xdg-desktop-portal-hyprland, -wlr). `capabilities` listed `screenshot`, and
+  the Screenshot portal returned the image, but `screenshot()` then asked for
+  the input session's monitor layout and raised `NotSupported`. When the portal
+  offers no RemoteDesktop interface, the backend now works as with
+  `remote_desktop=False`: screenshots (screenshot pixels are the coordinates),
+  `monitors()`, AT-SPI and the clipboard work, and input raises `NotSupported`.
+  Checked on a real Hyprland 0.56 session: screenshots, the AT-SPI tree and a
+  native element action (a GTK4 toggle button) work.
+- **Wayland: the missing-RemoteDesktop error names Hyprland** and says what
+  still works. `limitations()` says there is no input, instead of "the first
+  input asks for approval once".
 
 ### Tests
 
+- The two X11 tests that bind many spare keycodes (`test_type_text_unicode`,
+  `test_every_canonical_key_presses`) use their own backend and close it.
+  With the module-wide backend they held 13 of the 14 spare keycodes of
+  Arch Linux's Xvfb keymap (xkeyboard-config 2.48), and two later tests
+  failed for lack of one. A fake-portal test covers a portal without
+  RemoteDesktop.
 - Regression fixtures for title drift (Welcome → Review queue → a note's name)
   and for an Electron-style sparse tree: the selector fails with an actionable
   error, while coordinates, hotkeys and `tree` still work. Plus tests for the
