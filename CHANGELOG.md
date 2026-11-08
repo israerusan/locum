@@ -12,9 +12,12 @@ The rules apply from 0.3.0 on.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-07
+
 Diagnostics and honest reporting, from a critique of a real Obsidian run on
 Windows. No new capabilities: the changes are in what a failing or partly
-successful command says.
+successful command says. Also: Wayland screenshots work on portals without
+RemoteDesktop (Hyprland, wlroots), checked on a real Hyprland session.
 
 ### Changed
 
@@ -707,7 +710,8 @@ Check it on your machine: `python -m locum.selftest` (opens its own Notepad tab,
 [0.1.2]: https://github.com/israerusan/locum/releases/tag/v0.1.2
 [0.1.1]: https://github.com/israerusan/locum/releases/tag/v0.1.1
 [0.1.0]: https://github.com/israerusan/locum/releases/tag/v0.1.0
-[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/israerusan/locum/releases/tag/v0.4.3
 [0.4.2]: https://github.com/israerusan/locum/releases/tag/v0.4.2
 [0.4.1]: https://github.com/israerusan/locum/releases/tag/v0.4.1
 [0.4.0]: https://github.com/israerusan/locum/releases/tag/v0.4.0
