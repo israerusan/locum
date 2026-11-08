@@ -311,6 +311,13 @@ class WaylandBackend(Backend):
             self._versions[interface] = self._portal.version(interface)
         return self._versions[interface]
 
+    def _input_session(self) -> bool:
+        """Whether input (and the monitor layout it brings) can come from a RemoteDesktop
+        session: wanted (``remote_desktop=True``) and offered by the portal. When it is not
+        offered (xdg-desktop-portal-hyprland, -wlr), the backend works like
+        ``remote_desktop=False``: screenshots, AT-SPI and the clipboard still work."""
+        return self._remote_desktop and self._version(P.REMOTE_DESKTOP) > 0
+
     def _drop_session(self) -> None:
         st = self._state
         watch = st.get("closed_watch")
@@ -356,8 +363,9 @@ class WaylandBackend(Backend):
             if rd_version <= 0:
                 raise NotSupported(
                     "xdg-desktop-portal offers no RemoteDesktop interface here: no input injection is possible. "
-                    "It is implemented by xdg-desktop-portal-gnome and -kde; xdg-desktop-portal-wlr (Sway, "
-                    "other wlroots compositors) does not implement it."
+                    "It is implemented by xdg-desktop-portal-gnome and -kde; xdg-desktop-portal-hyprland "
+                    "(Hyprland) and xdg-desktop-portal-wlr (Sway, other wlroots compositors) do not implement "
+                    "it. Screenshots, AT-SPI selectors and native element actions still work."
                 )
             sc_version = self._version(P.SCREEN_CAST)
             available = self._available_device_types()
@@ -467,7 +475,10 @@ class WaylandBackend(Backend):
         if not self._screen_coords:
             notes.append("AT-SPI element bounds are hidden (toolkits report window-relative extents on "
                          "Wayland); elements are driven with native actions, not mouse clicks")
-        if self._remote_desktop and not self._state["session"]:
+        if self._remote_desktop and self._version(P.REMOTE_DESKTOP) <= 0:
+            notes.append("no input: xdg-desktop-portal offers no RemoteDesktop interface here (e.g. "
+                         "xdg-desktop-portal-hyprland, -wlr); screenshot pixels are the coordinates")
+        elif self._remote_desktop and not self._state["session"]:
             notes.append("input session not started yet: the first input asks for approval once")
         if self._version(P.SCREENSHOT) > 0:
             notes.append("screenshots go through the Screenshot portal: slow, may ask for permission, and on "
@@ -717,7 +728,7 @@ class WaylandBackend(Backend):
     def monitors(self) -> List[Monitor]:
         """The monitors shared in the session, in the compositor's logical layout."""
         self._check()
-        if not self._remote_desktop:
+        if not self._input_session():
             if self._image_layout is None:
                 self.screenshot()
             return [Monitor(0, self._image_layout, 1.0, True, "screenshot")]  # type: ignore[arg-type]
@@ -778,7 +789,7 @@ class WaylandBackend(Backend):
 
         self._check()
         img = self._capture()  # a portal round trip (maybe a dialog): not under the input lock
-        if self._remote_desktop:
+        if self._input_session():
             layout = self.virtual_screen()
         else:
             layout = self._image_layout = Rect(0, 0, img.width, img.height)

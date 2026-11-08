@@ -17,7 +17,7 @@ def test_platform_support_table_sits_next_to_the_headline():
     assert re.search(r"macOS.*\*\*blocking\*\* real-desktop self-test on the GitHub macOS runner", HEAD)
     assert re.search(r"Windows 10/11.*\*\*blocking\*\* real-desktop self-test", HEAD)
     assert re.search(r"Xvfb.*AT-SPI.*not a full desktop session", HEAD)
-    assert re.search(r"Wayland.*experimental, not yet validated on a real compositor", HEAD)
+    assert re.search(r"Wayland.*Experimental: input never run on a real compositor", HEAD)
 
 
 def test_headline_does_not_claim_equal_support_on_all_platforms():

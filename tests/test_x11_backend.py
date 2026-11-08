@@ -557,7 +557,10 @@ def test_key_events_reach_focused_window(be, xc):
 
 
 @pytest.mark.x11
-def test_type_text_unicode(be, xc):
+def test_type_text_unicode(xvfb_display, xc):
+    # own backend (closed at the end) so its scratch keycodes are given back: some
+    # keymaps (e.g. Arch's xkeyboard-config 2.48) have only ~14 spare keycodes
+    be = X11Backend(xvfb_display, clipboard_tool="none", accessibility=False)
     win = make_window(xc, (120, 120, 200, 120), event_mask=X.KeyPressMask)
     try:
         be.activate_window(win.id)
@@ -575,6 +578,7 @@ def test_type_text_unicode(be, xc):
     finally:
         win.destroy()
         xc.sync()
+        be.close()
 
 
 @pytest.mark.x11
@@ -616,17 +620,23 @@ def _shift_codes(d):
 
 
 @pytest.mark.x11
-def test_every_canonical_key_presses(be):
-    for k in sorted(KEYS):
-        be.key_down(k)
-        be.key_up(k)
-    # capslock/numlock toggled their lock state: toggle back so later tests start clean
-    for k in ("capslock", "numlock"):
-        be.key_down(k)
-        be.key_up(k)
-    assert not be._state.held_keycodes
-    with pytest.raises(ValueError):
-        be.key_down("definitely-not-a-key")
+def test_every_canonical_key_presses(xvfb_display):
+    # own backend (closed at the end): keys missing from the keymap borrow spare
+    # keycodes, and a module-scoped backend would hold them for every later test
+    be = X11Backend(xvfb_display, clipboard_tool="none", accessibility=False)
+    try:
+        for k in sorted(KEYS):
+            be.key_down(k)
+            be.key_up(k)
+        # capslock/numlock toggled their lock state: toggle back so later tests start clean
+        for k in ("capslock", "numlock"):
+            be.key_down(k)
+            be.key_up(k)
+        assert not be._state.held_keycodes
+        with pytest.raises(ValueError):
+            be.key_down("definitely-not-a-key")
+    finally:
+        be.close()
 
 
 @pytest.mark.x11

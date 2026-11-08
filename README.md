@@ -4,8 +4,9 @@
 mouse/keyboard input, screenshots and template matching, accessibility
 selectors, RPA robots, and LLM-agent control. Every push runs a real-desktop
 self-test on Windows, macOS and Linux/X11, and a failure fails the build (see
-below). Native Wayland support (through xdg-desktop-portal) is **experimental
-and not yet validated on a real compositor**. Changes are in
+below). Native Wayland support (through xdg-desktop-portal) is **experimental**:
+its input has not yet run on a real compositor (capture and AT-SPI were checked
+on Hyprland). Changes are in
 [CHANGELOG.md](CHANGELOG.md); the stability promise is in [docs/API.md](docs/API.md).
 
 | Platform | Backend | How it is tested today |
@@ -13,7 +14,7 @@ and not yet validated on a real compositor**. Changes are in
 | Windows 10/11 | SendInput + **UI Automation** | unit tests; **blocking** real-desktop self-test and focus-steal tests on the GitHub Windows runner on every push; validated on a real Windows 11 machine |
 | macOS 12+ | Quartz events + **AX API** | unit tests; **blocking** real-desktop self-test on the GitHub macOS runner (Quartz, AX, TextEdit); passed on a real Apple Silicon Mac (0.1.1) |
 | Linux (X11 / XWayland) | XTEST + **AT-SPI** | unit tests plus X11 tests under Xvfb; **blocking** self-test on Xvfb + openbox with a real D-Bus/AT-SPI registry and a GTK editor (not a full desktop session) |
-| Linux (Wayland) | xdg-desktop-portal + **AT-SPI** | unit tests against a fake D-Bus portal only: **experimental, not yet validated on a real compositor**; opt-in only (`LOCUM_BACKEND=wayland`) |
+| Linux (Wayland) | xdg-desktop-portal + **AT-SPI** | unit tests against a fake D-Bus portal; screenshots, AT-SPI tree and native element actions checked by hand on Hyprland 0.56 (its portal has no RemoteDesktop, so no input there). **Experimental: input never run on a real compositor**; opt-in only (`LOCUM_BACKEND=wayland`) |
 | Java Swing/AWT (`locum.bridges.java`) | Java Access Bridge | **blocking** CI job driving a real Swing window through a Temurin JDK; **experimental** (one test window, no business application) |
 | SAP GUI (`locum.bridges.sap`) | SAP GUI Scripting (COM) | unit tests against a fake COM object graph only: **experimental, never run against a real SAP GUI** |
 | Citrix / RDP / Horizon (`locum.bridges.remote`) | pixels: image matching + OCR in the session window | unit tests only; no accessibility tree, so no selectors, and no real remote session in CI |
@@ -499,7 +500,8 @@ Read this before you depend on locum.
   machine plus blocking CI). macOS has passed on a real Apple Silicon Mac and
   passes blocking CI on hosted runners. Linux CI is Xvfb + openbox + AT-SPI:
   real X11 and accessibility, but not a full GNOME/KDE session. Wayland is
-  opt-in (`LOCUM_BACKEND=wayland`) and has never run on a real compositor. SAP
+  opt-in (`LOCUM_BACKEND=wayland`); its capture and AT-SPI were checked by hand
+  on Hyprland, but its input has never run on a real compositor. SAP
   has never run against a real SAP GUI. Java runs a real Swing test window,
   not a business app. Citrix/RDP is image matching and OCR only. Treat
   everything outside Windows, macOS and X11 as unproven until you have tested
@@ -561,7 +563,7 @@ backend uses.
 | Windows 10/11 | SendInput (Unicode, DPI-aware, multi-monitor) | mss / GDI | Win32 | **UI Automation** (comtypes) | run as the same integrity level as the target app (UAC); text locum puts on the clipboard is kept out of Clipboard History (Win+V) and cloud sync (`WindowsBackend(clipboard_history=True)` allows it) |
 | macOS 12+ | Quartz events | Quartz (Retina-aware) | Quartz / AppKit | **AX API** | needs Accessibility + Screen Recording permission |
 | Linux X11 | XTEST (Unicode via spare keycodes) | mss / XGetImage | EWMH | **AT-SPI** (PyGObject) | native X11 clipboard (xclip/xsel optional) |
-| Linux Wayland (experimental) | RemoteDesktop portal (keysyms on the active layout; absolute pointer per ScreenCast stream) | Screenshot portal (slow; may prompt) | list only (AT-SPI): no activate/move/close | **AT-SPI** (element bounds hidden by default) | `pip install locum[wayland]`, `LOCUM_BACKEND=wayland`; GNOME/KDE portals; not yet validated on a real compositor |
+| Linux Wayland (experimental) | RemoteDesktop portal (keysyms on the active layout; absolute pointer per ScreenCast stream) | Screenshot portal (slow; may prompt) | list only (AT-SPI): no activate/move/close | **AT-SPI** (element bounds hidden by default) | `pip install locum[wayland]`, `LOCUM_BACKEND=wayland`; GNOME/KDE portals for input (Hyprland/wlroots portals: capture and AT-SPI only); input not yet validated on a real compositor |
 | Any (tests, CI, evals) | `MockBackend` / `DemoBackend` | ✓ | ✓ | ✓ | deterministic, no display |
 
 **Wayland (experimental):** Wayland deliberately prevents applications from
@@ -579,6 +581,10 @@ gets the tested `x11` backend, which reaches XWayland clients.
 
 What Wayland does not allow is refused, not faked:
 
+* input needs the RemoteDesktop portal, which xdg-desktop-portal-gnome and
+  -kde implement but xdg-desktop-portal-hyprland and -wlr do not. There,
+  screenshots (in screenshot pixels), AT-SPI selectors, native element actions
+  and the clipboard still work, and input raises `NotSupported`;
 * windows cannot be activated, moved, resized or closed;
 * window positions and stacking order are unknown, so input bound to a window
   is refused when its destination cannot be verified;
