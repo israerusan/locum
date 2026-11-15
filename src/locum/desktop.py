@@ -49,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 import math
+import numbers
 import os
 import pathlib
 import re
@@ -516,7 +517,7 @@ class Desktop:
             return cur if y is None else Point(cur.x, int(round(y)))
         if isinstance(target, bool):
             raise TypeError("A bool is not a screen position")
-        if isinstance(target, (int, float)):
+        if isinstance(target, numbers.Real):  # numpy integers too (cv2 / argmax results)
             yy = self.mouse.position().y if y is None else int(round(y))
             return Point(int(round(target)), yy)
         if y is not None:
@@ -676,7 +677,9 @@ class Desktop:
         A point on no monitor raises ``ValueError`` (the OS would click the
         clamped screen edge) unless ``allow_offscreen``.
 
-        Returns the clicked point (the element's center for native invokes).
+        Returns the clicked point (the element's center for native invokes; for
+        an invoked element with no screen bounds at all, the cursor position,
+        where nothing was clicked -- use :meth:`Element.click` to tell the cases apart).
         """
         dx, dy = int(offset[0]), int(offset[1])
         if y is None:
@@ -852,13 +855,9 @@ class Desktop:
         """Capture the screen (or ``region``: rect-like, Element, Window or Match), optionally saving it to ``path``."""
         img = self.screen.capture(self._region(region), monitor=monitor)
         if path is not None:
-            p = pathlib.Path(path).expanduser()
-            if not p.parent.exists():
-                p.parent.mkdir(parents=True, exist_ok=True)
-            if p.suffix:
-                img.save(str(p))
-            else:
-                img.save(str(p), format="PNG")
+            from .vision import _save_image
+
+            _save_image(img, path)  # PNG unless the suffix is an image extension (like Screen.save)
         return img
 
     def monitors(self) -> List[Monitor]:

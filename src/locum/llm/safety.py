@@ -261,8 +261,10 @@ NAVIGATION_KEYS: frozenset = frozenset({"tab", "up", "down", "left", "right", "h
 _NAVIGATION_MODIFIERS = frozenset({"shift", "ctrl"})
 
 #: Tools that start programs / fill the clipboard: an :class:`AllowRule` only covers
-#: them when it names them (``launch=...`` for ``launch_app``, ``tool=write_clipboard``).
-_UNTARGETED_TOOLS = frozenset({"launch_app", "write_clipboard"})
+#: them when it names them (``launch=...`` for ``launch_app``, ``tool=write_clipboard``,
+#: ``tool=browser_launch``). An ``app=`` rule for a browser authorizes acting inside it,
+#: not starting it.
+_UNTARGETED_TOOLS = frozenset({"launch_app", "write_clipboard", "browser_launch"})
 
 ConfirmCallback = Callable[[str, Dict[str, Any]], bool]
 
@@ -768,8 +770,8 @@ class AllowRule:
       a rule that lists it, e.g. ``{"selector": "edit#amount", "keys": "f8"}``.
     * ``tools`` -- tool-name globs the rule covers (``("write_clipboard",)``,
       ``("erp_*",)`` for integration tools). Without ``tools`` a rule covers
-      desktop actions that have a target; ``launch_app``, ``write_clipboard``
-      and integration tools are only covered when named here (``command``
+      desktop actions that have a target; ``launch_app``, ``browser_launch``,
+      ``write_clipboard`` and integration tools are only covered when named here (``command``
       implies ``launch_app``).
 
     String shorthands (handy in YAML): ``"window=Invoice*"``, ``"app=excel"``,
@@ -1067,7 +1069,10 @@ class Policy:
 
     @classmethod
     def permissive(cls, **kw: Any) -> "Policy":
-        """Everything allowed, no confirmations (trusted scripts, sandboxes, evals)."""
+        """Everything allowed, no confirmations (trusted scripts, sandboxes, evals).
+
+        Tools registered with ``ToolSpec(confirm=True)`` still ask: that flag says
+        the tool always needs a human, whatever the policy's patterns."""
         kw.setdefault("confirm_patterns", ())
         kw.setdefault("confirm_keys", ())
         policy = cls(**kw)
@@ -1084,19 +1089,20 @@ class Policy:
 
         ``Policy.strict(allow=[...])`` adds allow-list authorization (see
         ``allow``): only actions matching your rules run without a human. When
-        a rule names ``launch_app`` (``"launch=notepad.exe"``) or
-        ``write_clipboard`` (``"tool=write_clipboard"``), that tool is no longer
-        in the default ``deny_tools`` (an explicit ``deny_tools`` always wins).
+        a rule names ``launch_app`` (``"launch=notepad.exe"``),
+        ``browser_launch`` (``"tool=browser_launch"``) or ``write_clipboard``
+        (``"tool=write_clipboard"``), that tool is no longer in the default
+        ``deny_tools`` (an explicit ``deny_tools`` always wins).
         """
         if "deny_tools" not in kw:
-            deny = ["launch_app", "write_clipboard", "read_clipboard"]
+            deny = ["launch_app", "browser_launch", "write_clipboard", "read_clipboard"]
             allow = kw.get("allow")
             if allow is not None:
                 if isinstance(allow, (str, dict, AllowRule)):
                     allow = [allow]
                 rules = [AllowRule.coerce(r) for r in allow]
                 kw["allow"] = rules
-                for tool in ("launch_app", "write_clipboard"):
+                for tool in ("launch_app", "browser_launch", "write_clipboard"):
                     if any(r.covers_tool(tool) for r in rules):
                         deny.remove(tool)
             kw["deny_tools"] = tuple(deny)
@@ -1219,15 +1225,13 @@ class Policy:
             for combo in _key_items(context["keys"]):
                 if any(combo == c for c in self._confirm_combos):
                     return f"shortcut {'+'.join(sorted(combo))!r} commits the focused form"
-        if self.allow is not None and context.get("require_confirmation"):
+        if context.get("require_confirmation"):
+            # The integrator marked this tool as always needing a human (``ToolSpec(confirm=True)``),
+            # whatever the confirm patterns (also with none, as in ``Policy.permissive``).
             return str(context["require_confirmation"]) if isinstance(context["require_confirmation"], str) \
                 else f"{tool_name!r} always requires confirmation"
         if not self.confirm_patterns:
             return None
-        if context.get("require_confirmation"):
-            # The integrator marked this tool as always needing a human (``ToolSpec(confirm=True)``).
-            return str(context["require_confirmation"]) if isinstance(context["require_confirmation"], str) \
-                else f"{tool_name!r} always requires confirmation"
         # Key names are deliberately not matched: the Delete key is editing, not a "delete" commit.
         haystack = [str(context.get(k)) for k in ("target", "target_text", "selector", "command") if context.get(k)]
         # What the Enter of the action activates (a browser form's default button, its action URL).
@@ -2516,18 +2520,29 @@ class GuardedDesktop(_GuardedProxy):
             return [], "+".join(str(k) for k in keys)  # judged conservatively as text below
         return parts, "+".join(parts)
 
+    def _held_ctx(self, parts: List[str], combo: str) -> Tuple[Dict[str, Any], List[str]]:
+        """Context for ``key_down``/``hold``: like :meth:`hotkey`, including the controls an
+        access key / accelerator presses (holding ``alt+p`` presses "&Pay now" too)."""
+        from .tools import _shortcut_targets  # noqa: PLC0415
+
+        pressed = _shortcut_targets(self._raw, [parts]) if parts else []
+        ctx, _ = self._focus_ctx(activating=keys_activate([parts or combo]),
+                                 enter=any(p in ("enter", "num_enter") for p in parts), keys=combo,
+                                 shortcut_targets=pressed or None)
+        return ctx, pressed
+
     def key_down(self, key: str) -> None:
         parts, combo = self._held_combo([key])
-        ctx, _ = self._focus_ctx(activating=keys_activate([parts or combo]),
-                                 enter=any(p in ("enter", "num_enter") for p in parts), keys=combo)
-        if self._gate("key_down", {"key": str(key)}, ctx, f"hold down {key}"):
+        ctx, pressed = self._held_ctx(parts, combo)
+        desc = f"hold down {key}" + (f" (presses {', '.join(map(repr, pressed))})" if pressed else "")
+        if self._gate("key_down", {"key": str(key)}, ctx, desc):
             self._raw.key_down(key)
 
     def hold(self, *keys: Any) -> Any:
         parts, combo = self._held_combo(keys)
-        ctx, _ = self._focus_ctx(activating=keys_activate([parts or combo]),
-                                 enter=any(p in ("enter", "num_enter") for p in parts), keys=combo)
-        if not self._gate("hold_key", {"keys": "+".join(str(k) for k in keys)}, ctx, f"hold {combo}"):
+        ctx, pressed = self._held_ctx(parts, combo)
+        desc = f"hold {combo}" + (f" (presses {', '.join(map(repr, pressed))})" if pressed else "")
+        if not self._gate("hold_key", {"keys": "+".join(str(k) for k in keys)}, ctx, desc):
             import contextlib  # noqa: PLC0415
 
             return contextlib.nullcontext([])

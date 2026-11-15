@@ -24,7 +24,7 @@ from .backends.base import CAP_CLIPBOARD, CAP_UNICODE_TYPING
 from . import _inputlock
 from ._cancel import check as _cancel_check
 from ._target import check_input as _target_check
-from .errors import NotSupported
+from .errors import ActionTimeout, NotSupported
 from .failsafe import FailSafe
 from .keys import check_combo, lower_combo_letters, normalize_key, parse_hotkey, press_actions, split_text_tokens
 
@@ -69,7 +69,8 @@ class Keyboard:
         clipboard_timeout: On backends that can tell (X11 native clipboard):
             seconds to wait for the target application to read the paste. If it
             has not read it by then the clipboard is **not** restored, so a late
-            paste still inserts the typed text.
+            paste still inserts the typed text; if more text was to follow, typing
+            stops with :class:`ActionTimeout` instead of overwriting that paste.
     """
 
     def __init__(
@@ -421,6 +422,13 @@ class Keyboard:
                     # have read this text, or it would paste other data.
                     restore = self._await_paste(since)
                     settled = True
+                    if not restore and i < len(units) - 1:
+                        # The rest would overwrite this paste on the clipboard (a late read
+                        # inserts the wrong text) or type ahead of it: stop here instead.
+                        raise ActionTimeout(
+                            f"the target application did not read pasted text within {self.clipboard_timeout:g}s; "
+                            "typing stopped before the rest of the text (raise Keyboard.clipboard_timeout, or "
+                            "type with mode='keys')")
                 else:  # pragma: no cover - internal invariant
                     raise AssertionError(kind)
         finally:

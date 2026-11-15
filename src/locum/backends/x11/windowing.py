@@ -268,6 +268,77 @@ class _WindowsMixin:
             cur = self._prop_list(self._root, "_NET_CURRENT_DESKTOP")
             return self._window_info(active, active, supported, cur[0] if cur else None)
 
+    @staticmethod
+    def _xid_of(handle: Any) -> Optional[int]:
+        if isinstance(handle, WindowInfo):
+            handle = handle.handle
+        try:
+            return int(handle, 0) if isinstance(handle, str) else int(handle)
+        except (TypeError, ValueError):
+            return None
+
+    @_x_errors
+    def window_handle_at(self, x: int, y: int) -> Any:
+        """The top-level window a click at ``(x, y)`` reaches, by the X server's stacking order.
+
+        Unlike the client list, this sees override-redirect windows (GTK/Qt pop-up
+        menus, tooltips, combo-box drop-downs): a click on a menu item reaches the
+        menu, not the window under it. A managed window maps to its client window
+        (the handle :meth:`list_windows` reports)."""
+        self._check()
+        X = self._xl.X
+        with self._lock:
+            try:
+                children = self._root.query_tree().children  # bottom-to-top
+            except self._xl.error.XError:
+                return None
+            for child in reversed(children):
+                try:
+                    attrs = child.get_attributes()
+                    if attrs.map_state != X.IsViewable or attrs.win_class == X.InputOnly:
+                        continue
+                    if not self._abs_geometry(child).contains((int(x), int(y))):
+                        continue
+                except self._xl.error.XError:
+                    continue  # vanished meanwhile
+                if attrs.override_redirect:
+                    return int(child.id)
+                client = self._client_window(child)
+                return int((client or child).id)
+            return None
+
+    @_x_errors
+    def window_belongs_to(self, handle: Any, target: Any) -> bool:
+        """Whether input reaching ``handle`` is input for ``target``: the same window, a
+        window whose ``WM_TRANSIENT_FOR`` chain leads to it (its dialogs), or an untitled
+        override-redirect pop-up (menu) of the same process."""
+        h, t = self._xid_of(handle), self._xid_of(target)
+        if h is None or t is None:
+            return handle == target
+        if h == t:
+            return True
+        self._check()
+        with self._lock:
+            cur, seen = h, {h}
+            for _ in range(16):
+                parent = self._prop_list(self._win_obj(cur), "WM_TRANSIENT_FOR")[:1]
+                if not parent or not parent[0] or parent[0] in seen:
+                    break
+                cur = parent[0]
+                if cur == t:
+                    return True
+                seen.add(cur)
+            win = self._win_obj(h)
+            try:
+                if not win.get_attributes().override_redirect:
+                    return False
+            except self._xl.error.XError:
+                return False
+            if self._title(win):
+                return False
+            pid = self._prop_list(win, "_NET_WM_PID")[:1]
+            return bool(pid) and pid == self._prop_list(self._win_obj(t), "_NET_WM_PID")[:1]
+
     def _handle(self, handle: Any) -> Any:
         """Validate ``handle`` (XID or WindowInfo) and return the Xlib window object."""
         if isinstance(handle, WindowInfo):

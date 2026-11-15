@@ -6,7 +6,7 @@ from typing import List, Optional, Sequence
 import pytest
 
 from locum.backends.base import AccessibleNode
-from locum.backends.mock import MockBackend
+from locum.backends.mock import MockBackend, MockNode
 from locum.errors import SelectorSyntaxError
 from locum.selectors import describe_node, parse, quote, selector_for, tree_text
 from locum.types import Rect
@@ -416,9 +416,9 @@ def test_selector_for_without_parents_and_with_root(scene):
     assert hit.name == "8"
     s = selector_for(hit)
     assert parse(s).find_first(rs).same_as(hit)
-    # focused_element() returns a node without parent links -> selector for the node alone
-    scene._set_focus(scene.windows[0].find("Display"))
-    lonely = scene.focused_element()
+    # a node without parent links -> selector for the node alone
+    lonely = MockNode(scene, scene.windows[0].find("Display"))
+    assert lonely.parent is None
     s2 = selector_for(lonely)
     assert s2 == "edit#display"
     assert parse(s2).find_first(rs).same_as(lonely)

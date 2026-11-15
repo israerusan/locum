@@ -352,8 +352,10 @@ field has focus.
 `confirm_patterns`/`confirm_keys` still apply on top, so an allowed
 `button "Submit"` keeps asking until you pass `confirm_patterns=()`.
 `Policy.strict(allow=[...])` adds the strict preset's limits (shells blocked,
-card numbers denied, 200 actions, 30/min); a `launch=` or
-`tool=write_clipboard` rule lifts that tool from its default `deny_tools`.
+card numbers denied, 200 actions, 30/min); a `launch=`,
+`tool=browser_launch` or `tool=write_clipboard` rule lifts that tool from its
+default `deny_tools`. An `app=` rule for a browser authorizes acting inside it,
+not starting it.
 An authorized action records the rule in `context["allowed_by"]`.
 
 ### RPA behind the policy
@@ -477,9 +479,10 @@ nobody authorized; it is not a sandbox against code that reaches
   button (HTML implicit submission, dialog default buttons), so keyboard
   actions with Enter are also judged by that button's label when the
   accessibility tree reports one (`"default"` state).
-* **Presets.** `Policy.permissive()` (no confirmations; sandboxes and evals),
-  `Policy()` (default heuristic tripwire), `Policy.strict()` (no app
-  launching or clipboard, shells/registry blocked, card numbers denied, broad
+* **Presets.** `Policy.permissive()` (no confirmations except tools marked
+  `ToolSpec(confirm=True)`; sandboxes and evals),
+  `Policy()` (default heuristic tripwire), `Policy.strict()` (no app or
+  browser launching or clipboard, shells/registry blocked, card numbers denied, broad
   confirmations incl. save/close/install, 200 actions max, 30/min — still
   heuristic), and `Policy.strict(allow=[...])` (all of that plus allow-list
   authorization).

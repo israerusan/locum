@@ -159,11 +159,15 @@ def reveal(value: Any) -> Any:
 
 @functools.lru_cache(maxsize=4096)
 def _forms(s: str) -> Tuple[str, ...]:
-    """The ways a secret can appear in text: as is, quoted by repr/JSON, HTML-escaped."""
-    out = [s]
-    for form in (repr(s)[1:-1], json.dumps(s)[1:-1], json.dumps(s, ensure_ascii=False)[1:-1], html.escape(s)):
-        if form not in out:
-            out.append(form)
+    """The ways a secret can appear in text: as is, quoted by repr/JSON, HTML-escaped,
+    and quoted *then* HTML-escaped (a JSON dump shown in an HTML report: ``"`` ->
+    ``\\"`` -> ``\\&quot;``)."""
+    quoted = [s, repr(s)[1:-1], json.dumps(s)[1:-1], json.dumps(s, ensure_ascii=False)[1:-1]]
+    out: List[str] = []
+    for q in quoted:
+        for form in (q, html.escape(q), html.escape(q, quote=False)):
+            if form not in out:
+                out.append(form)
     return tuple(out)
 
 

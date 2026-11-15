@@ -552,11 +552,14 @@ def _short_json(value: Any, limit: int = 160) -> str:
 
 # =============================================================================== input targets
 
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")
-
-
 def _is_image_target(text: str) -> bool:
-    return text.lower().endswith(_IMAGE_EXTS) or (os.path.isfile(os.path.expanduser(text)) and not _is_point(text))
+    """Whether ``text`` names an image, by Desktop's rule: an image extension or a
+    ``data:image/`` URL. Any other existing file is not an image: a selector such as
+    ``edit`` must not turn into an image click because a file of that name exists."""
+    from .desktop import IMAGE_EXTENSIONS
+
+    low = text.strip().lower()
+    return low.endswith(IMAGE_EXTENSIONS) or low.startswith("data:image/")
 
 
 def _target_window(ctx: _Ctx) -> Any:
@@ -743,12 +746,9 @@ def cmd_screenshot(ctx: _Ctx) -> int:
             raise _UsageError("--window cannot be combined with --region or --monitor")
         win = ctx.desktop.window(window, timeout=0)
         img, how, report = win._capture_report(mode, restore_minimized=restore_minimized)
-        p = os.path.expanduser(out)
-        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
-        if os.path.splitext(p)[1]:
-            img.save(p)
-        else:
-            img.save(p, format="PNG")
+        from .vision import _save_image
+
+        _save_image(img, out)
     else:
         if mode != "auto" or restore_minimized:
             raise _UsageError("--mode and --restore-minimized need --window")
@@ -903,19 +903,26 @@ def cmd_click(ctx: _Ctx) -> int:
         _require_scope(ctx, "Clicks at coordinates or on an image", flag="anywhere", allowed="--window TITLE")
     target: Any = _parse_point(a.target, "TARGET") if _is_point(a.target) else a.target
     window = _target_window(ctx) if a.window else None
-    if window is not None and not positional:
-        target = window.find(a.target, timeout=a.timeout)
+    if not positional:
+        target = window.find(a.target, timeout=a.timeout) if window is not None else ctx.desktop.find(a.target)
+    point: Optional[Point]
     with _bound(ctx, window):
-        if target is a.target or isinstance(target, Point):
+        if positional:
             point = ctx.desktop.click(target, button=a.button, clicks=a.clicks, offset=offset)
         else:
             target.click(a.button, a.clicks, offset=offset)
-            point = getattr(target, "_last_click_point", None) or target.center
+            # None: the element had no usable screen position and was invoked natively.
+            # The action happened; there is just no clicked point to report.
+            point = getattr(target, "_last_click_point", None)
+    where = f" in {window.title!r}" if window is not None else ""
     if ctx.json:
-        ctx.emit_json({"clicked": point.to_dict(), "button": a.button, "clicks": a.clicks,
+        ctx.emit_json({"clicked": point.to_dict() if point is not None else None, "button": a.button,
+                       "clicks": a.clicks, "native": point is None,
                        "window": window.title if window is not None else None})
+    elif point is None:
+        ctx.print(f"invoked {target!r} natively (no screen position)" + where)
     else:
-        ctx.print(f"clicked ({point.x}, {point.y})" + (f" in {window.title!r}" if window is not None else ""))
+        ctx.print(f"clicked ({point.x}, {point.y})" + where)
     return EXIT_OK
 
 
@@ -1035,6 +1042,9 @@ def cmd_locate(ctx: _Ctx) -> int:
     a = ctx.args
     if not 0.0 < a.confidence <= 1.0:
         raise _UsageError("--confidence must be in (0, 1]")
+    if a.click and not a.anywhere:  # a usage error whether or not the image is found
+        raise _UsageError("locate --click clicks whatever window is at the match: pass --anywhere to click it "
+                          "anyway, or use `locum click IMAGE --window TITLE`")
     d = ctx.desktop
     region = _parse_region(a.region)
     if a.all:
@@ -1048,9 +1058,6 @@ def cmd_locate(ctx: _Ctx) -> int:
         m = d.locate(a.image, region=region, confidence=a.confidence, grayscale=a.grayscale, timeout=a.timeout or 0.0)
         matches = [m] if m is not None else []
     if matches and a.click:
-        if not a.anywhere:
-            raise _UsageError("locate --click clicks whatever window is at the match: pass --anywhere to click it "
-                              "anyway, or use `locum click IMAGE --window TITLE`")
         with _unscoped_target(ctx):
             d.mouse.click(matches[0].center)
     if ctx.json:
@@ -1082,12 +1089,10 @@ def cmd_observe(ctx: _Ctx) -> int:
     )
     saved = None
     if a.screenshot:
+        from .vision import _save_image
+
         img = obs.annotated if obs.annotated is not None else obs.screenshot
-        path = os.path.expanduser(a.screenshot)
-        parent = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent, exist_ok=True)
-        img.save(path)
-        saved = os.path.abspath(path)
+        saved = _save_image(img, a.screenshot)
     if ctx.json:
         data = obs.to_dict()
         if saved:
@@ -1835,7 +1840,12 @@ def main(
         return code
     err.write(usage_err.getvalue())
     if not args.command:
-        parser.print_help(out)
+        if wants_json:  # the one JSON document on stdout; the help goes to stderr
+            parser.print_help(err)
+            _emit_error_json(out, "UsageError", "error", "no command given", EXIT_USAGE,
+                             hint="run `locum --help` for the commands")
+        else:
+            parser.print_help(out)
         return EXIT_USAGE
     if not hasattr(args, "timeout"):
         args.timeout = None
@@ -1881,7 +1891,8 @@ def main(
             # --json is a contract: stdout carries exactly one JSON document, also when
             # the command failed (the diagnostic stays on stderr).
             try:
-                ctx.emit_json(_error_doc(type(exc).__name__, label, message, code, hint=hint,
+                kind = "UsageError" if isinstance(exc, _UsageError) else type(exc).__name__
+                ctx.emit_json(_error_doc(kind, label, message, code, hint=hint,
                                          details=getattr(exc, "details", None)))
             except Exception:
                 pass

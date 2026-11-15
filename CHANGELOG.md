@@ -12,6 +12,139 @@ The rules apply from 0.3.0 on.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-15
+
+A polish pass: a review of the whole library found over 30 defects. Three were
+safety gaps in the LLM tools, one leaked secrets into HTML reports, and the
+rest were wrong results at the edges. Each fix has a regression test
+(`tests/test_review15_polish.py`). No new features.
+
+### Breaking
+
+These tighten safety behaviour, which docs/API.md allows in a patch release.
+
+- **`browser_launch` refuses a `url` that starts with `-`.** The URL was the
+  browser's last command-line argument, so a model could pass a switch such as
+  `--gpu-launcher=...` or `--renderer-cmd-prefix=...`. `Browser.launch(url=...)`
+  raises `ValueError` for the same input. **Migration:** put browser options
+  in `Browser.launch(extra_args=...)`.
+- **`Policy.strict()` denies `browser_launch` by default**, like `launch_app`.
+  An `app=` allow rule (`"app=Google Chrome"`) authorizes acting inside the
+  browser, not starting it. **Migration:** allow it with
+  `Policy.strict(allow=["tool=browser_launch", ...])`.
+- **`ToolSpec(confirm=True)` always asks.** With no `confirm_patterns` (as in
+  `Policy.permissive()` or `Policy(confirm_patterns=())`), the flag was
+  ignored, although its documentation says every call needs a human.
+
+### Security
+
+- **The computer-use `hold_key` action and `GuardedDesktop.hold` / `key_down`
+  skipped the shortcut tripwire.** Holding `alt+p` pressed the "&Pay now"
+  button without checking its label, as `key` / `hotkey` do. An xdotool
+  spelling such as `Control_L+s` also slipped past `confirm_keys` (Ctrl+S).
+  Holding keys is now judged like pressing them.
+- **A password field's value could reach the model, the audit log and the
+  confirmation callback.** This happened for a password field with no
+  accessible name on a backend that reports its value: the policy target label
+  fell back to that value. Password fields are never labelled by their value
+  now.
+- **The HTML run report could show a registered secret that report.json
+  masked**, when the secret contained `"` or `\`. JSON escaping followed by
+  HTML escaping produced a form the scrubber did not know. Secrets are now
+  masked in that combined form too.
+- **The X11 backend no longer sends the clipboard to the Wayland desktop.**
+  `wl-clipboard` was preferred whenever `$WAYLAND_DISPLAY` was set, also when
+  locum drove another X display (`xvfb-run` started from a Wayland terminal).
+  Text typed through the clipboard, passwords included, went to the user's
+  desktop clipboard and never reached the X app. `wl-clipboard` is now used
+  only when asked for (`clipboard_tool="wl-clipboard"`).
+
+### Fixed
+
+- **`observe(changes_only=True)` drew the wrong ids on its image.** The boxes
+  were drawn before the elements got back their earlier ids, so the crop sent
+  to the model could label a new "Delete all" button with Cancel's id. The
+  boxes are now redrawn with the final ids.
+- **MCP `wait(seconds=N)` with N equal to the call timeout** (60 by default)
+  was reported as "timed out and stopped". `seconds` now extends the deadline
+  like a tool's `timeout` argument.
+- **`locum click SELECTOR` exited 1 after the click had happened**, when an
+  element with no screen bounds was invoked natively. A retrying script would
+  click twice. It now reports `invoked ... natively`, and with `--json`
+  `"clicked": null, "native": true`. Without `--window` it used to print the
+  cursor position as the clicked point.
+- **X11: a target's own dialogs and pop-up menus counted as other windows**, so
+  input bound to the window (`--window`, the agent tools) was refused with
+  `TargetLost`. `window_belongs_to` now follows `WM_TRANSIENT_FOR` and accepts
+  untitled override-redirect pop-ups of the same process. `window_handle_at`
+  now sees override-redirect menus.
+- **The a11y tab walk reported a Tab trap on the starting control as a
+  complete cycle.** It now reports `tab-trap` instead of `tab-unreachable`
+  warnings, so a CI gate that fails on errors catches it.
+- **Tri-state checkboxes on Linux (AT-SPI `indeterminate`)** counted as
+  unchecked: `uncheck()` did nothing. On every backend,
+  `wait_until("unchecked")` accepted a mixed box, while the `:unchecked`
+  selector did not match it.
+- **Number verification failed when the currency symbol came after the sign
+  or inside the parentheses** (`-$5.00`, `($1,250.00)`, `-€5`). A field that
+  reformats `-5` as `-$5.00` failed `set_text` verification.
+- **`set_text(..., clear=False)` on the typing path** inserted the text where
+  the click put the caret. It now moves to the end first.
+- **Window titles in Thai, Devanagari or decomposed (NFD) Unicode lost their
+  last combining mark** (`"ดี"` became `"ด"`, so `window "ดี"` matched "ดู").
+  Combining marks are now stripped only after a decoration glyph (`✔️`).
+- **Self-healing a union selector** (`'button "Save", button "Speichern"'`)
+  counted each node once per branch against `max_nodes`, then refused to heal
+  a fully scanned tree as "truncated". `heal` also raised `IndexError` when
+  `roots` contained `None`.
+- **`[role^=...]`, `[role*=...]`, `[role%=...]`, dict `role__contains` and
+  UiPath role globs were case-sensitive** against the lowercased role, so
+  `[role^=Butt]` matched nothing.
+- **`selector_for`'s last-resort path pointed at the wrong child** for a node
+  with no role (`> *:nth(0)` instead of its real index).
+- **Clicks and moves to numpy integer coordinates** (`np.int64`, as returned
+  by cv2 or `argmax`) raised `TypeError`.
+- **Saving a screenshot to a dotted name or a name with no extension**
+  (`shot_10.30.45`, `annotated`) failed in `Desktop.screenshot(path=)`,
+  `locum screenshot --window` and `locum observe --screenshot`, while
+  `Screen.save` worked. All of them now save PNG unless the suffix is an image
+  extension.
+- **CLI: an existing file named like a selector** (`edit`) turned
+  `locum click edit` into a coordinates/image click (usage error). Only image
+  extensions and `data:image/` URLs count as images, as in `Desktop`.
+- **`locum --json` with no command** now writes the JSON error document, and
+  usage errors detected after parsing report `"type": "UsageError"`, not
+  `"_UsageError"`. `locate --click` without `--anywhere` is a usage error
+  whether or not the image is found.
+- **The input-lock registry kept every mock or test backend alive** for the
+  rest of the process. It now holds them weakly. `desktop_input(...,
+  timeout=float("inf"))` raised `OverflowError`.
+- **`Window.is_on_screen` counted mirrored monitors twice**, so a window
+  partly off-screen counted as fully visible.
+- **The self-test wrote no report** when the pointer position could not be
+  read (Wayland before locum moved the pointer).
+- **Fallback typing kept going after an unread paste.** When the target app
+  did not read an intermediate paste in time, the next paste overwrote it on
+  the clipboard. Typing now stops with `ActionTimeout`.
+- **RPA: a parent flow's inline sub-flow, called from a file sub-flow,**
+  resolved its images and files against the calling file's folder instead of
+  its own.
+- **WorkQueue never recovered its own expired claim**, for example after
+  `process()` stopped on a write error in `complete()`. The item stayed
+  `in_progress` forever for that instance. It is now abandoned like any
+  expired lease.
+- **WorkQueue: a crash during a retry wait used up an attempt that never
+  ran.** With `on_abandoned="requeue"`, the item then failed one attempt
+  early. The attempt is now counted when it starts.
+- **A flow stopped with Ctrl+C** saved a report with `aborted: false` and no
+  error. It is now marked aborted, as `Robot.run` does.
+- **`MockBackend.focused_element()` returned a node with no parents**, so on
+  the reference backend the "Enter presses the default button" check never
+  ran.
+- **`locum.compat.pyautogui.write()` with a modifier held**
+  (`keyDown('ctrl'); write('a')`) typed a literal "a" instead of Ctrl+A. It now
+  presses keys, as pyautogui does.
+
 ## [0.4.3] - 2026-11-07
 
 Diagnostics and honest reporting, from a critique of a real Obsidian run on
@@ -710,7 +843,8 @@ Check it on your machine: `python -m locum.selftest` (opens its own Notepad tab,
 [0.1.2]: https://github.com/israerusan/locum/releases/tag/v0.1.2
 [0.1.1]: https://github.com/israerusan/locum/releases/tag/v0.1.1
 [0.1.0]: https://github.com/israerusan/locum/releases/tag/v0.1.0
-[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/israerusan/locum/releases/tag/v0.4.4
 [0.4.3]: https://github.com/israerusan/locum/releases/tag/v0.4.3
 [0.4.2]: https://github.com/israerusan/locum/releases/tag/v0.4.2
 [0.4.1]: https://github.com/israerusan/locum/releases/tag/v0.4.1

@@ -582,14 +582,18 @@ def heal(
     snap = _Snapshot(root_list, max_depth)
     best: Dict[int, Tuple[float, Any, _Target, str]] = {}
     visited = 0
+    scanned: set = set()  # node paths already counted: a union's branches rescan the same nodes
     for t in targets:
         # Scope: the top-level roots containing a match of the selector's first compound.
         if t.scope is not None:
             hits = _Branch([(None, t.scope)]).search(snap, snap.roots, None, True, None)
+            # Map by path, not list position: ``roots`` may hold ``None`` entries that the
+            # snapshot skips, so a root's path index is not its index in ``snap.roots``.
+            by_index = {r.path[0]: r for r in snap.roots}
             scope_ids = sorted({e.path[0] for e in hits})
             if not scope_ids:
                 continue
-            scope_roots = [snap.roots[i] for i in scope_ids]
+            scope_roots = [by_index[i] for i in scope_ids if i in by_index]
             allow_root = False
         else:
             scope_roots = list(snap.roots)
@@ -602,7 +606,9 @@ def heal(
                     continue
             for e in snap.walk(r):
                 _cancel_check()
-                visited += 1
+                if e.path not in scanned:
+                    scanned.add(e.path)
+                    visited += 1
                 if visited > opts.max_nodes:
                     break
                 if e is r and not allow_root:

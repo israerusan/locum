@@ -506,7 +506,12 @@ class SelfTest:
                 self.clipboard_saved = True
             except Exception:
                 saved_clip = None
-        start_pos = self.d.position() if self.d.backend.has(CAP_MOUSE) else None
+        start_pos = None
+        if self.d.backend.has(CAP_MOUSE):
+            try:  # Wayland cannot read the pointer before locum has moved it: no reason to skip the report
+                start_pos = self.d.position()
+            except Exception:
+                start_pos = None
         try:
             self.run_check("environment", self.c_environment)
             self.run_check("screenshot", self.c_screenshot, needs=CAP_SCREENSHOT)

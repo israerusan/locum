@@ -823,8 +823,13 @@ class ComputerUseAdapter:
             keys = parse_key_combo(text)
             check_activation_combo(keys)
             dur = self._duration(p)
-            dry = self._guard(action, p, self._keyboard_context(keys_activate([keys]), enter=_has_enter(keys), keys=text),
-                              f"hold {text} for {dur:g}s")
+            # Like ``key``: canonical key names (an xdotool spelling such as "Control_L+s" must
+            # still match ``confirm_keys``), and the controls an access key / accelerator presses.
+            pressed = _shortcut_targets(d, [keys])
+            ctx = self._keyboard_context(keys_activate([keys]), enter=_has_enter(keys), keys="+".join(keys),
+                                         shortcut_targets=pressed or None)
+            dry = self._guard(action, p, ctx, f"hold {text} for {dur:g}s"
+                              + (f" (presses {', '.join(map(repr, pressed))})" if pressed else ""))
             if dry is not None:
                 return dry
             with d.hold(*keys):

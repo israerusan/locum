@@ -43,13 +43,27 @@ def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
 # glyph (terminals, "✳ ◐ ◑ ⠋"), a dirty marker ("*doc.txt", "● main.py"), a
 # notification count ("(3) Inbox") and Windows' "(Not Responding)" suffix.
 _EDGE_MARKS = frozenset("*•·")  # *, bullet, middle dot
-_EDGE_CATEGORIES = frozenset({"So", "Co", "Cf", "Cc", "Mn", "Zs", "Zl", "Zp"})
+_EDGE_CATEGORIES = frozenset({"So", "Co", "Cf", "Cc", "Zs", "Zl", "Zp"})
 _LEADING_COUNT = re.compile(r"^\(\d+\+?\)\s+")
 _NOT_RESPONDING = re.compile(r"\s*[(\[]\s*not responding\s*[)\]]\s*$", re.I)
 
 
 def _edge_mark(ch: str) -> bool:
     return ch.isspace() or ch in _EDGE_MARKS or unicodedata.category(ch) in _EDGE_CATEGORIES
+
+
+def _trailing_mark_end(text: str, j: int, i: int) -> int:
+    """Where the trailing decoration of ``text[i:j]`` starts (``j`` if there is none).
+
+    A combining mark (``Mn``: an emoji variation selector, a keycap) is part of the
+    character before it: it goes with a decoration glyph ("✔️") but stays with a
+    letter (Thai "ดี", Devanagari, NFD "Café")."""
+    k = j
+    while k > i and unicodedata.category(text[k - 1]) == "Mn":
+        k -= 1
+    if k < j:  # a run of combining marks: decoration only if its base character is
+        return k - 1 if k > i and _edge_mark(text[k - 1]) else j
+    return j - 1 if j > i and _edge_mark(text[j - 1]) else j
 
 
 def stable_title(title: Any) -> str:
@@ -69,10 +83,13 @@ def stable_title(title: Any) -> str:
         prev = cur
         cur = _NOT_RESPONDING.sub("", cur)
         i, j = 0, len(cur)
-        while i < j and _edge_mark(cur[i]):
-            i += 1
-        while j > i and _edge_mark(cur[j - 1]):
-            j -= 1
+        while i < j and (_edge_mark(cur[i]) or unicodedata.category(cur[i]) == "Mn"):
+            i += 1  # a leading combining mark has no base character: it is debris
+        while j > i:
+            k = _trailing_mark_end(cur, j, i)
+            if k == j:
+                break
+            j = k
         cur = _LEADING_COUNT.sub("", cur[i:j])
         if cur == prev:
             break
@@ -238,7 +255,7 @@ def _is_actionable(node: Any) -> bool:
 
 def _label_of(node: Any) -> str:
     name = _safe(lambda: node.name, "") or ""
-    if not name:
+    if not name and not is_password(node):  # never label a password field with its plaintext
         value = _safe(lambda: node.value)
         name = value if isinstance(value, str) else ""
     return str(name)

@@ -283,6 +283,15 @@ class Observation:
         if self._ctx is not None and cache is not None:
             self._ctx.cache = cache
 
+    def _redraw_annotations(self) -> None:
+        """Redraw :attr:`annotated` after the element ids changed (``obsdiff.compare``
+        renumbers elements to keep their earlier ids): the labels in the image must be
+        the ids in the text, or the model acts on the wrong element."""
+        if self.annotated is None or self.screenshot is None:
+            return
+        self.annotated = _draw_boxes(self.screenshot, self.elements, self.region, self.scale,
+                                     bool(getattr(self, "_window_captured", False)))
+
     # ----------------------------------------------------------------- mapping
     @property
     def image_size(self) -> Tuple[int, int]:
@@ -637,6 +646,16 @@ def _resolve_window(desktop: "Desktop", window: Any) -> Any:
     return desktop.window(window, timeout=0)
 
 
+
+def _draw_boxes(shot: "Image", elements: Sequence[ObservedElement], region: Rect, scale: float,
+                window_captured: bool) -> "Image":
+    """``shot`` with each element's numbered box (the ids the observation's text uses)."""
+    from ..vision import annotate as _annotate
+
+    # A window captured off-screen shows its covered elements too, so they get boxes.
+    boxes = [(el.bounds, str(el.id)) for el in elements if window_captured or not el.occluded]
+    return _annotate(shot, boxes, color=None, offset=(region.left, region.top), scale=scale) if boxes else shot.copy()
+
 def observe(
     desktop: "Desktop",
     *,
@@ -878,11 +897,7 @@ def observe(
         else:
             shot = raw
         if annotate:
-            from ..vision import annotate as _annotate
-
-            # A window captured off-screen shows its covered elements too, so they get boxes.
-            boxes = [(el.bounds, str(el.id)) for el in elements if window_captured or not el.occluded]
-            annotated_img = _annotate(shot, boxes, color=None, offset=(region.left, region.top), scale=scale) if boxes else shot.copy()
+            annotated_img = _draw_boxes(shot, elements, region, scale, window_captured)
     shown_windows, shown_active = all_windows, active
     if target_window is not None:
         # Observing one window shows that window only: the titles of the other windows
@@ -904,6 +919,7 @@ def observe(
     )
     obs.capped = limit > 0 and len(elements) >= limit
     obs._max_id = len(elements)
+    obs._window_captured = window_captured
     obs._groups, obs._gen, obs._opts, obs._taken = groups, gen0, opts, taken
     obs.reused_windows = reused
     if pruned:

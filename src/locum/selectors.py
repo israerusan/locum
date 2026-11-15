@@ -470,8 +470,9 @@ class _AttrCond(_Cond):
         self.form = form  # attr | id | class | shorthand | bare
         self._rx: Optional["re.Pattern[str]"] = None
         # Process names are matched case-insensitively whatever the operator
-        # (Windows file names are; ``[app="EXCEL.EXE"]`` == ``[app=excel]``).
-        self._fold = ci or key == "app"
+        # (Windows file names are; ``[app="EXCEL.EXE"]`` == ``[app=excel]``). Roles too:
+        # the property is lowercased, so ``[role^=Butt]`` must not silently match nothing.
+        self._fold = ci or key in ("app", "role")
         if op == "~=":
             self._rx = re.compile(value or "", re.I if self._fold else 0)
         elif op == "%=":
@@ -2089,7 +2090,8 @@ def _selector_below(node: AccessibleNode, chain: Sequence[AccessibleNode], top_s
         parent_e, child = chain[i - 1], chain[i]
         kids = _safe(lambda: list(parent_e.children()), []) or []
         role = (_safe(lambda: child.role, "") or "").lower() or "*"
-        same_role = [k for k in kids if (_safe(lambda: k.role, "") or "").lower() == role]
+        # ``> *:nth(i)`` counts every child; ``> button:nth(i)`` only the buttons.
+        same_role = kids if role == "*" else [k for k in kids if (_safe(lambda: k.role, "") or "").lower() == role]
         pos = next((j for j, k in enumerate(same_role) if _same(k, child)), 0)
         parts.append(f"> {_role_head('' if role == '*' else role)}:nth({pos})")
     return " ".join(parts)
