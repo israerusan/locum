@@ -16,7 +16,8 @@ concurrency:
 jobs:
   test:
     name: ${{ matrix.os }} / py${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
+    # matrix.runner overrides the image for one leg without renaming its check.
+    runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 25
     strategy:
       # fail-fast stays off: GitHub's macOS runners are sometimes never assigned
@@ -27,6 +28,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.9", "3.12", "3.13"]
+        include:
+          # ubuntu-latest moved to 26.04, which has no Python 3.9 build (3.9 is end-of-life):
+          # keep testing the minimum supported version on the previous LTS image.
+          - os: ubuntu-latest
+            python-version: "3.9"
+            runner: ubuntu-24.04
     defaults:
       run:
         shell: bash
