@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 import unicodedata
 
@@ -166,8 +167,11 @@ def test_set_text_append_moves_the_caret_to_the_end():
     w.add("edit", "Name", (10, 10, 200, 30), value="abc")
     d = _desk(be)
     d.find('edit "Name"').set_text("def", clear=False, native=False, verify=False)
-    keys = [e for e in be.events if e[0] in ("key_down", "keydown", "down") and "end" in str(e)]
-    assert keys, be.events[-20:]
+    # "End of text" before typing: cmd+down on macOS, ctrl+end elsewhere.
+    mod, key = ("cmd", "down") if sys.platform == "darwin" else ("ctrl", "end")
+    events = list(be.events)
+    typed = events.index(("type", "def"))
+    assert events[typed - 4:typed] == [("key_down", mod), ("key_down", key), ("key_up", key), ("key_up", mod)], events
 
 
 @pytest.mark.parametrize("title", ["ดี", "ดู", "फ़ाइल में", unicodedata.normalize("NFD", "Café")])
