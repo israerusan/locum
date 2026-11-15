@@ -830,7 +830,9 @@ class MockBackend(Backend):
     def focused_element(self) -> Optional[AccessibleNode]:
         if self._focus is None:
             return None
-        return MockNode(self, self._focus)
+        # With its parent chain, like UIA / AT-SPI: the policy's "Enter presses the form's
+        # default button" check walks the focused node's ancestors.
+        return self._node_with_parents(self._focus)
 
 
 __all__ = ["MockBackend", "MockWindow", "MockWidget", "MockNode", "NotSupported"]

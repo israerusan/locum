@@ -44,6 +44,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from typing import Any, Callable, Dict, Iterator, Optional
 
 from .errors import DesktopBusy
@@ -200,7 +201,9 @@ class _Lock:
             self.depth += 1
             return True
         start = time.monotonic()
-        if not self._mutex.acquire(timeout=max(0.0, timeout)):
+        # inf ("wait as long as it takes") would overflow Lock.acquire / the Win32 wait; NaN is 0.
+        timeout = 0.0 if timeout != timeout else min(max(0.0, float(timeout)), threading.TIMEOUT_MAX)
+        if not self._mutex.acquire(timeout=timeout):
             return False
         if self._os is not None:
             try:
@@ -258,12 +261,26 @@ def _lock_for(obj: Any) -> _Lock:
     key: Any = ("named", name) if name else ("backend", id(backend))
     with _LOCKS_GUARD:
         lock = _LOCKS.get(key)
-        if lock is None or (name is None and getattr(lock, "_backend_ref", None) is not backend):
+        if lock is None or (name is None and _ref_target(lock) is not backend):
+            if name is None:
+                # Per-backend locks refer to their backend weakly (a strong reference here
+                # kept every mock backend alive forever); drop the ones whose backend is gone.
+                for k in [k for k, v in _LOCKS.items() if k[0] == "backend" and v.depth == 0
+                          and _ref_target(v) is None]:
+                    del _LOCKS[k]
             lock = _Lock(key, _os_lock(name) if name else None)
             if name is None:
-                lock._backend_ref = backend  # type: ignore[attr-defined]  # id() reuse guard
+                try:
+                    lock._backend_ref = weakref.ref(backend)  # type: ignore[attr-defined]  # id() reuse guard
+                except TypeError:  # not weak-referenceable: keep it alive (the old behaviour)
+                    lock._backend_ref = lambda b=backend: b  # type: ignore[attr-defined]
             _LOCKS[key] = lock
         return lock
+
+
+def _ref_target(lock: _Lock) -> Any:
+    ref = getattr(lock, "_backend_ref", None)
+    return ref() if ref is not None else None
 
 
 def _timeout_of(obj: Any, timeout: Optional[float]) -> float:

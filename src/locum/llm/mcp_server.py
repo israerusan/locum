@@ -249,7 +249,8 @@ class MCPServer:
 
     # ------------------------------------------------------- call execution
     def _timeout_for(self, args: Dict[str, Any]) -> Optional[float]:
-        """The call's time limit: ``call_timeout``, extended for a tool's own ``timeout`` argument.
+        """The call's time limit: ``call_timeout``, extended for a tool's own ``timeout`` argument
+        (or ``seconds``, the ``wait`` tool's: ``wait(seconds=60)`` must not hit a 60 s limit).
 
         The extension is capped at :attr:`MAX_TOOL_TIMEOUT` (the most any tool waits)
         plus the margin, so ``wait_for(timeout=1e9)`` cannot switch the server
@@ -257,6 +258,8 @@ class MCPServer:
         """
         t = self.call_timeout
         req = args.get("timeout")
+        if req is None:
+            req = args.get("seconds")
         if t is None or isinstance(req, bool) or not isinstance(req, (int, float)):
             return t
         try:

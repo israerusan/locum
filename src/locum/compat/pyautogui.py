@@ -1039,7 +1039,13 @@ def write(message: Union[str, Sequence[str]], interval: float = 0.0, logScreensh
         _logScreenshot(logScreenshot, "write", message if isinstance(message, str) else ",".join(map(str, message)))
     if isinstance(message, str):
         if message:
-            d.keyboard.type(message, interval=float(interval or 0.0), mode=d.typing_mode)
+            # pyautogui presses each character's key, so ``keyDown('ctrl'); write('a')`` is
+            # Ctrl+A. Unicode injection would insert a literal "a": with a modifier held,
+            # type with key presses.
+            from ..keys import MODIFIERS
+
+            held = any(k in MODIFIERS for k in d.keyboard.pressed)
+            d.keyboard.type(message, interval=float(interval or 0.0), mode="keys" if held else d.typing_mode)
         return
     for i, k in enumerate(message):
         if i and interval:

@@ -288,6 +288,9 @@ def compare(prev: "Observation", new: "Observation") -> ObservationDiff:
             next_id += 1
             diff.added.append(n)
     new._max_id = next_id - 1
+    redraw = getattr(new, "_redraw_annotations", None)
+    if redraw is not None:
+        redraw()  # the boxes were drawn with observe()'s fresh ids
     diff.removed = [p for p in prev.elements if id(p) not in matched_old]
     diff.capped = bool(getattr(prev, "capped", False) and getattr(new, "capped", False))
 

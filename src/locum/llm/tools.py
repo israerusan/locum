@@ -2125,6 +2125,9 @@ class DesktopToolkit:
         from ..browser import Browser, find_executable
 
         name = str(browser or "edge").lower()
+        if url is not None and str(url).lstrip().startswith("-"):
+            # The URL is the browser's last argv item: "--gpu-launcher=..." would be an option.
+            raise ValueError(f"url must be a URL, not a command-line switch: {url!r}")
         app = {"edge": "msedge.exe", "chrome": "chrome.exe", "chromium": "chrome.exe"}.get(name, name)
         if sys.platform != "win32":
             app = {"edge": "Microsoft Edge", "chrome": "Google Chrome", "chromium": "Chromium"}.get(name, name)

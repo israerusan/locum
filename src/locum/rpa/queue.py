@@ -825,7 +825,12 @@ class WorkQueue:
         return claim is not None and it.status == IN_PROGRESS and it.lease_id == claim
 
     def _abandon_reason(self, it: QueueItem, now: float) -> Optional[str]:
-        if it.status != IN_PROGRESS or self._owns(it):
+        if it.status != IN_PROGRESS:
+            return None
+        if self._owns(it) and (it.lease_expires_at is None or now < it.lease_expires_at):
+            # This worker's own claim, while its lease runs (process() renews it). An
+            # expired own claim is abandoned like anyone's: process() may have stopped
+            # on an error after next(), and nothing will ever finish the item.
             return None
         if it.lease_expires_at is None:
             return "it has no lease (written by an older locum or a run that crashed)"
@@ -1425,12 +1430,15 @@ class WorkQueue:
                 if item.attempts >= budget:
                     self.fail(item, exc, business=False)
                     return
+                # The next attempt is counted when it starts, after the wait: a crash (or kill)
+                # during the wait must not use up an attempt that never ran.
                 with self._txn():
                     self._held_item(item)
                     self._check_owner(item)
                     self._set_error(item, exc)
                     item.history.append({"time": _now(), "event": "retry", "attempt": item.attempts, "error": item.error})
-                    item.attempts += 1
+                    if delay <= 0:
+                        item.attempts += 1
                     self._touch()
                 if delay > 0:
                     try:
@@ -1443,6 +1451,11 @@ class WorkQueue:
                     except (FailSafeTriggered, KeyboardInterrupt):
                         self._interrupted_in_wait(item)  # the attempt it was waiting for never started
                         raise
+                    with self._txn():
+                        self._held_item(item)
+                        self._check_owner(item)
+                        item.attempts += 1
+                        self._touch()
                 delay *= backoff
                 continue
             if isinstance(result, dict):
@@ -1481,8 +1494,7 @@ class WorkQueue:
             if not self._owns(item):
                 return  # another worker has it now
             # Stopped by the human between attempts: no attempt was running, so nothing
-            # can be half done. The attempt it was waiting for does not count.
-            item.attempts = max(0, item.attempts - 1)
+            # can be half done. The attempt it was waiting for was not counted yet.
             self._reset(item, "interrupted", reset_attempts=False)
             self._touch()
 

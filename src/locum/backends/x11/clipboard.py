@@ -40,10 +40,12 @@ class _ClipboardMixin:
             if shutil.which(get[0]) is None or shutil.which(put[0]) is None:
                 raise BackendUnavailable(f"Clipboard tool {tool!r} is not installed")
             return list(get), list(put)
-        order = ["xclip", "xsel"]
-        if os.environ.get("WAYLAND_DISPLAY"):
-            order.insert(0, "wl-clipboard")
-        for name in order:
+        # wl-clipboard only when asked for (clipboard_tool="wl-clipboard"): it talks to the
+        # Wayland session named by $WAYLAND_DISPLAY, not to this backend's X display. Under
+        # `xvfb-run` started from a Wayland terminal it would put typed text (passwords
+        # included) on the user's desktop clipboard and give the X app nothing. On
+        # Xwayland, xclip/xsel/native reach the same clipboard through the X server.
+        for name in ("xclip", "xsel"):
             get, put = tools[name]
             if shutil.which(get[0]) and shutil.which(put[0]):
                 return list(get), list(put)

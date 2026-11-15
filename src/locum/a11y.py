@@ -1057,15 +1057,26 @@ def _run_tab_walk(desktop: Any, window: Any, *, max_tabs: int, reverse_check: bo
     initial = _safe(backend.focused_element)
     try:
         with _inputlock.desktop_input(raw_desktop), _target.bind(target):
-            _forward(walk, seen, max_tabs, backend, handle, root, press, add, label, selectors, sel_roots, cache)
+            stuck = _forward(walk, seen, max_tabs, backend, handle, root, press, add, label, selectors, sel_roots, cache)
             _backward_jumps(walk, seen, add)
             if walk.complete and snapshot is not None:
+                unreachable = []
                 for n in snapshot:
                     if root is not None and n.same_as(root):
                         continue
                     if (n.role in _FOCUS_ROLES and _visible(n) and _enabled(n) and "focusable" in n.states
                             and not _in_roving_container(n) and not _is_chrome(n)
                             and _index_of(seen, n._raw) is None):
+                        unreachable.append(n)
+                if stuck and len(seen) == 1 and unreachable:
+                    # Tab never moved the focus off the control focused before the walk, and the
+                    # window has other focusable controls: a trap, not a one-stop cycle.
+                    walk.complete = False
+                    walk.stopped = "trap"
+                    add(seen[0], "tab-trap", f"Tab leaves the focus on {label(seen[0])}: keyboard users are "
+                                             "trapped there; the walk stopped")
+                else:
+                    for n in unreachable:
                         add(n, "tab-unreachable", f"{n.role} is focusable but Tab never reaches it: "
                                                   "keyboard-only users cannot get to it")
             elif not walk.complete:
@@ -1095,43 +1106,50 @@ def _run_tab_walk(desktop: Any, window: Any, *, max_tabs: int, reverse_check: bo
 
 def _forward(walk: TabWalk, seen: List[Any], max_tabs: int, backend: Any, handle: Any, root: Any,
              press: Callable[[str, int], bool], add: Callable[..., None], label: Callable[[Any], str],
-             selectors: bool, sel_roots: Optional[List[AccessibleNode]], cache: List[Any]) -> None:
-    """The forward Tab walk: fills ``walk.stops`` / ``seen`` and sets ``complete`` / ``stopped``."""
-    rb =_safe(lambda: root.bounds) if root is not None else None
+             selectors: bool, sel_roots: Optional[List[AccessibleNode]], cache: List[Any]) -> bool:
+    """The forward Tab walk: fills ``walk.stops`` / ``seen`` and sets ``complete`` / ``stopped``.
+
+    Returns whether the first Tab press left the focus where it was (on the control
+    focused before the walk): with other focusable controls around, that is a trap.
+    """
+    rb = _safe(lambda: root.bounds) if root is not None else None
+    stuck = False
     for i in range(1, max_tabs + 1):
         before = _safe(backend.focused_element)
         before_value = _editable_value(before)
         if not press("tab", i):
-            return
+            return stuck
         walk.presses += 1
         node = _safe(backend.focused_element)
         if _in_window(backend, handle, node, root) is False:
             add(node, "tab-escape", f"Tab press {i} moved the keyboard focus out of {walk.window!r} "
                                     f"(from {label(before)} to {label(node)}); the walk stopped")
             walk.stopped = "escape"
-            return
+            return stuck
         if node is None and before is None and not seen:
             walk.stopped = "no-focus"
             walk.notes.append(f"nothing in {walk.window!r} has the keyboard focus and Tab did not focus anything: "
                               "focus a control of the window (click it) and run the walk again")
-            return
+            return stuck
         if node is None:
             add(before, "tab-focus-lost", f"after Tab press {i} (from {label(before)}) no element has the "
                                           "keyboard focus; the walk stopped")
             walk.stopped = "focus-lost"
-            return
+            return stuck
         if before is not None and _same(node, before):
+            if not seen:
+                stuck = True
             after_value = _editable_value(node)
             if before_value is not None and after_value is not None and after_value != before_value:
                 add(node, "tab-trap", f"{label(node)} takes Tab as text (its text changed): keyboard users "
                                       "cannot Tab out of it; the walk stopped (the inserted Tab was not undone)")
                 walk.stopped = "trap"
-                return
+                return stuck
         idx = _index_of(seen, node)
         if idx == 0:
             walk.complete = True
             walk.stopped = "cycle"
-            return
+            return stuck
         if idx is not None:
             if idx == len(seen) - 1:
                 msg = f"Tab press {i} left the focus on {label(node)}: keyboard users are trapped there"
@@ -1140,7 +1158,7 @@ def _forward(walk: TabWalk, seen: List[Any], max_tabs: int, backend: Any, handle
                        f"the focus loops among stops {idx + 1}-{len(seen)}")
             add(node, "tab-trap", msg + "; the walk stopped")
             walk.stopped = "trap"
-            return
+            return stuck
         snap = _Snap(node)
         vis = _visible(snap)
         b = snap.bounds

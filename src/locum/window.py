@@ -466,12 +466,8 @@ class Window:
                 mons = [self.backend.virtual_screen()]
             except Exception:
                 return True
-        seen = 0
-        for m in mons:
-            hit = m.intersect(r)
-            if hit is not None:
-                seen += hit.width * hit.height
-        return seen >= r.width * r.height
+        hits = [h for h in (m.intersect(r) for m in mons) if h is not None]
+        return _union_area(hits) >= r.width * r.height
 
     def _in_plain_view(self) -> bool:
         return self.is_on_screen() and not self.is_covered()
@@ -635,3 +631,21 @@ def _selector_text(original: Any, parsed: Any) -> Any:
     if isinstance(original, str):
         return original
     return str(parsed)
+
+
+def _union_area(rects: List[Rect]) -> int:
+    """Area covered by ``rects`` (overlaps counted once: mirrored or overlapping monitors)."""
+    xs = sorted({x for r in rects for x in (r.left, r.right)})
+    total = 0
+    for x0, x1 in zip(xs, xs[1:]):
+        spans = sorted((r.top, r.bottom) for r in rects if r.left <= x0 and r.right >= x1)
+        covered, end = 0, None
+        for top, bottom in spans:
+            if end is None or top >= end:
+                covered += bottom - top
+                end = bottom
+            elif bottom > end:
+                covered += bottom - end
+                end = bottom
+        total += covered * (x1 - x0)
+    return total

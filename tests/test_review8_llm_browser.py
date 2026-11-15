@@ -115,14 +115,24 @@ def test_abortable_sleep_stops_when_the_call_is_cancelled():
     assert fs.abortable_sleep(0.05) is False  # outside a scope: a plain sleep
 
 
-def test_mcp_wait_times_out_and_frees_the_worker(server):
+def test_mcp_cancelled_wait_frees_the_worker(server):
     srv, inp, out, _ = server
     inp.send(call(1, "wait", {"seconds": 10}))
-    r = out.next(5, by_id(1))
-    assert r["result"]["isError"] and "Timed out" in r["result"]["content"][0]["text"]
+    time.sleep(0.2)
+    inp.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}})
+    t0 = time.monotonic()
     inp.send(call(2, "list_windows"))
     r2 = out.next(5, by_id(2))
-    assert r2["result"]["isError"] is False and "Calc" in r2["result"]["content"][0]["text"]
+    assert r2["result"]["isError"] is False and time.monotonic() - t0 < 5
+
+
+def test_mcp_wait_seconds_extends_the_call_timeout(server):
+    # wait(seconds=N) is the tool's own time limit, like wait_for(timeout=N): a 0.4 s
+    # call_timeout must not report wait(1) as "timed out and stopped".
+    srv, inp, out, _ = server
+    inp.send(call(1, "wait", {"seconds": 1}))
+    r = out.next(5, by_id(1))
+    assert r["result"]["isError"] is False and "Waited 1s" in r["result"]["content"][0]["text"]
 
 
 # ----------------------------------------------------------------------------- 2. no response after cancel

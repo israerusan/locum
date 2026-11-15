@@ -273,6 +273,21 @@ def crop(image: ImageSource, region: RectLike) -> Image.Image:
 
 
 # ------------------------------------------------------------------- FFT machinery
+def _save_image(img: Image.Image, path: Any) -> str:
+    """Save ``img`` to ``path`` (parent folders created); returns the absolute path.
+
+    The format comes from the extension; a dot suffix that is not an image
+    extension ("shot_10.30.45", "invoice.v2") or none at all means PNG.
+    """
+    p = pathlib.Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.suffix and p.suffix.lower() in Image.registered_extensions():
+        img.save(str(p))
+    else:
+        img.save(str(p), format="PNG")
+    return str(p.resolve())
+
+
 def _fast_len(n: int) -> int:
     """Smallest 5-smooth integer >= n (fast FFT sizes)."""
     if n <= 1:

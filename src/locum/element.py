@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -213,7 +214,10 @@ def _parse_number(text: str, decimal: Optional[str] = None) -> "set":
     from decimal import Decimal, InvalidOperation
 
     t = "".join(text.split()).replace("'", "").replace("\u00a0", "").replace("\u202f", "")
-    t = re.sub(r"^[A-Z]{3}(?=[-+(\d])|(?<=[\d)\-])[A-Z]{3}$", "", t.strip("$€£¥₹"))  # "EUR", "$"
+    def _strip_currency(v: str) -> str:
+        return re.sub(r"^[A-Z]{3}(?=[-+(\d])|(?<=[\d)\-])[A-Z]{3}$", "", v.strip("$€£¥₹"))  # "EUR", "$"
+
+    t = _strip_currency(t)
     sign = 1
     if t[:1] == "(" and t[-1:] == ")":  # accounting format: (1,250.00)
         sign, t = -1, t[1:-1]
@@ -221,6 +225,7 @@ def _parse_number(text: str, decimal: Optional[str] = None) -> "set":
         sign, t = (-1 if t[0] == "-" else 1), t[1:]
     elif t.endswith("-"):  # SAP writes negative amounts as "1.250,00-"
         sign, t = -1, t[:-1]
+    t = _strip_currency(t)  # the symbol after the sign / inside the parentheses: "-$5.00", "($1,250.00)"
     if not re.fullmatch(r"\d+(?:[.,]\d+)*", t):
         return set()
     out = set()
@@ -1286,6 +1291,10 @@ class Element:
             if clear:
                 kb.hotkey("mod+a")
                 kb.press("backspace")
+            elif typed:
+                # Appending: focusing may have clicked mid-text, and keystrokes go in at the
+                # caret. Move it to the end first (cmd+down is "end of text" on macOS).
+                kb.hotkey("cmd+down" if sys.platform == "darwin" else "ctrl+end")
             if typed:
                 kb.type(typed, mode=typing_mode)
             if vmode is None:
@@ -1558,7 +1567,8 @@ class Element:
 
     def _check_state(self) -> str:
         st = self.states
-        return "checked" if "checked" in st else "mixed" if "mixed" in st else "unchecked"
+        # AT-SPI reports a tri-state box's third state as "indeterminate", UIA as "mixed".
+        return "checked" if "checked" in st else "mixed" if ("mixed" in st or "indeterminate" in st) else "unchecked"
 
     def _set_checked(self, want: str) -> "Element":
         """Toggle until the check state is ``want`` (a tri-state box may need two toggles)."""
@@ -1686,7 +1696,8 @@ class Element:
             "disabled": lambda: not self.is_enabled,
             "focused": lambda: self.is_focused,
             "checked": lambda: self.is_checked,
-            "unchecked": lambda: not self.is_checked,
+            # Like the :unchecked selector: an indeterminate (mixed) box is not unchecked.
+            "unchecked": lambda: self._check_state() == "unchecked",
             "selected": lambda: self.is_selected,
         }
         if s not in table:

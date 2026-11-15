@@ -572,10 +572,17 @@ class Browser:
     @classmethod
     def launch(cls, browser: str = "edge", *, url: Optional[str] = None, profile_dir: Optional[str] = None,
                headless: bool = False, timeout: float = 30.0, extra_args: Sequence[str] = ()) -> "Browser":
-        """Start ``browser`` with a locum-managed profile and a DevTools port (reuses a running one)."""
+        """Start ``browser`` with a locum-managed profile and a DevTools port (reuses a running one).
+
+        ``url`` must be a URL, not a command-line switch: a value that starts with ``-``
+        raises ``ValueError`` (the browser would read ``--gpu-launcher=...`` as an option).
+        Browser options go in ``extra_args``.
+        """
         browser = browser.lower()
         if browser not in BROWSERS:
             raise ValueError(f"browser must be one of {BROWSERS}, got {browser!r}")
+        if url is not None and str(url).lstrip().startswith("-"):
+            raise ValueError(f"url must be a URL, not a command-line switch: {url!r}")
         exe = find_executable(browser)
         if exe is None:
             raise NotSupported(f"{browser} is not installed (or not where locum looks for it)")

@@ -207,7 +207,8 @@ def test_click_selector_drives_the_app(desk, be):
 def test_click_coordinates_button_clicks_offset(desk, be):
     code, out, _ = run(["--json", "click", "300,200", "--anywhere", "--button", "right", "--clicks", "2", "--offset", "5,-5"], desk)
     assert code == EXIT_OK
-    assert json.loads(out) == {"clicked": {"x": 305, "y": 195}, "button": "right", "clicks": 2, "window": None}
+    assert json.loads(out) == {"clicked": {"x": 305, "y": 195}, "button": "right", "clicks": 2, "native": False,
+                                "window": None}
     downs = [e for e in be.events if e[0] == "down"]
     assert downs == [("down", "right", 305, 195), ("down", "right", 305, 195)]
     assert run(["click", "1,2", "--anywhere", "--clicks", "0"], desk)[0] == EXIT_USAGE

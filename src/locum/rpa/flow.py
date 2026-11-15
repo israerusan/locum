@@ -145,7 +145,7 @@ import pathlib
 import re
 import time
 import traceback as _tb
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .._policy import DEFAULT_POLICY, resolve_policy
@@ -852,6 +852,10 @@ class _Scope:
     flows: Mapping[str, Any]
     settings: Mapping[str, Any]
     call_depth: int = 0
+    #: The directory of the document that defined each inline flow (default: ``base_dir``).
+    #: A file sub-flow may call its parent's inline flows: their relative paths stay
+    #: relative to the parent's directory.
+    flow_dirs: Mapping[str, pathlib.Path] = field(default_factory=dict)
 
 
 class FlowRunner:
@@ -1489,7 +1493,7 @@ class FlowRunner:
         if isinstance(ref, str) and ref in scope.flows:
             sub = scope.flows[ref]
             sub_doc = {"steps": sub} if isinstance(sub, list) else dict(sub)
-            sub_dir = scope.base_dir
+            sub_dir = scope.flow_dirs.get(ref, scope.base_dir)
             label = ref
         else:
             if isinstance(ref, str):
@@ -1514,10 +1518,14 @@ class FlowRunner:
             if key not in explicit:
                 child_vars[str(key)] = interpolate(value, child_vars, path=f"{path}.call.vars.{key}")
         merged_flows = dict(scope.flows)
-        merged_flows.update(sub_doc.get("flows") or {})
+        own_flows = dict(sub_doc.get("flows") or {})
+        merged_flows.update(own_flows)
+        flow_dirs = {name: scope.flow_dirs.get(name, scope.base_dir) for name in scope.flows}
+        flow_dirs.update({str(name): sub_dir for name in own_flows})
         settings = dict(scope.settings)
         settings.update(sub_doc.get("settings") or {})
-        child_scope = _Scope(base_dir=sub_dir, flows=merged_flows, settings=settings, call_depth=scope.call_depth + 1)
+        child_scope = _Scope(base_dir=sub_dir, flows=merged_flows, settings=settings, call_depth=scope.call_depth + 1,
+                             flow_dirs=flow_dirs)
         saved_vars = self.vars
         self.vars = child_vars
         try:
@@ -1823,6 +1831,11 @@ def run_flow(
         error = exc
         report.aborted = True
         report.error = f"{type(exc).__name__}: {exc}"
+    except (KeyboardInterrupt, SystemExit) as exc:
+        # Stopped early, like Robot.run reports it; the interrupt still propagates.
+        report.aborted = True
+        report.error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        raise
     finally:
         report.finished_at = time.time()
         report.variables = runner.vars
