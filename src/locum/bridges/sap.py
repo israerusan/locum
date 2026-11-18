@@ -38,8 +38,10 @@ is no longer busy afterwards.
 COM objects belong to the thread that created them: use a session on the thread
 that attached it (call ``pythoncom.CoInitialize()`` first on a worker thread).
 A session that is frozen (an endless loop on the server, a modal system
-message) blocks *every* COM call into it, even ``Busy``; this module cannot
-time out such a call.
+message) blocks *every* COM call into it, even ``Busy``. Listing sessions
+(:func:`sessions`, :func:`attach`) reads each one on its own thread with a
+deadline (``probe_timeout``) and skips a frozen one; calls on an attached
+session that freezes mid-action are not bounded.
 """
 
 from __future__ import annotations
@@ -47,10 +49,12 @@ from __future__ import annotations
 import fnmatch
 import re
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+from .._secret import Secret
 from ..backends.base import AccessibleNode
 from ..errors import (
     ActionTimeout,
@@ -206,6 +210,9 @@ class SapSessionInfo:
     description: str
     busy: bool
     disabled_by_server: bool = False
+    #: The session did not answer within the probe deadline (frozen: every COM call into it
+    #: blocks). Its other fields are empty and ``busy`` is ``True``; locum never touches it again.
+    hung: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -233,17 +240,68 @@ def _conn_matches(index: int, conn: Any, want: Union[int, str]) -> bool:
     return desc.lower() == str(want).lower() or fnmatch.fnmatchcase(desc.lower(), str(want).lower())
 
 
+#: Seconds every session has to answer when sessions are listed (``sessions()``, ``attach()``).
+PROBE_TIMEOUT = 5.0
+
+
+def _nth(coll: Any, i: int) -> Any:
+    """Item ``i`` of a SAP COM collection (``coll(i)``, ``Item``, ``ElementAt``); raises when there is none."""
+    last: Optional[BaseException] = None
+    for getter in (lambda: coll(i), lambda: coll.Item(i), lambda: coll.ElementAt(i)):
+        try:
+            return getter()
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise last if last is not None else IndexError(i)
+
+
+def _cross_thread(obj: Any) -> Callable[[], Any]:
+    """A callable returning ``obj`` usable on another thread.
+
+    A pywin32 proxy belongs to the COM apartment that created it (another STA thread gets
+    ``RPC_E_WRONG_THREAD``), so it is marshalled into a stream here and unmarshalled on the
+    probing thread, in that thread's own apartment. Anything else (a fake, a free-threaded
+    object) is handed over as it is. One callable serves one thread (a stream unmarshals once).
+    """
+    ole = getattr(obj, "_oleobj_", None)
+    if ole is None:
+        return lambda: obj
+    import pythoncom  # noqa: PLC0415
+    import win32com.client  # noqa: PLC0415
+
+    stream = pythoncom.CoMarshalInterThreadInterfaceInStream(pythoncom.IID_IDispatch, ole)
+
+    def open_() -> Any:
+        try:
+            pythoncom.CoInitialize()  # never CoUninitialize: GetObject("SAPGUI") breaks on that thread after it
+        except Exception:  # noqa: BLE001
+            pass
+        return win32com.client.Dispatch(pythoncom.CoGetInterfaceAndReleaseStream(stream, pythoncom.IID_IDispatch))
+
+    return open_
+
+
+def _hung_info(ci: int, si: int, conn: Any) -> SapSessionInfo:
+    return SapSessionInfo(ci, si, "", "", "", "", str(_get(conn, "Description", "") or ""), True, False, True)
+
+
 class SapGui:
     """The SAP GUI Scripting engine: connections and sessions.
 
     Args:
         engine_obj: The ``GuiApplication`` COM object (default: the running SAP Logon's).
         policy / confirm / audit / desktop: Safety hook, see :func:`attach`.
+        probe_timeout: Seconds each session has to answer while sessions are listed
+            (:meth:`sessions`, :meth:`attach`). Every session is read on its own thread
+            (pywin32 proxies are marshalled to it): a frozen session -- which blocks every
+            COM call into it, even ``Busy`` -- is reported ``hung`` instead of hanging the
+            caller, and is never touched again. ``None`` reads them on this thread (no deadline).
     """
 
     def __init__(self, engine_obj: Any = None, *, policy: Any = None, confirm: Any = None, audit: Any = None,
                  desktop: Any = None, default_timeout: float = 30.0, poll_interval: float = 0.1,
-                 sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic) -> None:
+                 sleep: Callable[[float], Any] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 probe_timeout: Optional[float] = PROBE_TIMEOUT) -> None:
         warn_experimental("locum.bridges.sap", "a real SAP GUI")
         self.com = engine_obj if engine_obj is not None else engine()
         self.desktop, self.gate = ActionGate.resolve(desktop, policy, confirm, audit, bridge="sap")
@@ -251,21 +309,69 @@ class SapGui:
         self.poll_interval = float(poll_interval)
         self.sleep = sleep
         self.clock = clock
+        self.probe_timeout = None if probe_timeout is None else float(probe_timeout)
 
     def connections(self) -> List[Any]:
         return _items(_get(self.com, "Children"))
 
+    def _probe(self, ci: int, conn: Any, only: Optional[int] = None) -> List[Tuple[int, Optional[SapSessionInfo]]]:
+        """``(index, info)`` for the sessions of ``conn`` (just session ``only`` when given);
+        ``info`` is ``None`` for a session that did not answer within :attr:`probe_timeout`."""
+        kids = _get(conn, "Children")
+        count = _get(kids, "Count")
+        if self.probe_timeout is None or not isinstance(count, int):
+            return [(si, _info_of(ci, si, conn, s)) for si, s in enumerate(_items(kids))
+                    if only is None or si == only]
+        wanted = [si for si in range(count) if only is None or si == only]
+        if not wanted:
+            return []
+        try:
+            openers = {si: _cross_thread(conn) for si in wanted}
+        except Exception:  # noqa: BLE001 - cannot marshal the proxy: read on this thread, as before
+            openers = {}
+        if not openers:
+            return [(si, _info_of(ci, si, conn, s)) for si, s in enumerate(_items(kids)) if si in wanted]
+        results: Dict[int, Any] = {}
+
+        def work(si: int) -> None:
+            try:
+                c = openers[si]()
+                results[si] = _info_of(ci, si, c, _nth(_get(c, "Children"), si))
+            except BaseException as exc:  # noqa: BLE001 - reported to the listing thread
+                results[si] = exc
+
+        threads = [threading.Thread(target=work, args=(si,), name=f"locum-sap-probe-{ci}-{si}", daemon=True)
+                   for si in wanted]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + self.probe_timeout
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+        out: List[Tuple[int, Optional[SapSessionInfo]]] = []
+        for si in wanted:
+            r = results.get(si)
+            if isinstance(r, SapSessionInfo):
+                out.append((si, r))
+            elif r is None:  # still blocked in the probe thread: frozen
+                out.append((si, None))
+            else:  # the probe failed without hanging (session closed meanwhile, marshalling): read it here
+                try:
+                    out.append((si, _info_of(ci, si, conn, _nth(kids, si))))
+                except Exception:  # noqa: BLE001 - gone
+                    continue
+        return out
+
     def sessions(self) -> List[SapSessionInfo]:
         """Every session of every connection (connections the server refuses are listed with
-        ``disabled_by_server=True`` and session ``-1``)."""
+        ``disabled_by_server=True`` and session ``-1``; frozen sessions with ``hung=True``)."""
         out: List[SapSessionInfo] = []
         for ci, conn in enumerate(self.connections()):
             if _get(conn, "DisabledByServer", False):
                 out.append(SapSessionInfo(ci, -1, "", "", "", "", str(_get(conn, "Description", "") or ""),
                                           False, True))
                 continue
-            for si, sess in enumerate(_items(_get(conn, "Children"))):
-                out.append(_info_of(ci, si, conn, sess))
+            for si, info in self._probe(ci, conn):
+                out.append(info if info is not None else _hung_info(ci, si, conn))
         return out
 
     def attach(self, *, system: Optional[str] = None, client: Optional[Union[str, int]] = None,
@@ -288,6 +394,8 @@ class SapGui:
             ElementNotFound: no session matches.
             AmbiguousElement: several match -- narrow the filters (another
                 session may hold someone's unsaved work).
+            ActionTimeout: the session picked with ``session=`` is frozen (it did not
+                answer within ``probe_timeout``). Frozen sessions are otherwise skipped.
         """
         conns = self.connections()
         if not conns:
@@ -295,16 +403,17 @@ class SapGui:
         matches: List[Tuple[SapSessionInfo, Any]] = []
         refused: List[str] = []
         seen: List[SapSessionInfo] = []
+        hung: List[str] = []
         for ci, conn in enumerate(conns):
             if connection is not None and not _conn_matches(ci, conn, connection):
                 continue
             if _get(conn, "DisabledByServer", False):
                 refused.append(str(_get(conn, "Description", "") or f"con[{ci}]"))
                 continue
-            for si, sess in enumerate(_items(_get(conn, "Children"))):
-                if session is not None and si != int(session):
+            for si, info in self._probe(ci, conn, None if session is None else int(session)):
+                if info is None:
+                    hung.append(f"con[{ci}]/ses[{si}] {_get(conn, 'Description', '') or ''}".strip())
                     continue
-                info = _info_of(ci, si, conn, sess)
                 seen.append(info)
                 if system is not None and str(system).lower() not in (info.system.lower(), info.description.lower()):
                     continue
@@ -312,30 +421,42 @@ class SapGui:
                     continue
                 if user is not None and str(user).lower() != info.user.lower():
                     continue
-                matches.append((info, sess))
+                matches.append((info, conn))
         want = ", ".join(f"{k}={v!r}" for k, v in (("system", system), ("client", client), ("connection", connection),
                                                    ("session", session), ("user", user)) if v is not None) or "any"
         if not matches:
-            if refused and not seen:
+            if hung and session is not None:
+                raise ActionTimeout(
+                    f"SAP GUI session {'; '.join(hung)} is not responding (no answer within {self.probe_timeout:g}s): "
+                    "it is frozen, usually on a hidden popup or an export waiting on another program. "
+                    "Close that SAP window, or pick another session")
+            if refused and not seen and not hung:
                 raise NotSupported(
                     f"The SAP server refuses scripting for {', '.join(refused)} (connection.DisabledByServer): "
                     f"sapgui/user_scripting is FALSE there. {SCRIPTING_HINT}")
             listed = "; ".join(f"con[{i.connection}]/ses[{i.session}] {i.system}/{i.client} {i.user} "
                                f"({i.transaction})" for i in seen) or "none"
-            raise ElementNotFound(f"No SAP GUI session matches {want}. Open sessions: {listed}")
+            frozen = f". Not responding (frozen): {'; '.join(hung)}" if hung else ""
+            raise ElementNotFound(f"No SAP GUI session matches {want}. Open sessions: {listed}{frozen}")
         if len(matches) > 1:
             listed = "; ".join(f"con[{i.connection}]/ses[{i.session}] {i.system}/{i.client} {i.user} ({i.transaction})"
                                for i, _ in matches)
             raise AmbiguousElement(f"{len(matches)} SAP GUI sessions match {want}: {listed}. "
                                    "Pass connection=/session= to pick one")
-        info, sess = matches[0]
+        info, conn = matches[0]
+        # Fetched on this thread (the probe's proxy belongs to its own apartment); it answered just now.
+        try:
+            sess = _nth(_get(conn, "Children"), info.session)
+        except Exception as exc:  # noqa: BLE001 - closed in the meantime
+            raise ElementNotFound(f"SAP GUI session con[{info.connection}]/ses[{info.session}] closed while "
+                                  f"attaching ({_com_message(exc)})") from exc
         return SapSession(sess, self, info)
 
 
 def attach(*, system: Optional[str] = None, client: Optional[Union[str, int]] = None,
            connection: Optional[Union[int, str]] = None, session: Optional[int] = None, user: Optional[str] = None,
            policy: Any = None, confirm: Any = None, audit: Any = None, desktop: Any = None,
-           default_timeout: float = 30.0) -> "SapSession":
+           default_timeout: float = 30.0, probe_timeout: Optional[float] = PROBE_TIMEOUT) -> "SapSession":
     """Attach to a running, logged-on SAP GUI session (see :meth:`SapGui.attach` for the filters).
 
     Args:
@@ -347,14 +468,18 @@ def attach(*, system: Optional[str] = None, client: Optional[Union[str, int]] = 
             :class:`~locum.llm.safety.GuardedDesktop` (whose policy, confirm and
             audit are used unless given).
         default_timeout: Seconds to wait for a busy session after an action.
+        probe_timeout: Seconds each session has to answer while looking for the match
+            (frozen sessions are skipped; see :class:`SapGui`).
     """
-    gui = SapGui(policy=policy, confirm=confirm, audit=audit, desktop=desktop, default_timeout=default_timeout)
+    gui = SapGui(policy=policy, confirm=confirm, audit=audit, desktop=desktop, default_timeout=default_timeout,
+                 probe_timeout=probe_timeout)
     return gui.attach(system=system, client=client, connection=connection, session=session, user=user)
 
 
-def sessions() -> List[SapSessionInfo]:
-    """Every open SAP GUI session (read-only; never attaches)."""
-    return SapGui().sessions()
+def sessions(probe_timeout: Optional[float] = PROBE_TIMEOUT) -> List[SapSessionInfo]:
+    """Every open SAP GUI session (read-only; never attaches). A frozen session is listed with
+    ``hung=True`` after ``probe_timeout`` seconds instead of blocking the call."""
+    return SapGui(probe_timeout=probe_timeout).sessions()
 
 
 # ---------------------------------------------------------------------- the session
@@ -527,16 +652,26 @@ class SapSession:
                 pass
         return "saplogon.exe"
 
-    def _run(self, tool: str, args: Dict[str, Any], ctx: Dict[str, Any], description: str, action: Callable[[], Any],
+    def _run(self, tool: str, args: Dict[str, Any], ctx: Union[Dict[str, Any], Callable[[], Dict[str, Any]]],
+             description: Union[str, Callable[[], str]], action: Callable[[], Any],
              *, secret: bool = False, wait: bool = True) -> bool:
-        """Gate, run ``action`` (COM errors -> :class:`BackendError`), then wait until not busy."""
-        if not self.gate.allow(tool, args, ctx, description, secret=secret):
-            return False
+        """Gate, run ``action`` (COM errors -> :class:`BackendError`), then wait until not busy.
+
+        ``ctx`` and ``description`` may be callables: building them reads the active window and
+        the component's label (cross-process COM calls), which only a policy needs."""
+        if self.gate.policy is not None:
+            ctx = ctx() if callable(ctx) else ctx
+            description = description() if callable(description) else description
+            if not self.gate.allow(tool, args, ctx, description, secret=secret):
+                return False
+        else:
+            self.gate.guard()  # all an ungated allow() does: the fail-safe and cancel scopes
         try:
             action()
         except LocumError:
             raise
         except Exception as exc:  # noqa: BLE001 - pywintypes.com_error
+            description = description() if callable(description) else description
             raise BackendError(f"SAP GUI refused to {description} ({_com_message(exc)}). If every write fails, "
                                "the server may allow read-only scripting (sapgui/user_scripting_set_readonly)") \
                 from exc
@@ -550,10 +685,16 @@ class SapSession:
         vkey = int(vkey)
         win = self._find_raw(window)
         combo = vkey_combo(vkey)
-        ctx = self._ctx(window=win)
-        ctx["keys"] = combo
+        memo: Dict[str, Dict[str, Any]] = {}
+
+        def ctx() -> Dict[str, Any]:
+            if "ctx" not in memo:
+                memo["ctx"] = self._ctx(window=win)
+                memo["ctx"]["keys"] = combo
+            return memo["ctx"]
+
         self._run("press_keys", {"keys": combo, "vkey": vkey, "window": window}, ctx,
-                  f"press {combo} (vkey {vkey}) in {ctx.get('target_window') or window!r}",
+                  lambda: f"press {combo} (vkey {vkey}) in {ctx().get('target_window') or window!r}",
                   lambda: win.sendVKey(vkey))
         return self.statusbar
 
@@ -564,8 +705,10 @@ class SapSession:
             code = code[2:]
         if not code:
             raise ValueError("start_transaction needs a transaction code")
-        ctx = self._ctx()
-        ctx["target"] = f"transaction {code}"
+        def ctx() -> Dict[str, Any]:
+            c = self._ctx()
+            c["target"] = f"transaction {code}"
+            return c
 
         def go() -> None:
             try:
@@ -664,16 +807,16 @@ class SapComponent:
         return wrap(com, self.session)
 
     def set_focus(self) -> "SapComponent":
-        self.session._run("focus", {"target": self.id}, self.session._ctx(self, activates=False),
-                          f"focus {self.label or self.id!r}", lambda: self.com.SetFocus(), wait=False)
+        self.session._run("focus", {"target": self.id}, lambda: self.session._ctx(self, activates=False),
+                          lambda: f"focus {self.label or self.id!r}", lambda: self.com.SetFocus(), wait=False)
         return self
 
     def _act(self, tool: str, verb: str, action: Callable[[], Any], *, activates: bool = True,
              args: Optional[Dict[str, Any]] = None, secret: bool = False) -> "SapComponent":
         a = {"target": self.id}
         a.update(args or {})
-        self.session._run(tool, a, self.session._ctx(self, activates=activates),
-                          f"{verb} {self.label or self.id!r}", action, secret=secret)
+        self.session._run(tool, a, lambda: self.session._ctx(self, activates=activates),
+                          lambda: f"{verb} {self.label or self.id!r}", action, secret=secret)
         return self
 
     def to_dict(self) -> Dict[str, Any]:
@@ -728,10 +871,12 @@ class SapTextField(SapComponent):
         lt = str(_get(left, "Text", "") or "") if left is not None else ""
         return (lt or self.tooltip or _meaningful_name(self.name)).strip()
 
-    def set_text(self, text: str) -> "SapTextField":
-        """Set the field's text. Raises ``ValueError`` (nothing written) when it is longer than the
-        field (``MaxLength``: SAP would cut it off silently)."""
-        value = str(text)
+    def set_text(self, text: Any) -> "SapTextField":
+        """Set the field's text (a str or a :class:`~locum._secret.Secret`, revealed only for the
+        write and masked in audit events). Raises ``ValueError`` (nothing written) when it is longer
+        than the field (``MaxLength``: SAP would cut it off silently)."""
+        secret = isinstance(text, Secret) or self.is_password
+        value = text.reveal() if isinstance(text, Secret) else str(text)
         limit = self.max_length
         if limit is not None and len(value) > limit:
             raise ValueError(f"{len(value)} characters do not fit SAP field {self.id!r} (MaxLength {limit}); "
@@ -742,8 +887,7 @@ class SapTextField(SapComponent):
         def write() -> None:
             self.com.Text = value
 
-        self._act("set_value", "set text of", write, activates=False,
-                  args={"text": value}, secret=self.is_password)
+        self._act("set_value", "set text of", write, activates=False, args={"text": value}, secret=secret)
         return self
 
     def caret_to_end(self) -> "SapTextField":
@@ -929,8 +1073,8 @@ class SapTableControl(SapComponent):
 
         if gated:
             done = self.session._run("scroll", {"target": self.id, "row": int(row)},
-                                     self.session._ctx(self, activates=False),
-                                     f"scroll to row {row} of {self.label or self.id!r}", move)
+                                     lambda: self.session._ctx(self, activates=False),
+                                     lambda: f"scroll to row {row} of {self.label or self.id!r}", move)
         else:
             try:
                 move()
@@ -957,7 +1101,12 @@ class SapTableControl(SapComponent):
         if vis and not (top <= row < top + vis):
             if not self._scroll(row, gated=gated):
                 return None
-            top = self._top()
+            top, vis = self._top(), self.visible_row_count
+            if vis and not (top <= row < top + vis):
+                # The scrollbar clamps silently (its range ends before RowCount, or the screen
+                # refused to scroll): a visible-relative GetCell would name another row.
+                raise BackendError(f"SAP table {self.id!r} did not scroll to row {row} (first visible row is "
+                                   f"{top}, {vis} visible, {n} rows): the scrollbar stops short of it")
         return row - top
 
     def _cell(self, row: int, col: Union[int, str], *, gated: bool) -> Optional[SapComponent]:
@@ -1062,11 +1211,13 @@ class SapGridView(SapComponent):
             out.append({c: self._value(r, c) for c in cols})
         return out
 
-    def write(self, row: int, col: str, text: str) -> "SapGridView":
-        """Change an editable cell (``ModifyCell``)."""
+    def write(self, row: int, col: str, text: Any) -> "SapGridView":
+        """Change an editable cell (``ModifyCell``; ``text`` may be a :class:`~locum._secret.Secret`)."""
+        secret = isinstance(text, Secret)
+        value = text.reveal() if secret else str(text)
         self._load(int(row))
-        self._act("set_value", f"set cell ({row}, {col}) of", lambda: self.com.ModifyCell(int(row), str(col), str(text)),
-                  activates=False, args={"row": int(row), "column": str(col), "text": str(text)})
+        self._act("set_value", f"set cell ({row}, {col}) of", lambda: self.com.ModifyCell(int(row), str(col), value),
+                  activates=False, args={"row": int(row), "column": str(col), "text": value}, secret=secret)
         return self
 
     def set_current_cell(self, row: int, col: str) -> "SapGridView":

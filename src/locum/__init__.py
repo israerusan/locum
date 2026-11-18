@@ -53,16 +53,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from .motion import Humanize
     from .window import Window
 
-try:  # written by the build from the git tag (hatch-vcs); never edited by hand
-    from ._version import __version__
-except ImportError:  # pragma: no cover - a source tree that was never built/installed
-    try:
-        from importlib.metadata import version as _dist_version
-
-        __version__ = _dist_version("locum")
-    except Exception:
-        __version__ = "0.0.0+unknown"
-
+# ``__version__`` is resolved on first access (``__getattr__`` -> ``_versioning``): in a git
+# checkout the build's ``_version.py`` goes stale, and asking git costs a subprocess.
 # Heavy names resolved on first attribute access (PEP 562) so that
 # ``import locum`` stays cheap and side-effect free.
 _LAZY = {
@@ -92,6 +84,11 @@ _LAZY = {
 
 
 def __getattr__(name: str) -> Any:
+    if name == "__version__":
+        from ._versioning import resolve_version
+
+        version = globals()["__version__"] = resolve_version()
+        return version
     target = _LAZY.get(name)
     if target is None:
         raise AttributeError(f"module 'locum' has no attribute {name!r}")
@@ -101,7 +98,7 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> List[str]:
-    return sorted(set(globals()) | set(_LAZY))
+    return sorted(set(globals()) | set(_LAZY) | {"__version__"})
 
 
 # Import the submodules whose names clash with convenience functions *now*, so

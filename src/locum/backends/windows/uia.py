@@ -356,6 +356,10 @@ def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
     return default if value is None else value
 
 
+def _call(fn: Callable[[], Any]) -> Any:
+    return fn()
+
+
 class UIANode(AccessibleNode):
     """A UI Automation element (``IUIAutomationElement``) as a portable :class:`AccessibleNode`.
 
@@ -413,12 +417,15 @@ class UIANode(AccessibleNode):
         ct = self.control_type
         is_dialog = False
         has_toggle = False
+        class_name = ""  # decides only for windows: no cross-process read for other elements
         if ct == UIA_WindowControlTypeId:
             is_dialog = bool(self._ctx.property_value(self._el, UIA_IsDialogPropertyId) or False)
+            if not is_dialog:
+                class_name = self.class_name
         elif ct == UIA_ButtonControlTypeId:
             has_toggle = self._pattern(UIA_TogglePatternId) is not None
         is_root = ct == UIA_PaneControlTypeId and self._parent is None and not self._top_level and self._ctx.is_root(self._el)
-        return map_uia_control_type(ct, class_name=self.class_name, is_dialog=is_dialog, has_toggle=has_toggle,
+        return map_uia_control_type(ct, class_name=class_name, is_dialog=is_dialog, has_toggle=has_toggle,
                                     is_root=is_root)
 
     @property
@@ -473,10 +480,19 @@ class UIANode(AccessibleNode):
         # UIA converts the rectangle to the DPI awareness of the thread *reading* it:
         # read it in the backend's DPI scope, like every other backend coordinate.
         scoped = getattr(self._ctx, "dpi_call", None)
-        if callable(scoped):
-            r = scoped(lambda: self._get("CurrentBoundingRectangle"))
-        else:
-            r = self._get("CurrentBoundingRectangle")
+        if not callable(scoped):
+            scoped = _call
+        if self._top_level and self._handle_hint:
+            # UIA reports a top-level window's GetWindowRect, invisible resize borders
+            # included: 7-11 px wider than what is drawn (and spilling onto the next
+            # monitor when maximized). The backend knows the visible frame -- the same
+            # rectangle as WindowInfo.rect -- without a cross-process UIA call.
+            resolver = getattr(self._ctx, "window_bounds", None)
+            if callable(resolver):
+                visible = _safe(lambda: scoped(lambda: resolver(self._handle_hint)))
+                if visible is not None:
+                    return visible
+        r = scoped(lambda: self._get("CurrentBoundingRectangle"))
         if r is None:
             return None
         try:
@@ -522,7 +538,8 @@ class UIANode(AccessibleNode):
                 st.add("expanded")
             elif es == ExpandCollapseState_Collapsed:
                 st.add("collapsed")
-        if self.control_type == UIA_ButtonControlTypeId:
+        ct = self.control_type  # one cross-process read for both checks below
+        if ct == UIA_ButtonControlTypeId:
             # STATE_SYSTEM_DEFAULT: the dialog/form button that Enter in a text field presses.
             lp = self._pattern(UIA_LegacyIAccessiblePatternId)
             if lp is not None and _safe(lambda: int(lp.CurrentState) & 0x100, 0):
@@ -531,7 +548,7 @@ class UIANode(AccessibleNode):
         if vp is not None:
             if _safe(lambda: vp.CurrentIsReadOnly, False):
                 st.add("readonly")
-            elif self.control_type in (50004, 50030, 50003):  # Edit, Document, ComboBox
+            elif ct in (50004, 50030, 50003):  # Edit, Document, ComboBox
                 st.add("editable")
         return frozenset(st)
 

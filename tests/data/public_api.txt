@@ -407,7 +407,7 @@ locum.rpa.synced_location def(path: 'PathLike') -> 'str'
 locum.rpa.validate_flow def(doc: 'Mapping[str, Any]', *, prefix: 'str' = '') -> 'List[str]'
 
 # locum.llm
-locum.llm.Agent class(desktop: "Optional['Desktop']" = None, *, model: 'str' = 'claude-opus-5-5', client: 'Any' = None, mode: 'str' = 'tools', policy: 'Optional[Policy]' = None, audit: 'Optional[AuditLog]' = None, max_steps: 'int' = 50, system_prompt: 'Optional[str]' = None, on_step: 'Optional[Callable[[AgentStep], Any]]' = None, effort: 'str' = 'high', max_tokens: 'int' = 16000, initial_observation: 'bool' = True, toolkit: 'Optional[DesktopToolkit]' = None, computer: 'Optional[ComputerUseAdapter]' = None, extra_tools: 'Sequence[Any]' = (), create_kwargs: 'Optional[Dict[str, Any]]' = None, max_continuations: 'int' = 2)
+locum.llm.Agent class(desktop: "Optional['Desktop']" = None, *, model: 'str' = 'claude-opus-5-5', client: 'Any' = None, mode: 'str' = 'tools', policy: 'Optional[Policy]' = None, audit: 'Optional[AuditLog]' = None, max_steps: 'int' = 50, system_prompt: 'Optional[str]' = None, on_step: 'Optional[Callable[[AgentStep], Any]]' = None, effort: 'str' = 'high', max_tokens: 'int' = 16000, initial_observation: 'bool' = True, toolkit: 'Optional[DesktopToolkit]' = None, computer: 'Optional[ComputerUseAdapter]' = None, extra_tools: 'Sequence[Any]' = (), create_kwargs: 'Optional[Dict[str, Any]]' = None, max_continuations: 'int' = 2, prompt_cache: 'bool' = True)
     .client property
     .run(self, task: 'str') -> 'AgentResult'
     .system(self) -> 'str'
@@ -800,8 +800,8 @@ locum.bridges.sap.SapGridView class(com: 'Any', session: 'SapSession') -> 'None'
     .rows(self, columns: 'Optional[Sequence[str]]' = None, *, limit: 'Optional[int]' = None) -> 'List[Dict[str, str]]'
     .select_rows(self, rows: 'Sequence[int]') -> "'SapGridView'"
     .set_current_cell(self, row: 'int', col: 'str') -> "'SapGridView'"
-    .write(self, row: 'int', col: 'str', text: 'str') -> "'SapGridView'"
-locum.bridges.sap.SapGui class(engine_obj: 'Any' = None, *, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, desktop: 'Any' = None, default_timeout: 'float' = 30.0, poll_interval: 'float' = 0.1, sleep: 'Callable[[float], Any]' = <built-in function sleep>, clock: 'Callable[[], float]' = <built-in function monotonic>) -> 'None'
+    .write(self, row: 'int', col: 'str', text: 'Any') -> "'SapGridView'"
+locum.bridges.sap.SapGui class(engine_obj: 'Any' = None, *, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, desktop: 'Any' = None, default_timeout: 'float' = 30.0, poll_interval: 'float' = 0.1, sleep: 'Callable[[float], Any]' = <built-in function sleep>, clock: 'Callable[[], float]' = <built-in function monotonic>, probe_timeout: 'Optional[float]' = 5.0) -> 'None'
     .attach(self, *, system: 'Optional[str]' = None, client: 'Optional[Union[str, int]]' = None, connection: 'Optional[Union[int, str]]' = None, session: 'Optional[int]' = None, user: 'Optional[str]' = None) -> "'SapSession'"
     .connections(self) -> 'List[Any]'
     .sessions(self) -> 'List[SapSessionInfo]'
@@ -842,7 +842,7 @@ locum.bridges.sap.SapSession class(com: 'Any', gui: 'SapGui', info: 'Optional[Sa
     .tree(self, max_depth: 'int' = 8) -> 'str'
     .wait_ready(self, timeout: 'Optional[float]' = None) -> "'SapSession'"
     .windows(self) -> "List['SapWindow']"
-locum.bridges.sap.SapSessionInfo class(connection: 'int', session: 'int', system: 'str', client: 'str', user: 'str', transaction: 'str', description: 'str', busy: 'bool', disabled_by_server: 'bool' = False) -> None
+locum.bridges.sap.SapSessionInfo class(connection: 'int', session: 'int', system: 'str', client: 'str', user: 'str', transaction: 'str', description: 'str', busy: 'bool', disabled_by_server: 'bool' = False, hung: 'bool' = False) -> None
     .to_dict(self) -> 'Dict[str, Any]'
 locum.bridges.sap.SapStatusbar class(com: 'Any', session: 'SapSession') -> 'None'
     .is_error property
@@ -865,7 +865,7 @@ locum.bridges.sap.SapTextField class(com: 'Any', session: 'SapSession') -> 'None
     .is_password property
     .label property
     .max_length property
-    .set_text(self, text: 'str') -> "'SapTextField'"
+    .set_text(self, text: 'Any') -> "'SapTextField'"
     .text property
 locum.bridges.sap.SapWindow class(com: 'Any', session: 'SapSession') -> 'None'
     .close(self) -> "'SapWindow'"
@@ -873,9 +873,9 @@ locum.bridges.sap.SapWindow class(com: 'Any', session: 'SapSession') -> 'None'
     .send_vkey(self, vkey: 'int') -> "'SapStatusbar'"
     .title property
 locum.bridges.sap.VKEYS dict
-locum.bridges.sap.attach def(*, system: 'Optional[str]' = None, client: 'Optional[Union[str, int]]' = None, connection: 'Optional[Union[int, str]]' = None, session: 'Optional[int]' = None, user: 'Optional[str]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, desktop: 'Any' = None, default_timeout: 'float' = 30.0) -> "'SapSession'"
+locum.bridges.sap.attach def(*, system: 'Optional[str]' = None, client: 'Optional[Union[str, int]]' = None, connection: 'Optional[Union[int, str]]' = None, session: 'Optional[int]' = None, user: 'Optional[str]' = None, policy: 'Any' = None, confirm: 'Any' = None, audit: 'Any' = None, desktop: 'Any' = None, default_timeout: 'float' = 30.0, probe_timeout: 'Optional[float]' = 5.0) -> "'SapSession'"
 locum.bridges.sap.engine def() -> 'Any'
-locum.bridges.sap.sessions def() -> 'List[SapSessionInfo]'
+locum.bridges.sap.sessions def(probe_timeout: 'Optional[float]' = 5.0) -> 'List[SapSessionInfo]'
 locum.bridges.sap.vkey_combo def(vkey: 'int') -> 'str'
 
 # locum.bridges.java (experimental: no compatibility promise)
@@ -914,7 +914,7 @@ locum.bridges.java.JavaElement class(node: 'JavaNode') -> 'None'
     .rect property
     .release(self) -> 'None'
     .role property
-    .set_text(self, text: 'str', *, verify: 'bool' = True) -> "'JavaElement'"
+    .set_text(self, text: 'Any', *, verify: 'bool' = True) -> "'JavaElement'"
     .states property
     .text property
     .to_dict(self) -> 'Dict[str, Any]'

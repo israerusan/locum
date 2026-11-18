@@ -261,8 +261,11 @@ def _split_alpha(img: Image.Image) -> Tuple[np.ndarray, Optional[np.ndarray]]:
 
 def _gray(arr: np.ndarray) -> np.ndarray:
     """ITU-R 601 luma (same weights as PIL's ``convert("L")``), float64 HxWx1."""
-    a = arr.astype(np.float64)
-    g = a[:, :, 0] * 0.299 + a[:, :, 1] * 0.587 + a[:, :, 2] * 0.114
+    # Channel by channel into one float64 plane (bit-identical to converting the whole
+    # HxWx3 array to float64 first, without that 3-plane copy of a full screenshot).
+    g = arr[:, :, 0] * 0.299
+    g += arr[:, :, 1] * 0.587
+    g += arr[:, :, 2] * 0.114
     return g[:, :, None]
 
 
@@ -310,7 +313,11 @@ def _fast_len(n: int) -> int:
 
 def _window_sum(ii: np.ndarray, th: int, tw: int) -> np.ndarray:
     """Sliding-window sums from a zero-padded integral image (valid positions only)."""
-    return ii[th:, tw:] - ii[:-th, tw:] - ii[th:, :-tw] + ii[:-th, :-tw]
+    # Same operation order as ``a - b - c + d`` (bit-identical), one temporary only.
+    out = ii[th:, tw:] - ii[:-th, tw:]
+    out -= ii[th:, :-tw]
+    out += ii[:-th, :-tw]
+    return out
 
 
 def _integral(a: np.ndarray) -> np.ndarray:
@@ -892,9 +899,20 @@ def find_color(
     if cropped is None:
         return []
     img, dx, dy = cropped
-    arr = _rgb_array(img).astype(np.int16)
+    arr = _rgb_array(img)
     tol = max(0, int(tolerance))
-    mask = np.all(np.abs(arr - target) <= tol, axis=2)
+    # Per channel, in uint8: lo <= value <= hi is |value - target| <= tol (no int16 copy, no
+    # HxWx3 temporaries); a channel whose range is 0..255 matches everywhere and is skipped.
+    mask: Optional[np.ndarray] = None
+    for c in range(3):
+        lo, hi = max(0, int(target[c]) - tol), min(255, int(target[c]) + tol)
+        if lo == 0 and hi == 255:
+            continue
+        plane = arr[:, :, c]
+        m = plane >= lo if hi == 255 else (plane <= hi if lo == 0 else (plane >= lo) & (plane <= hi))
+        mask = m if mask is None else np.logical_and(mask, m, out=mask)
+    if mask is None:
+        mask = np.ones(arr.shape[:2], dtype=bool)
     if not mask.any():
         return []
     rows, starts, ends, labels = _connected_runs(mask, connectivity)
@@ -918,11 +936,18 @@ def find_color(
 
 
 # ---------------------------------------------------------------------------- diffs
-def _pair_arrays(a: ImageSource, b: ImageSource) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+def _abs_diff(a: ImageSource, b: ImageSource) -> Optional[np.ndarray]:
+    """Per-channel ``|a - b|`` as uint8 HxWx3, or ``None`` when the sizes differ.
+
+    Computed as ``max - min`` in uint8: no int16 copies of two full screenshots
+    (these run on every poll of a screen-change wait)."""
     ia, ib = load_image(a), load_image(b)
     if ia.size != ib.size:
         return None
-    return _rgb_array(ia).astype(np.int16), _rgb_array(ib).astype(np.int16)
+    xa, xb = _rgb_array(ia), _rgb_array(ib)
+    diff = np.maximum(xa, xb)
+    diff -= np.minimum(xa, xb)
+    return diff
 
 
 def _tile_axis(n: int, t: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -967,16 +992,14 @@ def image_diff(a: ImageSource, b: ImageSource, *, tile: Optional[int] = None) ->
     Images of different sizes are considered totally different (``1.0``).
     Empty images compare as identical.
     """
-    pair = _pair_arrays(a, b)
-    if pair is None:
+    diff = _abs_diff(a, b)
+    if diff is None:
         return 1.0
-    xa, xb = pair
-    if xa.size == 0:
+    if diff.size == 0:
         return 0.0
     if tile:
-        diff = np.abs(xa - xb).sum(axis=2, dtype=np.int32)
-        return _max_tile_mean(diff, tile) / (255.0 * xa.shape[2])
-    return float(np.abs(xa - xb).mean() / 255.0)
+        return _max_tile_mean(diff.sum(axis=2, dtype=np.int32), tile) / (255.0 * diff.shape[2])
+    return float(diff.mean(dtype=np.float64) / 255.0)
 
 
 def changed_fraction(a: ImageSource, b: ImageSource, *, pixel_tolerance: int = 0, tile: Optional[int] = None) -> float:
@@ -986,13 +1009,18 @@ def changed_fraction(a: ImageSource, b: ImageSource, *, pixel_tolerance: int = 0
     toggling on a full-screen capture). With ``tile`` (pixels), the largest
     fraction over ``tile`` x ``tile`` blocks. Different sizes -> ``1.0``.
     """
-    pair = _pair_arrays(a, b)
-    if pair is None:
+    diff = _abs_diff(a, b)
+    if diff is None:
         return 1.0
-    xa, xb = pair
-    if xa.size == 0:
+    if diff.size == 0:
         return 0.0
-    changed = np.abs(xa - xb).max(axis=2) > int(pixel_tolerance)
+    tol = int(pixel_tolerance)
+    if tol >= 255:
+        changed = np.zeros(diff.shape[:2], dtype=bool)  # no uint8 difference can exceed it
+    elif tol < 0:
+        changed = np.ones(diff.shape[:2], dtype=bool)
+    else:
+        changed = diff.max(axis=2) > tol
     if tile:
         return _max_tile_mean(changed.astype(np.int32), tile)
     return float(changed.mean())

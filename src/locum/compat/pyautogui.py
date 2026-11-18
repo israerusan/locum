@@ -259,7 +259,7 @@ def _logScreenshot(logScreenshot: Any, funcName: str, funcArgs: str, folder: str
             oldest = G_LOG_SCREENSHOTS_FILENAMES.pop(0)
             try:
                 os.unlink(os.path.join(folder, oldest))
-            except FileNotFoundError:
+            except OSError:  # already gone, or locked (open in a viewer): never fail the action
                 pass
         if limit is not None and int(limit) <= 0:
             return None

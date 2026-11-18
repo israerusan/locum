@@ -153,6 +153,28 @@ def discover_ports(allow_any: bool = False) -> List[int]:
     return ports
 
 
+def _stop_process(proc: Any, grace: float) -> None:
+    """Wait up to ``grace`` seconds for ``proc`` to exit, then terminate (and finally kill) it.
+
+    Either way the process is reaped (no zombie, no ``ResourceWarning``)."""
+    try:
+        if grace > 0:
+            try:
+                proc.wait(timeout=grace)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception:  # an already reaped / foreign process object: nothing more to do
+        pass
+
+
 def _is_local_ws(url: Any) -> bool:
     """``url`` is a ``ws://`` URL on this machine (127.0.0.1 / localhost / ::1)."""
     from urllib.parse import urlsplit
@@ -614,7 +636,13 @@ class Browser:
             if proc.poll() is not None and not port:
                 break
             time.sleep(0.2)
-        raise CDPError(f"{browser} did not open a DevTools port within {timeout:g}s")
+        code = proc.poll()
+        if code is None:
+            # Never leave a browser we started running without a handle to it: it would also
+            # hold the profile lock, so the next launch could not use the profile.
+            _stop_process(proc, grace=0.0)
+        detail = f" (it exited with code {code})" if code is not None else ""
+        raise CDPError(f"{browser} did not open a DevTools port within {timeout:g}s{detail}")
 
     # -------------------------------------------------------------- pages
     def pages(self) -> List[PageInfo]:
@@ -633,6 +661,7 @@ class Browser:
         end = time.monotonic() + max(0.0, float(timeout))
         while True:
             pages = self.pages()
+            self._forget_closed_tabs(pages)
             if match:
                 m = match.lower()
                 pages = [p for p in pages if m in p.title.lower() or m in p.url.lower()]
@@ -654,6 +683,15 @@ class Browser:
         page = Page(info, self)
         self._pages[info.id] = page
         return page
+
+    def _forget_closed_tabs(self, open_pages: Sequence[PageInfo]) -> None:
+        """Close the cached sessions of tabs that no longer exist (one socket each, never reused)."""
+        alive = {p.id for p in open_pages}
+        for tid in [t for t in self._pages if t not in alive]:
+            try:
+                self._pages.pop(tid).close()
+            except Exception:
+                pass
 
     def new_page(self, url: str = "about:blank") -> Page:
         """Open a new tab on ``url`` (its ``#fragment`` included).
@@ -723,14 +761,22 @@ class Browser:
                 pass
         self._pages.clear()
         if quit and self.process is not None:
+            asked = False
             try:
-                s = CDPSession(self.version["webSocketDebuggerUrl"])
-                s.call("Browser.close", timeout=5)
+                s: Optional[CDPSession] = CDPSession(self.version["webSocketDebuggerUrl"], timeout=5)
             except Exception:
+                s = None
+            if s is not None:
+                asked = True  # the request goes out (or the browser closes the socket on it)
                 try:
-                    self.process.terminate()
+                    s.call("Browser.close", timeout=5)
                 except Exception:
-                    pass
+                    pass  # the browser often drops the connection before it answers
+                finally:
+                    s.close()
+            # A clean exit first (a killed browser leaves a "restore pages?" profile behind),
+            # then terminate; either way the process is reaped.
+            _stop_process(self.process, grace=10.0 if asked else 0.0)
 
 
 __all__ = ["BROWSERS", "Browser", "CDPError", "CDPSession", "Page", "PageInfo", "attach_any_allowed", "discover_ports",

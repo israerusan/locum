@@ -533,6 +533,8 @@ class Window:
         try:
             root = self._root_node()
             if root is None:
+                if not self.exists:
+                    return " (the window no longer exists)"
                 return (" (the window has no accessibility root at all: use coordinates inside it, an image or "
                         "the keyboard)")
             below = 0

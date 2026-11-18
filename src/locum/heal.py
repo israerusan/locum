@@ -613,10 +613,15 @@ def heal(
                     break
                 if e is r and not allow_root:
                     continue
+                role = e.prop("role")
+                if t.role and (_role_score(t.role, role) or -1.0) < 0:
+                    continue  # rejected by _score anyway: read none of its other properties
+                # Only what _score looks at (each property can be a cross-process call).
+                bounds = e.prop("bounds") if t.bounds is not None else None
                 cand = Fingerprint(
-                    role=e.prop("role"), name=e.prop("name"), automation_id=e.prop("automation_id"),
-                    class_name=e.prop("class_name"),
-                    bounds=e.prop("bounds") if isinstance(e.prop("bounds"), Rect) else None,
+                    role=role, name=e.prop("name"), automation_id=e.prop("automation_id"),
+                    class_name=e.prop("class_name") if t.class_name else "",
+                    bounds=bounds if isinstance(bounds, Rect) else None,
                     window=window,
                 )
                 s = _score(t, cand, window)

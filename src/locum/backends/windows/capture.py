@@ -164,9 +164,10 @@ class _CaptureMixin:
         return box if box[2] > box[0] and box[3] > box[1] else None
 
     def _window_image(self, hwnd: int) -> Any:
-        """The window's visible frame (DWM bounds) rendered by PrintWindow; NotSupported if blank."""
+        """The window's visible frame (DWM bounds, clipped to the work area when maximized)
+        rendered by PrintWindow; NotSupported if blank."""
         outer = self._outer_rect(hwnd)
-        frame = self._frame_rect(hwnd)
+        frame = self._visible_rect(hwnd)  # = WindowInfo.rect, the area the image must cover
         w, h = outer.width, outer.height
         if w <= 0 or h <= 0 or w > _MAX_SIDE or h > _MAX_SIDE:
             raise NotSupported(f"Window {hwnd:#x} has no capturable size ({w}x{h})")

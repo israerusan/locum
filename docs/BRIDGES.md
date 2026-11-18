@@ -163,10 +163,18 @@ be a person's unsaved work. Narrow the filters with `connection=` and
 * COM objects belong to the thread that created them. Use a session on the
   thread that attached it, and call `pythoncom.CoInitialize()` first in a
   worker thread.
-* A **frozen** session (an endless loop on the server, a hanging RFC) blocks
-  every COM call into it, including `Busy`. locum cannot time such a call out.
-  The acceptance scenario (`tests/acceptance/test_sap_export.py`) probes sessions
-  from a separate thread with a deadline for this reason.
+* A **frozen** session (an endless loop on the server, a hanging RFC, an export
+  waiting on a hidden popup) blocks every COM call into it, including `Busy`,
+  while the other sessions keep answering. `sap.sessions()` and `attach()` read
+  each session on its own thread (the COM proxy is marshalled to it) and give it
+  `probe_timeout` seconds (5 by default; `None` reads on the calling thread with
+  no deadline). A session that does not answer is listed with `hung=True`,
+  skipped by `attach()` and never touched again; `attach(session=n)` on it raises
+  `ActionTimeout`. Calls on a session you are attached to are not bounded: if it
+  freezes mid-action, that call blocks.
+* Text setters (`SapTextField.set_text`, `.text =`, `SapGridView.write`) accept a
+  `Secret` (`locum.rpa.credentials`): it is revealed for the write only and masked
+  in audit events, on any field.
 * Downloads and uploads trigger SAP GUI's own *SAP GUI Security* prompt. It is a
   normal Windows dialog, so answer it with the desktop side of locum (the
   acceptance scenario does), or set the security rules in SAP GUI Options.

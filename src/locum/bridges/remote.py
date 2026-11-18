@@ -132,9 +132,10 @@ class ImageSession:
 
     # ------------------------------------------------------------------ acting
     def click(self, x: int, y: int, *, button: str = "left", clicks: int = 1) -> Point:
-        """Click a window-relative point."""
-        point = self.to_screen(x, y)
+        """Click a window-relative point (relative to where the window is once it is in front:
+        activating a minimized window restores it elsewhere)."""
         with self.bound():
+            point = self.to_screen(x, y)
             self.desktop.click(point, button=button, clicks=clicks)
         return point
 

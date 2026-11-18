@@ -85,7 +85,16 @@ def test_import_is_side_effect_free():
     info = json.loads(out.stdout.strip().splitlines()[-1])
     imported = info.pop("file")
     assert os.path.normcase(os.path.abspath(imported)) == os.path.normcase(os.path.abspath(locum.__file__))
-    assert info == {"heavy": [], "backend": True, "desktop": True, "version": locum.__version__}
+    # The child has no git on PATH, so in a checkout it reports the build-time version
+    # (_version.py) while this process may report the `git describe` one; after a commit
+    # on an editable install the two differ. Either is correct for this tree.
+    version = info.pop("version")
+    try:
+        from locum._version import __version__ as built
+    except ImportError:
+        built = None
+    assert version in {locum.__version__, built}
+    assert info == {"heavy": [], "backend": True, "desktop": True}
 
 
 def test_version_and_reexports():

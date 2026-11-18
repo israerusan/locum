@@ -503,6 +503,9 @@ def _poll_find(desktop: Any, probe: Callable[[], Any], timeout: float) -> Any:
 
 
 _TEXT_ENTRY_ROLES = frozenset({"edit", "document", "combobox", "spinbutton"})
+#: Node attributes that carry the hint an empty text field shows (macOS ``AXPlaceholderValue``,
+#: UI Automation ``HelpText`` -- WinUI/Chromium report the placeholder there).
+_PLACEHOLDER_KEYS = ("placeholder", "placeholder_text", "help_text")
 
 class Element:
     """A UI element (accessibility node) bound to a desktop.
@@ -580,11 +583,35 @@ class Element:
         the ``value`` -- an empty field gives ``""``, never its label, so
         ``el.text == ""`` reliably means "empty". For other elements it is the
         ``value`` if non-empty, else the ``name`` (a label's or button's text).
+        A text field whose value is just its placeholder (apps that report the
+        hint they draw in an empty field as its value) reads ``""``.
         """
         v = self.value
-        if self.role in _TEXT_ENTRY_ROLES or "editable" in self.states:
-            return v or ""
+        if self._is_text_input():
+            return "" if self._is_placeholder(v, text_input=True) else (v or "")
         return v if v not in (None, "") else self.name
+
+    def _placeholder(self) -> str:
+        """The hint a text field shows while empty (placeholder / cue banner / help text), or ``""``."""
+        attrs = _safe(lambda: dict(self._node.attributes()), {}) or {}
+        for key in _PLACEHOLDER_KEYS:
+            v = attrs.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+        return ""
+
+    def _is_placeholder(self, v: Optional[str], *, text_input: bool = False) -> bool:
+        """Whether ``v`` read from this text field is only its placeholder (the field is empty)."""
+        if not v or not v.strip() or not (text_input or self._is_text_input()):
+            return False
+        ph = self._placeholder()
+        return bool(ph) and v.strip() == ph.strip()
+
+    def _reads_as(self, actual: str, target: str, vmode: str, decimal: Optional[str]) -> bool:
+        """``actual`` satisfies ``target``; a field showing only its placeholder reads as empty."""
+        if _matches(actual, target, vmode, decimal):
+            return True
+        return self._is_placeholder(actual) and _matches("", target, vmode, decimal)
 
     @property
     def automation_id(self) -> str:
@@ -1064,8 +1091,7 @@ class Element:
         raise NotSupported(f"{self!r} cannot be focused natively")
 
     def _is_text_input(self) -> bool:
-        st = self.states
-        return self.role in ("edit", "combobox", "document", "spinbutton") or "editable" in st
+        return self.role in _TEXT_ENTRY_ROLES or "editable" in self.states
 
     def _read_states(self) -> Optional[frozenset]:
         """The node's states, or ``None`` if reading them raised (unknown, not "no states")."""
@@ -1251,7 +1277,10 @@ class Element:
         dec = self._decimal(decimal, vmode)
         self._guard()
         self._check_writable()
-        target = text if clear else (self.value or "") + text
+        current_text = "" if clear else self.value or ""
+        if self._is_placeholder(current_text):
+            current_text = ""  # the field shows its hint: appending to it must not keep the hint
+        target = current_text + text
         typed = text
         if mode is not False:
             ok = bool(self._native(lambda: self._node.set_value(target), False))
@@ -1260,7 +1289,7 @@ class Element:
                 if vmode is None:
                     took = current is None or _same_text_lenient(current, target)
                 else:
-                    took = current is None or _matches(current, target, vmode, dec)
+                    took = current is None or self._reads_as(current, target, vmode, dec)
                 if took or mode is True:
                     if vmode is not None and current is not None and not took:
                         self._raise_mismatch(target, current, vmode)  # native only: nothing to fall back to
@@ -1372,7 +1401,7 @@ class Element:
         def holds() -> bool:
             v = self.value
             last[0] = v
-            return v is None or _matches(v, target, vmode, decimal)
+            return v is None or self._reads_as(v, target, vmode, decimal)
 
         try:
             wait_until(holds, 1.0, _desktop_interval(self.desktop) or 0.05,
@@ -1432,7 +1461,7 @@ class Element:
             # Strict modes raise here, before a single key is sent.
             self._conclude(text, vmode, dec, None, "the field's result cannot be read back: "
                            + self._verify_skip_reason(text, kw["mode"]))
-        elif vmode == "amount" and before != "":
+        elif vmode == "amount" and before != "" and not self._is_placeholder(before):
             raise ValueError(f"{self!r}: verify='amount' types into an empty field only (it holds {before!r}); "
                              "use set_text(..., verify='amount') to replace the value")
         self.desktop.keyboard.type(text, **kw)
@@ -1498,12 +1527,16 @@ class Element:
     def _verify_typed(self, before: str, text: str, require_focus: Optional[bool] = None,
                       vmode: str = "normalized", decimal: Optional[str] = None) -> None:
         b, t = _norm_newlines(before), _norm_newlines(text)
+        raw_b = b
+        if self._is_placeholder(before):
+            b = ""  # the field showed its placeholder: it was empty (repairs must not keep the hint)
         last: List[Optional[str]] = [None]
 
         def arrived(v: str) -> bool:
             if vmode == "amount":
                 return _matches(v, text, "amount", decimal)
-            return _typed_into(b, _norm_newlines(v), t)
+            nv = _norm_newlines(v)
+            return _typed_into(b, nv, t) or (raw_b != b and _typed_into(raw_b, nv, t))
 
         def holds() -> bool:
             v = _safe(lambda: self.value, None)

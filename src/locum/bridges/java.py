@@ -48,6 +48,7 @@ from ctypes import POINTER, Structure, byref, c_int, c_int32, c_int64, c_long, c
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .. import _target
+from .._secret import Secret
 from ..backends.base import AccessibleNode
 from ..errors import ActionTimeout, BackendError, ElementNotFound, NotSupported, WindowNotFound
 from ..types import Point, Rect
@@ -1122,8 +1123,11 @@ class JavaElement:
             with _target.bind(target):
                 desktop.mouse.click(point)
 
-    def set_text(self, text: str, *, verify: bool = True) -> "JavaElement":
+    def set_text(self, text: Any, *, verify: bool = True) -> "JavaElement":
         """Replace the element's text (``setTextContents``) and read it back.
+
+        ``text`` may be a :class:`~locum._secret.Secret`: it is revealed only for the
+        call, masked in audit events, and a failed read-back names neither value.
 
         Raises :class:`NotSupported` when the bridge cannot set it (not an
         editable text component), :class:`ElementNotFound` for a disabled or
@@ -1131,24 +1135,30 @@ class JavaElement:
         1023-character limit (before anything is sent) and :class:`ActionTimeout`
         when the read-back differs.
         """
-        _check_settable(str(text))
+        is_secret = isinstance(text, Secret)
+        value = text.reveal() if is_secret else str(text)
+        _check_settable(value)
         st = self._present().states
         if "disabled" in st or "readonly" in st:
             raise ElementNotFound(f"{self!r} is disabled or read-only")
-        secret = "password" in st
+        password = "password" in st
+        secret = password or is_secret
         ctx = self._ctx(activates=False)
-        shown = "***" if secret else (text if len(text) <= 60 else text[:57] + "...")
-        if not self.bridge.gate.allow("set_value", {"target": ctx.get("target"), "text": text}, ctx,
+        shown = "***" if secret else (value if len(value) <= 60 else value[:57] + "...")
+        if not self.bridge.gate.allow("set_value", {"target": ctx.get("target"), "text": value}, ctx,
                                       f"set text of {ctx.get('target') or self.role!r} to {shown!r}", secret=secret):
             return self
-        if not self.node.set_value(str(text)):
+        if not self.node.set_value(value):
             raise NotSupported(f"setTextContents failed on {self!r}: not an editable text component "
                                "(click it and type instead)")
-        if verify and not secret:
+        if verify and not password:
             self.node.refresh()
             actual = self.node.text()
-            if actual != str(text):
-                raise ActionTimeout(f"{self!r} reads {actual!r} after setting {str(text)!r}")
+            if actual != value:
+                if secret:  # neither value may appear in the message
+                    raise ActionTimeout(f"{self!r} does not read back the secret just set "
+                                        f"({len(actual)} characters instead of {len(value)})")
+                raise ActionTimeout(f"{self!r} reads {actual!r} after setting {value!r}")
         return self
 
     def focus(self) -> "JavaElement":

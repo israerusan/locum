@@ -833,10 +833,18 @@ def _backend_name(desktop: Any) -> str:
 def _write(path: PathLike, text: str) -> str:
     p = pathlib.Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, p)
+    # pid + thread: two threads saving the same trace path must not share a temp file.
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, p)
+    except BaseException:
+        try:  # a full disk / locked target must not leave a hidden temp file behind
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return str(p)
 
 

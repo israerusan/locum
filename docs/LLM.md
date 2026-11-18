@@ -144,7 +144,14 @@ errors on the first request (a `TypeError` from wrong `create_kwargs`, a
 missing or invalid API key) are raised instead of being reported as a failed
 run. `create_kwargs` are passed to `messages.create` (e.g. `extra_headers`,
 `extra_body`); a `betas` list routes the requests through
-`client.beta.messages.create`.
+`client.beta.messages.create`. Requests enable automatic prompt caching
+(top-level `cache_control={"type": "ephemeral"}`), so the resent history is
+billed at the cached rate; `prompt_cache=False` turns it off and
+`create_kwargs["cache_control"]` overrides it. Observations from earlier steps
+keep their elements and text but drop their screenshots, so memory stays flat
+over a long run. Extra-tool arguments with secret-like names (`password`,
+`token`, `api_key`, `pin`, ...) are masked as `***` in the audit log,
+descriptions and confirmation details; the tool still gets the real value.
 
 `client=` accepts anything with `client.messages.create(**kwargs)` returning
 SDK objects or plain dicts — your own gateway, a proxy, or `ScriptedClient`

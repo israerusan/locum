@@ -45,6 +45,18 @@ class WebSocket:
         self._parts: List[bytes] = []  # fragments of a message not yet complete
         self._parts_len = 0
         self.closed = False
+        try:
+            self._handshake(host, port, path)
+        except BaseException:
+            # A refused / stalled / garbled handshake must not leak the connected socket.
+            self.closed = True
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            raise
+
+    def _handshake(self, host: str, port: int, path: str) -> None:
         key = base64.b64encode(os.urandom(16)).decode()
         host_header = f"[{host}]" if ":" in host else host  # an IPv6 address goes in brackets
         req = (f"GET {path} HTTP/1.1\r\nHost: {host_header}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -53,7 +65,6 @@ class WebSocket:
         head = self._read_until(b"\r\n\r\n", limit=65536).decode("latin-1")
         status = head.split("\r\n", 1)[0]
         if " 101 " not in status + " ":
-            self._sock.close()
             raise WebSocketError(f"WebSocket handshake refused: {status!r}")
         expected = base64.b64encode(hashlib.sha1((key + _GUID).encode()).digest()).decode()
         accept = ""
@@ -62,7 +73,6 @@ class WebSocket:
             if k.strip().lower() == "sec-websocket-accept":
                 accept = v.strip()
         if accept != expected:
-            self._sock.close()
             raise WebSocketError("WebSocket handshake: bad Sec-WebSocket-Accept")
 
     # ----------------------------------------------------------------- io
@@ -99,7 +109,7 @@ class WebSocket:
             header += struct.pack("!Q", n)
         mask = os.urandom(4)
         header += mask
-        masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload)) if n < 4096 else _mask(payload, mask)
+        masked = _mask(payload, mask)  # big-int XOR: faster than a per-byte loop at every size
         with self._send_lock:
             self._sock.sendall(bytes(header) + masked)
 

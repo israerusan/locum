@@ -230,6 +230,9 @@ def coerce_point(value: Any) -> Point:
         return Point(int(round(value["x"])), int(round(value["y"])))
     if isinstance(value, (tuple, list)) and len(value) == 2:
         return Point(int(round(value[0])), int(round(value[1])))
+    if getattr(value, "ndim", None) == 1 and getattr(value, "shape", None) == (2,):
+        # A numpy array ``[x, y]`` (cv2 / np.mean results), as Rect.coerce accepts ``[l, t, w, h]``.
+        return Point(int(round(value[0])), int(round(value[1])))
     center = getattr(value, "center", None)
     if center is not None:
         return coerce_point(center() if callable(center) else center)

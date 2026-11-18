@@ -356,12 +356,31 @@ def scrub_exception(exc: BaseException) -> BaseException:
         except Exception:  # pragma: no cover - exotic exception types
             pass
         stack.extend((cur.__cause__, cur.__context__))
+        subs = getattr(cur, "exceptions", None)  # an ExceptionGroup prints its members too
+        if isinstance(subs, tuple):
+            stack.extend(s for s in subs if isinstance(s, BaseException))
     return exc
 
 
+def _scrub_arg(a: Any) -> Any:
+    if isinstance(a, str):
+        return scrub(a) if contains_secret(a) else a
+    if isinstance(a, (dict, list, tuple)):  # str() of the exception shows their repr
+        try:
+            clean = scrub_data(a)
+            return clean if clean != a else a
+        except Exception:  # noqa: BLE001 - an element whose __eq__ raises
+            return a
+    return a
+
+
 def _scrub_one(exc: BaseException) -> None:
-    if any(isinstance(a, str) and contains_secret(a) for a in exc.args):
-        exc.args = tuple(scrub(a) if isinstance(a, str) else a for a in exc.args)
+    args = tuple(_scrub_arg(a) for a in exc.args)
+    if any(new is not old for new, old in zip(args, exc.args)):
+        exc.args = args
+    notes = getattr(exc, "__notes__", None)  # add_note() text is printed with the traceback
+    if isinstance(notes, list) and any(isinstance(n, str) and contains_secret(n) for n in notes):
+        exc.__notes__ = [scrub(n) if isinstance(n, str) else n for n in notes]
     if isinstance(exc, OSError):  # str() is built from these, not from args
         for attr in ("filename", "filename2", "strerror"):
             v = getattr(exc, attr, None)

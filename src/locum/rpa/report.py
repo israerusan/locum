@@ -33,8 +33,10 @@ STATUSES = (PASSED, FAILED, SKIPPED)
 
 PathLike = Union[str, "os.PathLike[str]"]
 
-#: Embedded base64 images in the HTML report (left out of the secret scrub).
-_DATA_URL_RE = re.compile(r"(data:image/[a-z+]+;base64,[A-Za-z0-9+/=]+)")
+#: The report's own embedded screenshots (left out of the secret scrub). Only the ``src="..."``
+#: attribute the renderer writes: user text is HTML-escaped (``"`` -> ``&quot;``), so an error
+#: message that merely contains ``data:image/...;base64,<secret>`` is still scrubbed.
+_DATA_URL_RE = re.compile(r'( src="data:image/[a-z+]+;base64,[A-Za-z0-9+/=]+")')
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -331,10 +333,12 @@ class RunReport:
 
 
 def _atomic_write(path: pathlib.Path, text: str) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    # The queue's writer: a temp name unique per thread (two threads saving one report no longer
+    # share a temp file), the temp file removed when the write or rename fails, and the rename
+    # retried while an antivirus / indexer / another saver briefly holds the target on Windows.
+    from .queue import _atomic_write as _write
+
+    _write(path, text)
 
 
 # ------------------------------------------------------------------- HTML

@@ -50,6 +50,12 @@ class _AccessibilityMixin:
             self._change_tracker_failed = True
             return None
         if not tracker.alive:
+            # Failed, or still subscribing after START_TIMEOUT: stop it, or a late
+            # subscription would stay registered with nobody left to close it.
+            try:
+                tracker.close(0)
+            except Exception:
+                pass
             self._change_tracker_failed = True
             return None
         self._change_tracker = tracker
@@ -70,7 +76,9 @@ class _AccessibilityMixin:
         ``Windows.UI.Core.CoreWindow`` is a child window of the frame; WebView2 and other
         cross-process children work the same way. ``observe(reuse=...)`` treats the window
         as changed when any of these processes raised an event. Win32 only (no UIA call):
-        ``EnumChildWindows`` + ``GetWindowThreadProcessId``, microseconds per child.
+        ``EnumChildWindows`` + ``GetWindowThreadProcessId``, microseconds per child. A
+        minimized Store app's ``CoreWindow`` is a cloaked top-level window with the frame's
+        title instead of a child; it is found with ``EnumWindows``.
         """
         u32 = _user32()
         try:
@@ -100,6 +108,27 @@ class _AccessibilityMixin:
             u32.EnumChildWindows(hwnd, _ENUM_PROC(cb), 0)
         except Exception:
             return None
+        if len(pids) <= 1 and _class_of(u32, hwnd) == _UWP_FRAME_CLASS:
+            # A minimized (or suspended) Store app's CoreWindow is no longer a child of
+            # its frame: Windows re-parents it to the desktop, cloaked, under the same
+            # title. It still raises the app's events, so look for it there.
+            title = _text_of(u32, hwnd)
+            hosted: List[int] = []
+
+            def top(h: int, _lp: int) -> bool:
+                if _class_of(u32, h) == _UWP_CORE_CLASS and _text_of(u32, h) == title:
+                    hosted.append(int(h))
+                return len(hosted) < 8
+
+            try:
+                if title:
+                    u32.EnumWindows(_ENUM_PROC(top), 0)
+            except Exception:
+                hosted = []
+            for h in hosted:
+                p = pid_of(h)
+                if p:
+                    pids.add(p)
         return frozenset(pids) if pids else None
 
     def _close_change_tracker(self) -> None:
@@ -136,7 +165,25 @@ class _AccessibilityMixin:
                 ctx.dpi_call = self._dpi_call  # UIANode.bounds is read after the backend call returned
             except Exception:
                 pass
+        if getattr(ctx, "window_bounds", None) is None:
+            try:
+                ctx.window_bounds = self._uia_window_bounds  # visible frame of top-level roots
+            except Exception:
+                pass
         return ctx
+
+    def _uia_window_bounds(self, hwnd: Any) -> Optional[Any]:
+        """Visible bounds of top-level window ``hwnd`` for :attr:`UIANode.bounds`, the same
+        rectangle as :attr:`WindowInfo.rect` (``None``: let UIA answer -- minimized, gone
+        or unreadable). Called inside the backend's DPI scope."""
+        try:
+            h = int(hwnd)
+            a = self._api
+            if not h or not a.IsWindow(h) or a.IsIconic(h):
+                return None
+            return self._visible_rect(h)
+        except Exception:
+            return None
 
     def _app_for_pid(self, pid: int) -> str:
         """:meth:`_process_name`, cached per tree snapshot.
@@ -182,11 +229,13 @@ class _AccessibilityMixin:
         ctx = self.uia
         names: Dict[int, str] = {}
         self._pid_names = names  # fresh per snapshot: PIDs are recycled
-        hwnds = self._toplevel_hwnds()
-        listed = {int(w.handle) for w in self._windows_from(hwnds, names)}
         roots: List[AccessibleNode] = []
-        for hwnd in hwnds:
-            if hwnd in listed:
+        for hwnd in self._toplevel_hwnds():
+            try:
+                listed = self._is_candidate(hwnd)  # what list_windows keeps, without its WindowInfo
+            except Exception:
+                continue  # window vanished while enumerating
+            if listed:
                 el = ctx.element_from_handle(hwnd)
             else:
                 try:
@@ -234,8 +283,36 @@ def _user32() -> Any:
         u.GetWindowThreadProcessId.restype = wintypes.DWORD
         u.EnumChildWindows.argtypes = [wintypes.HWND, _ENUM_PROC, wintypes.LPARAM]
         u.EnumChildWindows.restype = wintypes.BOOL
+        u.EnumWindows.argtypes = [_ENUM_PROC, wintypes.LPARAM]
+        u.EnumWindows.restype = wintypes.BOOL
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.restype = ctypes.c_int
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowTextW.restype = ctypes.c_int
         _U32 = u
     return _U32
+
+
+_UWP_FRAME_CLASS = "ApplicationFrameWindow"
+_UWP_CORE_CLASS = "Windows.UI.Core.CoreWindow"
+
+
+def _class_of(u32: Any, hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(257)
+    try:
+        n = int(u32.GetClassNameW(hwnd, buf, 257))
+    except Exception:
+        return ""
+    return buf.value[:n] if n > 0 else ""
+
+
+def _text_of(u32: Any, hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(512)
+    try:
+        n = int(u32.GetWindowTextW(hwnd, buf, 512))
+    except Exception:
+        return ""
+    return buf.value[:n] if n > 0 else ""
 
 
 class _SelectorChangeSource:

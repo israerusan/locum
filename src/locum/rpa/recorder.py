@@ -768,6 +768,8 @@ class Recorder:
         src = str(source).lower()
         if src not in ("auto", "pynput", "backend", "manual"):
             raise ValueError(f"source must be 'auto', 'pynput', 'backend' or 'manual', got {source!r}")
+        error: Optional[BaseException] = None
+        failed: Optional[str] = None
         with self._lock:
             if self._source is not None:
                 raise RuntimeError(f"Recorder is already recording (source={self._source!r})")
@@ -783,7 +785,26 @@ class Recorder:
             else:
                 self._source = "manual"
             if self._source != "manual":
-                self._install_action_listener()
+                try:
+                    self._install_action_listener()
+                except BaseException as exc:
+                    error, failed = exc, self._source
+                    self._source = None
+        if error is not None:
+            # Not recording after all: undo the hooks/listeners installed above, or they would keep
+            # feeding a recorder that reports is_recording and refuses start() again. Outside the
+            # lock: the pynput worker thread takes it to process the events already queued.
+            if failed == "pynput":
+                for listener in self._listeners:
+                    try:
+                        listener.stop()
+                    except Exception:  # pragma: no cover - listener already dead
+                        pass
+                self._listeners = []
+                self._stop_worker()
+            else:
+                self._remove_backend_hooks()
+            raise error
         return self
 
     def stop(self) -> List[RecordedAction]:

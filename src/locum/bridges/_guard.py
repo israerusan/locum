@@ -43,7 +43,17 @@ class ActionGate:
             from ..llm.safety import AuditLog, Policy  # noqa: PLC0415
 
             if not isinstance(policy, Policy):
-                raise TypeError(f"policy must be a locum.llm.safety.Policy, got {type(policy).__name__}")
+                # Policy.off() / False and the preset names ("strict"...), as everywhere else in locum.
+                from .._policy import resolve_policy  # noqa: PLC0415
+
+                try:
+                    policy = resolve_policy(policy)
+                except TypeError:
+                    raise TypeError(f"policy must be a locum.llm.safety.Policy, a preset name or Policy.off(), "
+                                    f"got {type(policy).__name__}") from None
+        if policy is not None:
+            from ..llm.safety import AuditLog  # noqa: PLC0415
+
             if audit is None:
                 audit = AuditLog()
         self.policy = policy

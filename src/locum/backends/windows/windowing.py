@@ -16,6 +16,8 @@ from ._win32api import (
     DWORD,
     GWL_EXSTYLE,
     GWL_STYLE,
+    MONITOR_DEFAULTTONEAREST,
+    MONITORINFOEXW,
     POINT,
     PROCESS_QUERY_LIMITED_INFORMATION,
     RECT,
@@ -154,6 +156,43 @@ class _WindowsMixin:
         phys = self._dwm_bounds(hwnd)
         return phys if phys is not None else self._outer_rect(hwnd)
 
+    def _work_area(self, hwnd: int) -> Optional[Rect]:
+        """Work area (monitor minus taskbar and app bars) of the monitor showing ``hwnd``."""
+        a = self._api
+        fn = getattr(a, "MonitorFromWindow", None)
+        if fn is None:
+            return None
+        try:
+            hmon = fn(hwnd, MONITOR_DEFAULTTONEAREST)
+            if not hmon:
+                return None
+            info = MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+            if not a.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                return None
+        except Exception:
+            return None
+        work = info.rcWork.to_rect()
+        return work if work.width > 0 and work.height > 0 else None
+
+    def _visible_rect(self, hwnd: int, zoomed: Optional[bool] = None, aware: Any = ...) -> Rect:
+        """:meth:`_frame_rect`, clipped to the monitor's work area when maximized.
+
+        Windows places a maximized window so that its resize borders hang off the
+        monitor. Some frames (File Explorer, SAP GUI, owner-drawn ones) keep up to
+        8 px of that in their DWM bounds, which then spill onto the neighbouring
+        monitor (or the taskbar).
+        """
+        r = self._frame_rect(hwnd, aware)
+        if zoomed is None:
+            is_zoomed = getattr(self._api, "IsZoomed", None)
+            zoomed = bool(is_zoomed(hwnd)) if is_zoomed is not None else False
+        if not zoomed:
+            return r
+        work = self._work_area(hwnd)
+        clipped = r.intersect(work) if work is not None else None
+        return clipped if clipped is not None else r
+
     def _is_candidate(self, hwnd: int) -> bool:
         a = self._api
         if not a.IsWindowVisible(hwnd):
@@ -175,15 +214,16 @@ class _WindowsMixin:
             app = self._process_name(pid)
             if names is not None:
                 names[pid] = app
+        zoomed = bool(a.IsZoomed(hwnd))
         return WindowInfo(
             handle=hwnd,
             title=self._text(hwnd),
-            rect=self._frame_rect(hwnd, aware),
+            rect=self._visible_rect(hwnd, zoomed, aware),
             app=app,
             pid=pid or None,
             is_active=bool(foreground) and int(foreground) == hwnd,
             is_minimized=bool(a.IsIconic(hwnd)),
-            is_maximized=bool(a.IsZoomed(hwnd)),
+            is_maximized=zoomed,
             is_visible=bool(a.IsWindowVisible(hwnd)),
             class_name=self._class(hwnd),
         )
@@ -274,7 +314,7 @@ class _WindowsMixin:
             try:
                 if not a.IsWindowVisible(h) or a.IsIconic(h) or self._is_cloaked(h) or self.window_belongs_to(h, target):
                     continue
-                r = self._frame_rect(h, aware)
+                r = self._visible_rect(h, aware=aware)
             except Exception:
                 continue
             if r.width > 0 and r.height > 0:

@@ -31,6 +31,7 @@ on a retry is reported as PASS with the failed attempts in its detail.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -40,7 +41,7 @@ import sys
 import tempfile
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 # A deliberately mixed string: accents, euro, Greek, CJK and an emoji outside the BMP.
 UNICODE_TEXT = "locum ñandú café €1.234,56 Ω 漢字 ✓ 😀"
@@ -625,7 +626,40 @@ def _mock_desktop() -> Any:
     return Desktop(be, sleep=lambda s: None)
 
 
+@contextlib.contextmanager
+def _tolerant_stdio() -> Iterator[None]:
+    """Make the process stdout/stderr write ``?`` for characters their encoding lacks.
+
+    Window titles, element names and errors are printed as they are: on a cp1252 pipe or
+    console a braille spinner or an emoji must not abort the run with a
+    ``UnicodeEncodeError``. The encoding is kept; the previous handler is restored after."""
+    restore = []
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        errors = getattr(stream, "errors", None)
+        if reconfigure is None or errors not in ("strict", None):
+            continue  # already tolerant (stderr: backslashreplace), or not a TextIOWrapper
+        try:
+            reconfigure(errors="replace")
+        except Exception:
+            continue
+        restore.append((reconfigure, errors or "strict"))
+    try:
+        yield
+    finally:
+        for reconfigure, errors in restore:
+            try:
+                reconfigure(errors=errors)
+            except Exception:
+                pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    with _tolerant_stdio():
+        return _main(argv)
+
+
+def _main(argv: Optional[List[str]]) -> int:
     ap = argparse.ArgumentParser(prog="python -m locum.selftest", description=__doc__.split("\n\n")[0])
     ap.add_argument("--backend", help="backend name (default: this platform's); 'mock' = simulated dry run")
     ap.add_argument("--yes", "-y", action="store_true", help="start without asking")

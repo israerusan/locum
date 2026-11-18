@@ -377,15 +377,40 @@ def _is_remote_drive(path: str) -> bool:
         return False
 
 
+def _strip_extended_prefix(p: str) -> str:
+    r"""``\\?\C:\x`` / ``\\.\C:\x`` -> ``C:\x`` and ``\\?\UNC\srv\share`` -> ``\\srv\share`` (Windows only)."""
+    if os.name != "nt" or not p.startswith(("\\\\?\\", "\\\\.\\")):
+        return p
+    rest = p[4:]
+    if rest[:4].upper() == "UNC\\":
+        return "\\\\" + rest[4:]
+    if len(rest) >= 2 and rest[1] == ":" and rest[0].isalpha():
+        return rest
+    return p  # a device or volume GUID path: left to the UNC check
+
+
 def synced_location(path: PathLike) -> str:
     """Why ``path`` is not a safe place for a live queue file ("" if it is).
 
     Flags cloud-synced folders (the OneDrive folders named by ``%OneDrive%`` /
     ``%OneDriveCommercial%`` / ``%OneDriveConsumer%``, any ``OneDrive`` /
     ``OneDrive - <org>`` / Dropbox / Google Drive / iCloud / Box folder) and
-    network locations (UNC paths, mapped network drives).
+    network locations (UNC paths, mapped network drives). The path is checked
+    as written and with symbolic links / junctions resolved, so a local-looking
+    link into a synced folder is refused too.
     """
-    p = os.path.abspath(os.path.expanduser(str(path)))
+    p = _strip_extended_prefix(os.path.abspath(os.path.expanduser(str(path))))
+    why = _synced_reason(p)
+    if why:
+        return why
+    try:
+        real = _strip_extended_prefix(os.path.realpath(p))
+    except (OSError, ValueError):
+        return ""
+    return _synced_reason(real) if os.path.normcase(real) != os.path.normcase(p) else ""
+
+
+def _synced_reason(p: str) -> str:
     if os.name == "nt" and (p.startswith("\\\\") or p.startswith("//")):  # UNC exists on Windows only
         return "a network share (UNC path)"
     for var in _SYNC_ENV_VARS:
@@ -438,7 +463,20 @@ def _iso(ts: Optional[float]) -> Optional[str]:
     return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+_PLAIN_SCALARS = frozenset({str, int, float, bool, type(None)})
+
+
 def _jsonable(value: Any) -> Any:
+    # Fast path for the plain dicts/lists/scalars payloads and histories are made of:
+    # every item is converted on every write of the queue file.
+    t = type(value)
+    if t in _PLAIN_SCALARS:
+        return value
+    if t is dict:
+        return {(k if type(k) is str else str(k)): (v if type(v) in _PLAIN_SCALARS else _jsonable(v))
+                for k, v in value.items()}
+    if t is list:
+        return [v if type(v) in _PLAIN_SCALARS else _jsonable(v) for v in value]
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, dict):
@@ -1343,8 +1381,8 @@ class WorkQueue:
             sleep: Sleep function for retry delays (inject ``lambda s: None`` in tests);
                 :func:`locum.failsafe.abort` (the kill hotkey) ends the wait at once.
 
-        :class:`~locum.errors.FailSafeTriggered` and ``KeyboardInterrupt``
-        stop processing immediately, the queue is saved and the exception
+        :class:`~locum.errors.FailSafeTriggered`, ``KeyboardInterrupt`` and
+        ``SystemExit`` stop processing immediately, the queue is saved and the exception
         propagates. If the handler was running, its side effect (the payment)
         may already have happened, so the item is treated like one a crash left
         ``in_progress``: per ``on_abandoned``, ``failed`` with error type
@@ -1416,7 +1454,7 @@ class WorkQueue:
             except BusinessException as exc:
                 self.fail(item, exc, business=True)
                 return
-            except (FailSafeTriggered, KeyboardInterrupt) as exc:
+            except (FailSafeTriggered, KeyboardInterrupt, SystemExit) as exc:
                 self._interrupted_in_handler(item, exc)
                 raise
             except Exception as exc:
@@ -1448,7 +1486,7 @@ class WorkQueue:
                         else:
                             sleep(delay)
                         _failsafe._raise_if_aborted()
-                    except (FailSafeTriggered, KeyboardInterrupt):
+                    except (FailSafeTriggered, KeyboardInterrupt, SystemExit):
                         self._interrupted_in_wait(item)  # the attempt it was waiting for never started
                         raise
                     with self._txn():
@@ -1615,15 +1653,14 @@ class WorkQueue:
         """
         with self._lock:
             items = list(self._items)
-        payload_keys: List[str] = []
-        output_keys: List[str] = []
+        # dicts as ordered sets: a list membership test per key made this O(items x columns^2).
+        payload_seen: Dict[str, None] = {}
+        output_seen: Dict[str, None] = {}
         for it in items:
-            for k in it.payload:
-                if k not in payload_keys:
-                    payload_keys.append(k)
-            for k in it.output:
-                if f"output.{k}" not in output_keys:
-                    output_keys.append(f"output.{k}")
+            payload_seen.update(dict.fromkeys(it.payload))
+            output_seen.update(dict.fromkeys(f"output.{k}" for k in it.output))
+        payload_keys: List[str] = list(payload_seen)
+        output_keys: List[str] = list(output_seen)
         base = ["id", "reference", "status", "attempts", "error_type", "error"]
         p = pathlib.Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)

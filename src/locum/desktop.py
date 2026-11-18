@@ -1108,9 +1108,17 @@ class Desktop:
                                f"or 'button \"{m.group(1)}\"')")
                 if not suggestions:
                     suggestions = [f"role {r!r}" for r in difflib.get_close_matches(lead, list(roles), n=limit, cutoff=0.5)]
+        glob_tip = ""
+        for m in _QUOTED_RE.finditer(selector_text):
+            value = m.group(1) if m.group(1) is not None else m.group(2)
+            if value and ("*" in value or "?" in value) and not selector_text[:m.start()].rstrip().endswith(("%=", "~=")):
+                # window("Invoice*") takes a glob, a selector's quoted name is exact.
+                glob_tip = (f"a quoted name matches exactly; for a glob write [name%={m.group(0)}], "
+                            "for a substring [name*=...]")
+                break
         if not suggestions:
-            return ""
-        return "; did you mean: " + ", ".join(suggestions[:limit]) + tip
+            return "; " + glob_tip if glob_tip else ""
+        return "; did you mean: " + ", ".join(suggestions[:limit]) + tip + (f" ({glob_tip})" if glob_tip else "")
 
     def _heal_options(self) -> Any:
         from .heal import HealOptions
@@ -1357,6 +1365,11 @@ class Desktop:
         Exact title matches win over case-insensitive/substring/glob matches;
         ties keep the Z-order (front-most first). Without criteria returns the
         active window (or the front-most one). Raises :class:`WindowNotFound`.
+
+        ``title`` is matched as described in :func:`~locum.window.match_window`
+        (exact, case-insensitive substring, glob or ``re.Pattern``). This is
+        looser than a selector, whose quoted ``window "Title"`` is an exact
+        match: use ``window[name%="Title*"]`` / ``[name*="Title"]`` there.
         """
         t = self._timeout(timeout)
         no_criteria = title is None and app is None and class_name is None and pid is None

@@ -898,7 +898,7 @@ class Robot:
         if self.report is not None and self._active:
             if exc is not None:
                 self.report.error = f"{type(exc).__name__}: {_exc_text(exc)}"
-                if isinstance(exc, (FailSafeTriggered, KeyboardInterrupt)):
+                if isinstance(exc, (FailSafeTriggered, KeyboardInterrupt, SystemExit)):  # stopped, as run() reports it
                     self.report.aborted = True
                 self._drop_above(None, exc)
             self.finish()

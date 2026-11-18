@@ -129,12 +129,14 @@ class ChangeTracker:
                 out.add(pid)
             return out
 
-    def close(self) -> None:
+    def close(self, timeout: float = 5.0) -> None:
+        """Unsubscribe; wait up to ``timeout`` seconds for the event thread to finish."""
         self._stop.set()
-        self._thread.join(5.0)
+        self._thread.join(timeout)
 
     # ------------------------------------------------------------- thread
     def _run(self) -> None:
+        uia = None
         try:
             import comtypes
 
@@ -143,7 +145,6 @@ class ChangeTracker:
             except Exception:
                 pass
             UIA = self._module
-            uia = None
             for clsid in self._clsids:
                 try:
                     uia = comtypes.CoCreateInstance(comtypes.GUID(clsid), interface=UIA.IUIAutomation,
@@ -160,6 +161,10 @@ class ChangeTracker:
             uia.AddPropertyChangedEventHandler(root, UIA.TreeScope_Subtree, None, handler, list(WATCHED_PROPERTIES))
         except BaseException as exc:  # no events: waits simply keep polling
             self.error = exc
+            # A subscription that failed half-way (e.g. on the property handler) must not
+            # leave the earlier handlers registered: UIA would keep calling into this dead
+            # tracker -- and keep it and its COM objects alive -- for the process lifetime.
+            _remove_handlers(uia)
             self._ready.set()
             return
         with self._cond:
@@ -171,10 +176,15 @@ class ChangeTracker:
             with self._cond:
                 self.alive = False
                 self._cond.notify_all()
-            try:
-                uia.RemoveAllEventHandlers()
-            except Exception:
-                pass
+            _remove_handlers(uia)
+
+
+def _remove_handlers(uia: Any) -> None:
+    if uia is not None:
+        try:
+            uia.RemoveAllEventHandlers()
+        except Exception:
+            pass
 
 
 def _pid(sender: Any) -> Optional[int]:

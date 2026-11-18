@@ -1360,8 +1360,9 @@ class Policy:
             for rx in self.deny_text_patterns:
                 texts = hay + [title] if title and getattr(rx, "match_window_title", True) else hay
                 for text in texts:
-                    if rx.search(text):
-                        raise PolicyViolation(f"Action blocked: {rx.pattern!r} matched {text[:80]!r}")
+                    m = rx.search(text)
+                    if m:
+                        raise PolicyViolation(f"Action blocked: {rx.pattern!r} matched {_shown_match(text, m, args, ctx)!r}")
 
         # Region confinement.
         if self.region is not None:
@@ -1572,6 +1573,23 @@ def _scrub_shown(text: Any, sensitive: Sequence[str]) -> Any:
         if value in text and value != MASK:
             text = text.replace(value, MASK)
     return text
+
+
+def _shown_match(text: str, match: Any, args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
+    """The text a deny pattern matched, for the error (the model, the audit log, the user):
+    the matched part itself reads ``***`` -- it is what the pattern keeps out, e.g. a card
+    number -- and so do this action's sensitive arguments. At most 80 characters."""
+    from .._secret import MASK  # noqa: PLC0415
+
+    try:
+        start, end = match.span()
+        shown = text[:start] + MASK + text[end:]
+        lo = max(0, start - 30)
+        shown = ("..." if lo else "") + shown[lo:lo + 80]
+    except Exception:  # a matcher object whose result has no span
+        return MASK
+    _masked, sensitive = _mask_sensitive_args(args, ctx)
+    return _scrub_shown(shown, sensitive)
 
 
 def _scrub_any(value: Any, sensitive: Sequence[str]) -> Any:

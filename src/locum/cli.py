@@ -60,7 +60,6 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
-from . import __version__
 from .backends.base import Backend
 from .backends.mock import MockBackend, MockWidget, MockWindow
 from .errors import (
@@ -445,6 +444,14 @@ class _SafeText:
         return getattr(self.wrapped, name)
 
 
+def _locum_version() -> str:
+    """``locum.__version__``, resolved on use (in a git checkout it asks git once), so that
+    importing the CLI or running a command that never shows the version spawns nothing."""
+    from . import __version__
+
+    return str(__version__)
+
+
 def _json_default(value: Any) -> Any:
     to_dict = getattr(value, "to_dict", None)
     if callable(to_dict):
@@ -639,7 +646,7 @@ def provenance() -> Dict[str, Any]:
 
     mismatch = bool(exe and on_path and os.path.basename(norm(exe)) == "locum" and norm(exe) != norm(on_path))
     return {
-        "version": __version__,
+        "version": _locum_version(),
         "executable": exe,
         "package": os.path.dirname(os.path.abspath(__file__)),
         "python": sys.executable,
@@ -686,7 +693,7 @@ def cmd_info(ctx: _Ctx) -> int:
     deps = {mod: importlib.util.find_spec(mod) is not None for mod, _ in OPTIONAL_DEPENDENCIES}
     prov = provenance()
     data = {
-        "version": __version__,
+        "version": _locum_version(),
         "python": platform.python_version(),
         "executable": prov["executable"],
         "package": prov["package"],
@@ -710,7 +717,7 @@ def cmd_info(ctx: _Ctx) -> int:
     if ctx.json:
         ctx.emit_json(data)
         return EXIT_OK
-    ctx.print(f"locum {__version__} on Python {data['python']} ({data['os']})")
+    ctx.print(f"locum {data['version']} on Python {data['python']} ({data['os']})")
     ctx.print(f"executable:   {prov['executable'] or '(none)'}")
     ctx.print(f"package:      {prov['package']}")
     ctx.print(f"python:       {prov['python']}")
@@ -904,7 +911,8 @@ def cmd_click(ctx: _Ctx) -> int:
     target: Any = _parse_point(a.target, "TARGET") if _is_point(a.target) else a.target
     window = _target_window(ctx) if a.window else None
     if not positional:
-        target = window.find(a.target, timeout=a.timeout) if window is not None else ctx.desktop.find(a.target)
+        target = (window.find(a.target, timeout=a.timeout) if window is not None
+                  else ctx.desktop.find(a.target, timeout=a.timeout))
     point: Optional[Point]
     with _bound(ctx, window):
         if positional:
@@ -1145,7 +1153,7 @@ def cmd_mcp(ctx: _Ctx) -> int:
         raise _UsageError("--call-timeout must be a finite number >= 0")
     server = MCPServer(ctx.desktop, policy, audit, call_timeout=t or None)
     be = ctx.desktop.backend
-    ctx.info(f"locum {__version__} MCP server on stdio (backend={getattr(be, 'name', '?')}, policy={a.policy}"
+    ctx.info(f"locum {_locum_version()} MCP server on stdio (backend={getattr(be, 'name', '?')}, policy={a.policy}"
              + (", dry-run" if a.dry_run else "") + (f", audit={a.audit}" if a.audit else "") + ")")
     server.serve(ctx.inp, ctx.raw_out)
     return EXIT_OK

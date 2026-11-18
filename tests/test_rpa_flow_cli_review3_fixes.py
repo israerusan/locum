@@ -290,8 +290,17 @@ class K:
 SHIFT, CTRL, ALTGR = K(name="shift"), K(name="ctrl_l"), K(name="alt_gr")
 
 
+def _no_focus_desktop():
+    # An empty mock desktop: nothing has the focus, on every machine. Recorder() without a
+    # desktop would probe the REAL focused control (Desktop() / the process-wide backend) for
+    # every key, so the result depended on what the user, or an earlier test, left focused.
+    from locum.backends.mock import MockBackend
+
+    return Desktop(MockBackend(), sleep=lambda s: None, default_timeout=0)
+
+
 def _pynput_run(seq):
-    r = Recorder(use_selectors=False, trust_unknown_focus=True).start(source="manual")  # no desktop: focus unknowable
+    r = Recorder(_no_focus_desktop(), use_selectors=False, trust_unknown_focus=True).start(source="manual")
     for kind, key in seq:
         ev = r._pynput_event(kind, key, 0.0)
         if ev is not None:
@@ -320,7 +329,7 @@ def test_layout_produced_characters_are_not_shifted_again():
     fr = [down(SHIFT)] + [down(K(c)) for c in "120.50"] + [up(SHIFT)]
     assert _pynput_run(fr) == [{"type": "120.50"}]
     # Backend key events (raw, unshifted key names) still get Shift applied.
-    r = Recorder(use_selectors=False, trust_unknown_focus=True).start(source="manual")  # no desktop: focus unknowable
+    r = Recorder(_no_focus_desktop(), use_selectors=False, trust_unknown_focus=True).start(source="manual")
     for e in [("key_down", "shift"), ("key_down", "1"), ("key_up", "1"), ("key_up", "shift")]:
         r.feed(e)
     assert [a.to_flow_step() for a in r.stop()] == [{"type": "!"}]

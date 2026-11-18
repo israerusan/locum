@@ -25,6 +25,14 @@ CSS-like (canonical)
     group ~ button                  general sibling: any later button under the same parent
     button "OK", button "Yes"       union
 
+A quoted name -- ``"OK"``, ``window "Calc"``, ``[name="OK"]`` -- is an
+**exact** match (case-sensitive; ``*`` and ``?`` are literal characters),
+as in CSS. Write ``[name%="Invoice*"]`` for a glob, ``[name*="Invoice"]``
+for a substring and add `` i`` to ignore case. (:meth:`Desktop.window`
+is a lookup by title, not a selector: it accepts an exact title, a
+case-insensitive substring or a glob.) A first compound with ``:root``
+(UiPath ``<wnd>``) only searches the search roots it matches.
+
 Sibling combinators follow CSS: ``A + B`` matches a ``B`` whose immediately
 preceding sibling (same parent, previous position in ``children()``) matches
 ``A``; ``A ~ B`` one with *any* earlier sibling matching ``A``. They compose
@@ -793,6 +801,21 @@ class _Branch:
         return acc[idx - 1] if idx else False
 
     # -- search ----------------------------------------------------------------
+    def anchor_roots(self, snap: _Snapshot, roots: List[_Entry], boundary: Optional[_Entry]) -> Optional[List[_Entry]]:
+        """The search roots this branch can match under, or ``None`` for all of them.
+
+        A multi-step branch whose first compound carries ``:root`` (UiPath
+        ``<wnd>``) only matches inside a search root that satisfies that
+        compound, so only those roots' subtrees need walking -- not every node
+        of every window. Exact: ``:root`` never matches a nested node.
+        """
+        if boundary is not None or self.relative is not None or len(self.steps) < 2:
+            return None
+        first = self.steps[0][1]
+        if first.positional or not any(isinstance(c, _StateCond) and c.name == "root" for c in first.conds):
+            return None
+        return [r for r in roots if r.parent is None and first.test(r, snap)]
+
     def search(
         self,
         snap: _Snapshot,
@@ -801,6 +824,9 @@ class _Branch:
         include_roots: bool,
         limit: Optional[int],
     ) -> List[_Entry]:
+        anchors = self.anchor_roots(snap, roots, boundary)
+        if anchors is not None:
+            roots = anchors
         if not self.positional:
             out: List[_Entry] = []
             if self.relative == ">" and len(self.steps) == 1:
@@ -959,11 +985,17 @@ class Selector:
             # for free, no duplicates and early exit once ``limit`` is reached.
             out: List[_Entry] = []
             root_ids = None if include_roots else {id(r) for r in roots}
+            # Per branch, the roots it can match under (None = all; see _Branch.anchor_roots).
+            anchors = [b.anchor_roots(snap, roots, boundary) for b in self.branches]
+            allowed = [None if a is None else {id(r) for r in a} for a in anchors]
             for r in roots:
+                live = [b for b, ok in zip(self.branches, allowed) if ok is None or id(r) in ok]
+                if not live:
+                    continue  # no branch can match in this root's subtree: don't walk it
                 for e in snap.walk(r):
                     if root_ids is not None and id(e) in root_ids:
                         continue
-                    if any(b.match_rtl(e, snap, boundary) for b in self.branches):
+                    if any(b.match_rtl(e, snap, boundary) for b in live):
                         out.append(e)
                         if limit is not None and len(out) >= limit:
                             return out

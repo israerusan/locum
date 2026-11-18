@@ -12,6 +12,125 @@ The rules apply from 0.3.0 on.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-18
+
+A second whole-library polish pass. Each fix has a regression test
+(`tests/test_polish2_*.py`). It is a minor release because it adds two
+parameters and changes the defaults below.
+
+### Breaking
+
+- **`Agent` sends `cache_control={"type": "ephemeral"}` by default**
+  (automatic prompt caching). **Migration:** a client or proxy that rejects the
+  argument needs `Agent(..., prompt_cache=False)`.
+- **Older observations in an agent run drop their pixels.**
+  `AgentResult.steps[...].tool_results[...].data` observations other than the
+  current step and `toolkit.last_observation` have `screenshot` and `annotated`
+  set to `None` (about 7 MB each; hundreds of MB over a long run), so
+  `image_base64()` raises `ValueError` on them. **Migration:** keep the image
+  you need from `on_step`, which still sees the current step's pixels.
+- **Deny-pattern `PolicyViolation` messages show the match as `***`** with
+  surrounding context, instead of the first 80 characters of the text (safety
+  fix). **Migration:** code that parsed the matched text out of the message
+  must stop doing so.
+- **Extra-tool arguments with secret-like names are masked** in the audit log,
+  descriptions, dry-run text and confirmation details, and no longer count
+  toward `confirm_patterns` matching (safety fix). **Migration:** match such
+  calls with `tool=<name>` rules instead of their argument values.
+- **A text field showing only its placeholder reads as empty** in `.text`,
+  `set_text(clear=False)` and `type(verify="amount")`. **Migration:** read
+  `.value` for the raw value.
+- **SAP table controls raise `BackendError`** instead of `ElementNotFound` when
+  the scrollbar cannot reach the requested row. **Migration:** catch
+  `BackendError` (or `LocumError`).
+- **`Browser.page()` closes cached sessions of tabs that are gone**, so a
+  `Page` for a closed tab stops working. `Browser.close(quit=True)` can block up
+  to 10 s while the browser exits.
+
+### Security
+
+- **Extra LLM tools: secret-named arguments are masked.** `password`, `token`,
+  `api_key`, `pin`, `otp`, `cvv` and similar arguments of extra tools show as
+  `***` in the audit log, action descriptions, dry-run text and confirmation
+  details. An underscored value (`Sup3r_Secret`) no longer reaches
+  `details["arg_texts"]` with its underscores turned into spaces. The tool still
+  gets the real value.
+- **Deny-pattern errors no longer echo the match.** A `CARD_NUMBER` block showed
+  the card number in the `PolicyViolation` message and the audit log; the match
+  is now `***` with surrounding context.
+- **`scrub_exception` covers `__notes__`, `ExceptionGroup` members and
+  container arguments.**
+- **HTML run report:** a secret inside text that looks like a `data:image/...`
+  URL is now masked.
+
+### Added
+
+- `Agent(prompt_cache=True)`: requests send top-level
+  `cache_control={"type": "ephemeral"}`. `prompt_cache=False` or
+  `create_kwargs["cache_control"]` overrides it.
+- `bridges.sap`: `sessions(probe_timeout=5.0)`, `attach(..., probe_timeout=5.0)`
+  and `SapSessionInfo.hung`. Each session is probed on its own thread under one
+  deadline, so one frozen session no longer hangs listing or attaching. A frozen
+  session is skipped by `attach()`, and `attach(session=n)` on it raises
+  `ActionTimeout`. `probe_timeout=None` keeps the old direct reads.
+
+### Fixed
+
+- **SAP / Java: a `Secret` typed `***`.** `SapTextField.set_text`,
+  `SapGridView.write` and `JavaElement.set_text` now reveal the secret for the
+  write only and mask it in the audit log.
+- **SAP table controls:** when the scrollbar clamps short of the requested row,
+  a `BackendError` is raised instead of reading or writing the wrong row.
+- **SAP: ungated actions no longer build the policy context** (5-9 COM calls per
+  action).
+- `bridges._guard.ActionGate` accepts `Policy.off()`, `False` and preset names.
+- `ImageSession.click` computes the point after activating the window, so a
+  minimized Citrix/RDP window is clicked where it reappears.
+- **Windows: maximized windows are clipped to their monitor's work area** in
+  `WindowInfo.rect`, `windows_above()` and `capture_window()`. Top-level UIA
+  roots report that rectangle too, not the frame plus invisible resize border.
+- **Windows: a minimized Store app** (`ApplicationFrameWindow`) reports its app
+  process in `window_content_pids()`.
+- **Windows UIA events:** a half-failed subscription removes the handlers it
+  added, and a tracker that did not start in time is stopped.
+- **Element: a field showing only its placeholder reads as empty** in `.text`,
+  `set_text(clear=False)`, `set_text("")` verification and
+  `type(verify="amount")`. `.value` is unchanged.
+- `Window.find` on a closed window says the window no longer exists.
+  `ElementNotFound` for a quoted name containing `*` or `?` suggests
+  `[name%="..."]`.
+- `coerce_point` accepts a numpy `[x, y]` array.
+- **LLM agent:** an empty `pause_turn` or a `tool_use` stop without tool blocks
+  no longer sends an empty message (a 400 on the next turn). An exception that
+  escapes `run()` records `agent_end` (`stop_reason="error"`). The default
+  system prompt no longer asks for an observation the first message already
+  carries.
+- **WorkQueue:** `\\?\C:\...` paths are not refused as network shares; links
+  that resolve into a synced folder are refused. `SystemExit` in a handler or a
+  retry wait no longer leaves the item in progress with a live lease.
+- Report and trace writes use a per-thread temp file, and a failed write leaves
+  no `.tmp` behind. `with robot:` exited by `SystemExit` marks the run aborted.
+- A `Recorder.start()` that fails after installing its hooks removes them.
+- `locum.__version__` and `locum --version` in a git checkout report the
+  checkout's version instead of the one frozen at install. `import locum` no
+  longer reads the version.
+- `locum click SELECTOR` without `--window` honours `--timeout`. The self-test
+  no longer aborts on a cp1252 console.
+- **Browser:** a launch that times out stops the browser it started.
+  `close(quit=True)` closes its session, waits up to 10 s, then terminates.
+  `page()` drops sessions of closed tabs, and a failed WebSocket handshake
+  closes its socket.
+- `compat.pyautogui`: rotating `LOG_SCREENSHOTS` never fails the action.
+
+### Changed
+
+- Faster: `:root` / UiPath `<wnd>` selectors walk only the matching windows;
+  `heal()` skips bounds and class reads for rejected roles; `UIANode.role` and
+  `states` make fewer UIA calls; `accessibility_roots` builds no `WindowInfo`;
+  `image_diff`, `changed_fraction`, `find_color`, grayscale conversion and
+  template matching use fewer and smaller temporaries (bit-identical results);
+  WorkQueue `_jsonable` and `export_csv` column collection; WebSocket masking.
+
 ## [0.4.4] - 2026-11-15
 
 A polish pass: a review of the whole library found over 30 defects. Three were
@@ -843,7 +962,8 @@ Check it on your machine: `python -m locum.selftest` (opens its own Notepad tab,
 [0.1.2]: https://github.com/israerusan/locum/releases/tag/v0.1.2
 [0.1.1]: https://github.com/israerusan/locum/releases/tag/v0.1.1
 [0.1.0]: https://github.com/israerusan/locum/releases/tag/v0.1.0
-[Unreleased]: https://github.com/israerusan/locum/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/israerusan/locum/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/israerusan/locum/releases/tag/v0.5.0
 [0.4.4]: https://github.com/israerusan/locum/releases/tag/v0.4.4
 [0.4.3]: https://github.com/israerusan/locum/releases/tag/v0.4.3
 [0.4.2]: https://github.com/israerusan/locum/releases/tag/v0.4.2
