@@ -184,11 +184,16 @@ def test_image_session_click_uses_the_window_position_after_activation(mock_back
 
 
 # ---------------------------------------------------------------------- Secret scrubbing
-def test_scrub_exception_covers_notes_groups_and_container_args():
+def test_scrub_exception_covers_container_args():
     Secret("Tr0ub4dor&3")
     e = ValueError({"password": "Tr0ub4dor&3"}, ["x", "Tr0ub4dor&3"])
     scrub_exception(e)
     assert "Tr0ub4dor&3" not in str(e)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="add_note() and ExceptionGroup are Python 3.11+")
+def test_scrub_exception_covers_notes_and_groups():
+    Secret("Tr0ub4dor&3")
     n = RuntimeError("boom")
     n.add_note("typed Tr0ub4dor&3 into the field")
     scrub_exception(n)
