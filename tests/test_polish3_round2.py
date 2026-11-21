@@ -97,7 +97,11 @@ class _BusySession:
     broken = False
 
     def call(self, method: str, params: Any = None, timeout: float = 30.0) -> Dict[str, Any]:
-        time.sleep(timeout)  # a real session raises only once the per-call timeout has passed
+        # Like Session.call: raise only once the monotonic clock has passed the per-call deadline
+        # (time.sleep alone can return a little early on Windows' coarse monotonic clock).
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            time.sleep(0.01)
         raise cdp.CDPError(f"DevTools call {method} timed out after {timeout:g}s")
 
 
