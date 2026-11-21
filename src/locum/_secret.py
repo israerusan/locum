@@ -226,7 +226,8 @@ def scrub(text: Optional[str], extra: Any = (), *, min_len: int = MIN_SCRUB) -> 
     if not isinstance(text, str) or not text:
         return text
     if extra:
-        pat, shortest = _compile(set(known_secrets()) | {str(s) for s in extra if s}, min_len)
+        # Not kept by ``re`` (see _compile_uncached): ``extra`` holds per-call secrets.
+        pat, shortest = _compile(set(known_secrets()) | {str(s) for s in extra if s}, min_len, False)
     else:
         pat, shortest = _pattern(min_len)
     if pat is None or len(text) < shortest:

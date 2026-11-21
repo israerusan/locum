@@ -127,10 +127,38 @@ def _safe(fn: Any, default: Any = None) -> Any:
         return default
 
 
-def _node_value(node: Any) -> Optional[str]:
-    """``node.value``, masked (``"***"``) for password fields: the model and the audit log never see passwords."""
+#: "Not read (or the read raised)": pre-read node fields passed down the observe walk.
+_UNREAD: Any = object()
+
+
+class _PreRead:
+    """``node`` with the ``role`` / ``states`` the observe walk already read: the checks it
+    is handed to (:func:`~locum._nodeinfo.is_password`) see the same values without a
+    second cross-process read. A field not read (or whose read raised) falls through to
+    the live node, so the check behaves exactly as on ``node`` itself."""
+
+    __slots__ = ("_node", "role", "states")
+
+    def __init__(self, node: Any, role: Any = _UNREAD, states: Any = _UNREAD) -> None:
+        self._node = node
+        if role is not _UNREAD:
+            self.role = role
+        if states is not _UNREAD:
+            self.states = states
+
+    def __getattr__(self, name: str) -> Any:  # unset slots and every other attribute
+        if name == "_node":
+            raise AttributeError(name)
+        return getattr(self._node, name)
+
+
+def _node_value(node: Any, role: Any = _UNREAD, states: Any = _UNREAD) -> Optional[str]:
+    """``node.value``, masked (``"***"``) for password fields: the model and the audit log never see passwords.
+
+    ``role`` / ``states``: the node's raw values when the caller already read them."""
     value = _safe(lambda: node.value)
-    if value not in (None, "") and is_password(node):
+    if value not in (None, "") and is_password(
+            node if role is _UNREAD and states is _UNREAD else _PreRead(node, role, states)):
         return "***"
     # A secret typed into an ordinary field: masked like a password field. Only a value that
     # *is* a secret, or holds an unambiguous (long) one: a PIN must not turn 1234.50 into ***.50.
@@ -289,6 +317,13 @@ class Observation:
         the ids in the text, or the model acts on the wrong element."""
         if self.annotated is None or self.screenshot is None:
             return
+        self._annotate()
+
+    def _annotate(self) -> None:
+        """Draw :attr:`annotated` from the screenshot and the current element ids (exactly
+        what ``observe(annotate=True)`` draws); nothing without a screenshot."""
+        if self.screenshot is None:
+            return
         self.annotated = _draw_boxes(self.screenshot, self.elements, self.region, self.scale,
                                      bool(getattr(self, "_window_captured", False)))
 
@@ -352,13 +387,15 @@ class Observation:
         live node: the entry was a snapshot from ``observe`` time, and a later
         ``find_elements`` / ``wait_for`` must not describe what it *used* to show
         (a calculator display still reading "0" after the result came in)."""
-        for el in self.elements:
-            if _same(el.node, node):
-                _refresh(el, node, self._ctx)
-                return el
+        raw_rid = _safe(lambda: getattr(node, "runtime_id", None))
+        rid = _rid_key(raw_rid)
+        found = self._find_same(node, rid)
+        if found is not None:
+            _refresh(found, node, self._ctx)
+            return found
         b = _safe(lambda: node.bounds)
         next_id = self.next_id()
-        win = self._window_of(node)
+        win = self._window_of(node, has_rid=bool(_safe(lambda: bool(raw_rid), False)))
         entry = ObservedElement(
             id=next_id,
             role=(_safe(lambda: node.role, "") or "unknown").lower(),
@@ -375,9 +412,44 @@ class Observation:
         )
         self.elements.append(entry)
         self._max_id = next_id
+        index = self.__dict__.get("_rid_index")
+        if index is not None and index.fresh_but_one(self.elements):
+            index.add(entry, rid)  # kept in step: no rebuild on the next add_element
         return entry
 
-    def _window_of(self, node: AccessibleNode) -> Optional[WindowInfo]:
+    def _find_same(self, node: AccessibleNode, rid: Optional[Tuple[Any, ...]]) -> Optional[ObservedElement]:
+        """The first element (in list order) whose node is ``node`` (:func:`_same`), or ``None``.
+
+        A node with a runtime id (UI Automation) is looked up in a runtime-id index instead
+        of comparing it with every element (each comparison reads both runtime ids across
+        processes: ``find_elements`` adding 100 nodes to a 300-element observation made
+        ~70,000 reads). Only elements *without* a runtime id are still compared one by one;
+        two nodes with different runtime ids are never the same element."""
+        els = self.elements
+        if rid is None:
+            for el in els:
+                if _same(el.node, node):
+                    return el
+            return None
+        index = self.__dict__.get("_rid_index")
+        if index is None or not index.fresh(els):
+            index = self.__dict__["_rid_index"] = _RidIndex(els)
+        pos, hit = index.by_rid.get(rid, (len(els), None))
+        for p, el in index.no_rid:  # compared one by one, as before: earlier entries win
+            if p >= pos:
+                break
+            if _same(el.node, node):
+                return el
+        if hit is not None:
+            if _same(hit.node, node):
+                return hit
+            # Same runtime id, yet the backend says "different": trust it, as the scan did.
+            for el in els:
+                if _same(el.node, node):
+                    return el
+        return None
+
+    def _window_of(self, node: AccessibleNode, has_rid: Optional[bool] = None) -> Optional[WindowInfo]:
         """The listed top-level window containing ``node``, so an element added later
         carries the same ``window_title`` as one found by ``observe`` (the diff of the
         next ``changes_only`` matches on it when the backend has no runtime ids)."""
@@ -387,7 +459,9 @@ class Observation:
         cur: Optional[AccessibleNode] = node
         # With runtime ids (UI Automation) the diff matches without the title: skip the
         # cross-process walk up the tree and only try the node's own handle.
-        depth = 0 if _safe(lambda: node.runtime_id) else 64
+        if has_rid is None:
+            has_rid = bool(_safe(lambda: bool(node.runtime_id), False))
+        depth = 0 if has_rid else 64
         for _ in range(depth + 1):
             if cur is None:
                 break
@@ -500,6 +574,51 @@ def _for_model(data: Dict[str, Any]) -> Dict[str, Any]:
     return scrub_data(data, min_len=MODEL_MIN_SCRUB)
 
 
+def _rid_key(rid: Any) -> Optional[Tuple[Any, ...]]:
+    """A node's raw ``runtime_id`` as a dict key (``None``: no usable runtime id)."""
+    try:
+        if rid is None or isinstance(rid, (str, bytes)) or len(rid) == 0:
+            return None
+        key = tuple(rid)
+        hash(key)
+    except Exception:  # not a sized iterable of hashables (or its truth value is ambiguous)
+        return None
+    return key
+
+
+class _RidIndex:
+    """Runtime id -> first element with it, for :meth:`Observation.add_element`.
+
+    Built from (and valid for) one exact list of elements: ``Observation.elements`` is
+    public, so any change made outside ``add_element`` is detected and the index rebuilt."""
+
+    __slots__ = ("snapshot", "by_rid", "no_rid")
+
+    def __init__(self, elements: List[ObservedElement]) -> None:
+        self.snapshot: List[ObservedElement] = []
+        self.by_rid: Dict[Tuple[Any, ...], Tuple[int, ObservedElement]] = {}
+        self.no_rid: List[Tuple[int, ObservedElement]] = []
+        for el in elements:
+            self.add(el, _rid_key(_safe(lambda: getattr(el.node, "runtime_id", None))))
+
+    def add(self, el: ObservedElement, rid: Optional[Tuple[Any, ...]]) -> None:
+        pos = len(self.snapshot)
+        self.snapshot.append(el)
+        if rid is None:
+            self.no_rid.append((pos, el))
+        else:
+            self.by_rid.setdefault(rid, (pos, el))
+
+    def fresh(self, elements: List[ObservedElement]) -> bool:
+        snap = self.snapshot
+        return len(elements) == len(snap) and all(a is b for a, b in zip(elements, snap))
+
+    def fresh_but_one(self, elements: List[ObservedElement]) -> bool:
+        """Valid for ``elements`` minus its last entry (just appended)."""
+        snap = self.snapshot
+        return len(elements) == len(snap) + 1 and all(a is b for a, b in zip(elements, snap))
+
+
 def _same(a: AccessibleNode, b: AccessibleNode) -> bool:
     if a is b:
         return True
@@ -604,16 +723,23 @@ def _selector_in(node: AccessibleNode, ctx: Optional[_SelectorContext]) -> str:
     return _selector(node, roots, cache)
 
 
-def _is_interactive(node: AccessibleNode) -> bool:
+_BASE_IS_VISIBLE = AccessibleNode.__dict__["is_visible"]
+
+
+def _is_interactive(node: AccessibleNode, role: Any = _UNREAD, states: Any = _UNREAD) -> bool:
+    """``role`` / ``states``: the node's raw values when the caller already read them."""
     from ..selectors import INTERACTIVE_ROLES
 
-    role = (_safe(lambda: node.role, "") or "").lower()
-    if role in INTERACTIVE_ROLES:
+    if role is _UNREAD:
+        role = _safe(lambda: node.role, "")
+    if (role or "").lower() in INTERACTIVE_ROLES:
         return True
     acts = _safe(lambda: list(node.actions()), []) or []
     if any(a in ("invoke", "toggle", "set_value", "select", "expand") for a in acts):
         return True
-    return "editable" in (_safe(lambda: node.states, frozenset()) or frozenset())
+    if states is _UNREAD:
+        states = _safe(lambda: node.states, frozenset())
+    return "editable" in (states or frozenset())
 
 
 def _walk_without_documents(root: AccessibleNode, max_depth: int) -> Any:
@@ -834,30 +960,52 @@ def observe(
                 partial.append(win_title)
                 complete = False
                 break
-            if node is root and _safe(lambda: node.role, "") == "window":
-                continue  # windows are listed separately
+            # Each node field is read once (every read is a cross-process call on a real
+            # desktop) and handed down to the checks; raw values, so they see what they read.
+            role = _UNREAD
+            if node is root:
+                role = _safe(lambda: node.role, _UNREAD)
+                if role == "window":
+                    continue  # windows are listed separately
             b = _safe(lambda: node.bounds)
-            if b is None or b.is_empty or not _safe(lambda: node.is_visible, False):
+            if b is None or b.is_empty:
+                continue
+            raw_states = _UNREAD
+            if getattr(type(node), "is_visible", None) is _BASE_IS_VISIBLE:
+                # AccessibleNode.is_visible, from the states and bounds already in hand.
+                raw_states = _safe(lambda: node.states, _UNREAD)
+                if raw_states is _UNREAD or not _safe(
+                        lambda: not ("offscreen" in raw_states or "invisible" in raw_states), False):
+                    continue
+            elif not _safe(lambda: node.is_visible, False):  # a backend's own rule: ask it
                 continue
             if b.intersect(region) is None:
                 continue
+            if role is _UNREAD:
+                role = _safe(lambda: node.role, _UNREAD)
             if interactive_only:
-                if not _is_interactive(node):
+                if not _is_interactive(node, role, raw_states):
                     continue
+                name = _UNREAD
             else:
-                if not (_safe(lambda: node.name, "") or _safe(lambda: node.value) or _is_interactive(node)):
+                name = _safe(lambda: node.name, "")
+                if not (name or _safe(lambda: node.value) or _is_interactive(node, role, raw_states)):
                     continue
-            states = set(_safe(lambda: node.states, frozenset()) or ())
+            if raw_states is _UNREAD:
+                raw_states = _safe(lambda: node.states, _UNREAD)
+            states = set((frozenset() if raw_states is _UNREAD else raw_states) or ())
             if zi is not None:
                 c = b.center
                 if any(r.contains(c) for _, r in front[:zi]):
                     states.add("occluded")
+            if name is _UNREAD:
+                name = _safe(lambda: node.name, "")
             elements.append(
                 ObservedElement(
                     id=len(elements) + 1,
-                    role=(_safe(lambda: node.role, "") or "unknown").lower(),
-                    name=_safe(lambda: node.name, "") or "",
-                    value=_node_value(node),
+                    role=(("" if role is _UNREAD else role) or "unknown").lower(),
+                    name=name or "",
+                    value=_node_value(node, role, raw_states),
                     bounds=b,
                     states=frozenset(states),
                     selector=LAZY_SELECTOR if selectors else "",

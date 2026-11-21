@@ -845,32 +845,52 @@ def cmd_tree(ctx: _Ctx) -> int:
     return EXIT_OK
 
 
-def _robust_selector(el: Any) -> str:
+def _robust_selector(el: Any, shared: Optional[Dict[str, Any]] = None) -> str:
     """``selector_for(el.node)`` checked for uniqueness across *all* windows,
-    so the printed selector finds this element (not a same-titled window's) with ``find``."""
+    so the printed selector finds this element (not a same-titled window's) with ``find``.
+
+    ``shared`` (a dict owned by one command, e.g. ``find --all``) keeps the desktop's
+    roots and a ``prefix_cache`` for every element it lists: the windows are read and
+    each window's uniqueness is proven once per command instead of once per element."""
     from .selectors import selector_for
 
-    try:
-        roots: Optional[List[Any]] = list(el.desktop.roots())
-    except Exception:
-        roots = None
-    return selector_for(el.node, roots=roots)
+    if shared is None:
+        shared = {}
+    if "roots" not in shared:
+        try:
+            shared["roots"] = list(el.desktop.roots())
+        except Exception:
+            shared["roots"] = None
+    roots: Optional[List[Any]] = shared["roots"]
+    cache = shared.setdefault("prefix_cache", []) if shared.get("share") and roots is not None else None
+    return selector_for(el.node, roots=roots, prefix_cache=cache)
 
 
-def _element_line(el: Any) -> str:
+def _selector_state() -> Dict[str, Any]:
+    """One command's shared selector state for :func:`_robust_selector` (many elements)."""
+    return {"share": True}
+
+
+def _element_line(el: Any, shared: Optional[Dict[str, Any]] = None) -> str:
     from .selectors import describe_node
 
     try:
-        sel = _robust_selector(el)
+        sel = _robust_selector(el, shared)
     except Exception:
         sel = ""
     return describe_node(el.node) + (f"  ->  {sel}" if sel else "")
 
 
-def _element_dict(el: Any) -> Dict[str, Any]:
+_UNSET: Any = object()
+
+
+def _element_dict(el: Any, shared: Optional[Dict[str, Any]] = None, *, selector: Any = _UNSET) -> Dict[str, Any]:
     d = el.to_dict()
+    if selector is not _UNSET:  # already computed by the caller (``inspect``)
+        d["robust_selector"] = selector
+        return d
     try:
-        d["robust_selector"] = _robust_selector(el)
+        d["robust_selector"] = _robust_selector(el, shared)
     except Exception:
         d["robust_selector"] = None
     return d
@@ -887,14 +907,15 @@ def cmd_find(ctx: _Ctx) -> int:
             found = d.find_all(a.selector)
     else:
         found = [d.find(a.selector, timeout=a.timeout)]
+    shared = _selector_state() if len(found) > 1 else None
     if ctx.json:
-        ctx.emit_json([_element_dict(e) for e in found] if a.all else _element_dict(found[0]))
+        ctx.emit_json([_element_dict(e, shared) for e in found] if a.all else _element_dict(found[0]))
         return EXIT_OK if found else EXIT_FAILURE
     if not found:
         ctx.info(f"no element matches {a.selector!r}")
         return EXIT_FAILURE
     for el in found:
-        ctx.print(_element_line(el))
+        ctx.print(_element_line(el, shared))
     return EXIT_OK
 
 
@@ -1127,7 +1148,7 @@ def cmd_inspect(ctx: _Ctx) -> int:
         chain.append(cur)
         cur = cur.parent
     if ctx.json:
-        data = _element_dict(el)
+        data = _element_dict(el, selector=sel)
         data["point"] = point.to_dict()
         data["ancestors"] = [{"role": e.role, "name": e.name} for e in chain[1:]]
         ctx.emit_json(data)

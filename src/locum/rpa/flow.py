@@ -1718,8 +1718,9 @@ class FlowRunner:
 
 
 def _truthy(v: Any) -> bool:
+    """Lenient boolean (an unknown word is false); the same true words as :func:`_bool_arg`."""
     if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "on")
+        return v.strip().lower() in _TRUE_WORDS
     return bool(v)
 
 
@@ -1813,6 +1814,7 @@ def run_flow(
     settings = dict(doc.get("settings") or {})
     scope = _Scope(base_dir=base, flows=dict(doc.get("flows") or {}), settings=settings)
     error: Optional[BaseException] = None
+    propagating = False  # an exception escapes run_flow (a failed report save must not replace it)
     overrides = dict(variables or {})
     try:
         for key, value in dict(doc.get("vars") or {}).items():
@@ -1835,14 +1837,28 @@ def run_flow(
         # Stopped early, like Robot.run reports it; the interrupt still propagates.
         report.aborted = True
         report.error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        propagating = True
+        raise
+    except BaseException:
+        propagating = True
         raise
     finally:
         report.finished_at = time.time()
         report.variables = runner.vars
         runner.log(report.summary(), level="info" if report.ok else "error")
         if evidence_dir is not None:
-            report.save_json(evidence_dir / "report.json")
-            report.save_html(evidence_dir / "report.html")
+            try:
+                report.save_json(evidence_dir / "report.json")
+                report.save_html(evidence_dir / "report.html")
+            except Exception as exc:
+                # Swallowed only when an error ends the call; a returned report's save error raises.
+                if not (propagating or (error is not None and raise_on_error)):
+                    raise
+                # Never hide the error that ended the run behind a save error.
+                from .._secret import scrub
+
+                runner.logger.warning("could not save the run report to %s: %s", evidence_dir,
+                                      scrub(f"{type(exc).__name__}: {exc}"))
     if error is not None and raise_on_error:
         raise error
     return report

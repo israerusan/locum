@@ -125,6 +125,7 @@ class WindowsBackend(
         self._mss_broken = screenshot_method == "gdi" or (not dpi_aware and screenshot_method == "auto")
         self._mss_local = threading.local()
         self._mss_lock = threading.Lock()
+        self._mss_failures = 0  # consecutive mss failures; mss is given up after 3
         self._mss_closers: List[Any] = []  # weakref.finalize objects closing per-thread mss grabbers
         self._accessibility = bool(accessibility)
         self._uia_view = uia_view
@@ -192,6 +193,21 @@ class WindowsBackend(
     def _check(self) -> None:
         if self._closed:
             raise BackendError("Windows backend has been closed")
+
+    def _is_hung(self, hwnd: int) -> bool:
+        """Whether ``hwnd``'s thread stopped pumping messages (``IsHungAppWindow``).
+
+        Calls that wait on the window's thread -- ``PrintWindow`` (no timeout at all),
+        UIA ``ElementFromHandle`` (the UIA timeout) -- are skipped for such a window.
+        False when the function is unavailable or fails.
+        """
+        fn = getattr(self._api, "IsHungAppWindow", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn(hwnd))
+        except Exception:
+            return False
 
     def _error(self, what: str) -> BackendError:
         code = self._api.get_last_error()

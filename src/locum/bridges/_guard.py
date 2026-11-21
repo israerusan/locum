@@ -40,7 +40,7 @@ class ActionGate:
     def __init__(self, policy: Any = None, *, confirm: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
                  audit: Any = None, failsafe: Any = None, bridge: str = "") -> None:
         if policy is not None:
-            from ..llm.safety import AuditLog, Policy  # noqa: PLC0415
+            from ..llm.safety import Policy  # noqa: PLC0415
 
             if not isinstance(policy, Policy):
                 # Policy.off() / False and the preset names ("strict"...), as everywhere else in locum.

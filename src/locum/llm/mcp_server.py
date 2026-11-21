@@ -115,8 +115,11 @@ class MCPServer:
         self._write_lock = threading.Lock()
         self._jobs: Dict[Any, "_Job"] = {}
         self._jobs_lock = threading.Lock()
+        # Replaced by each serve(): a worker only ever reads the queue it was started with.
         self._queue: "queue.Queue[Optional[_Job]]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
+        #: The worker of an earlier serve() still stuck in a call when that serve() ended.
+        self._stuck_worker: Optional[threading.Thread] = None
         self._batch_depth = 0
         self._desktop = desktop
         self.policy = policy
@@ -299,9 +302,19 @@ class MCPServer:
                 self._send(response)
         job.done.set()
 
-    def _work(self) -> None:
+    def _work(self, jobs: Optional["queue.Queue[Optional[_Job]]"] = None,
+              previous: Optional[threading.Thread] = None) -> None:
+        """Run the calls of ``jobs`` (this serve()'s queue) one at a time until its stop marker.
+
+        ``previous``: an earlier serve()'s worker still stuck in a call. Nothing runs until it
+        has finished: two workers must never drive the desktop at once. Calls queued meanwhile
+        get the usual "waited for an earlier call" timeout from their monitor."""
+        if jobs is None:
+            jobs = self._queue
+        if previous is not None:
+            previous.join()
         while True:
-            job = self._queue.get()
+            job = jobs.get()
             if job is None:
                 return
             if job.answered:
@@ -411,8 +424,15 @@ class MCPServer:
         else:
             out, restore = _claim_stdout()
         self._out = out
-        self._worker = threading.Thread(target=self._work, name="locum-mcp-worker", daemon=True)
-        self._worker.start()
+        # A fresh queue per serve(): the stop marker an earlier serve() left for its worker
+        # (still stuck in a call when that serve() returned) must not stop this one, and
+        # that old worker, holding its own queue, can never pick up this serve()'s calls.
+        jobs: "queue.Queue[Optional[_Job]]" = queue.Queue()
+        self._queue = jobs
+        previous = self._stuck_worker if self._stuck_worker is not None and self._stuck_worker.is_alive() else None
+        worker = threading.Thread(target=self._work, args=(jobs, previous), name="locum-mcp-worker", daemon=True)
+        self._worker = worker
+        worker.start()
         try:
             for line in iter(inp.readline, ""):
                 response = self.handle_line(line)
@@ -423,14 +443,16 @@ class MCPServer:
             # requests and close stdin), each within its own time limit, then stop.
             with self._jobs_lock:
                 pending = list(self._jobs.values())
-            self._queue.put(None)
+            jobs.put(None)
             limits = [j.received + j.timeout + 2.0 for j in pending if j.timeout is not None]
             if pending and len(limits) < len(pending):
-                self._worker.join()  # a call without a time limit: wait for it, as before
+                worker.join()  # a call without a time limit: wait for it, as before
             else:
-                self._worker.join(timeout=max([1.0] + [t - time.monotonic() for t in limits]))
+                worker.join(timeout=max([1.0] + [t - time.monotonic() for t in limits]))
             for job in pending:
                 job.done.wait(timeout=max(0.0, job.received + (job.timeout or 0) + 2.0 - time.monotonic()))
+            # Still stuck in a call: the next serve()'s worker waits for it to finish.
+            self._stuck_worker = worker if worker.is_alive() else None
             self._worker = None
             self._out = None
             if restore is not None:

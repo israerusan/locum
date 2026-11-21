@@ -57,6 +57,7 @@ import pathlib
 import threading
 import time
 import traceback as _traceback
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -379,8 +380,16 @@ class Tracer:
         self._lock = threading.RLock()
         self._local = threading.local()
         self._active = False
+        #: (object, name, had own attribute, previous own attribute) for the desktop: held strongly.
         self._patched: List[Tuple[Any, str, bool, Any]] = []
+        #: id -> (weak reference, [(name, had, previous)]) for the elements and windows a call
+        #: returned: held weakly, so a long trace does not keep every element it saw alive. A
+        #: collected one needs no restoring (its wrappers no-op once the tracer stops).
+        self._weak_patched: Dict[int, Tuple[Any, List[Tuple[str, bool, Any]]]] = {}
         self._patched_ids: set = set()
+        #: (registry snapshot, tracer secrets) -> compiled scrub pattern; see :meth:`_scrub`.
+        self._scrub_key: Optional[Tuple[Any, ...]] = None
+        self._scrub_pat: Tuple[Any, int] = (None, 0)
         self._handler: Optional[_LogHandler] = None
         self._logger_level: Optional[int] = None
         self._sig_cache: Dict[Any, Optional[inspect.Signature]] = {}
@@ -424,15 +433,29 @@ class Tracer:
 
     def stop(self) -> "Tracer":
         """Stop recording and restore every instrumented method exactly. Idempotent."""
-        if not self._active and not self._patched and self._handler is None:
+        if not self._active and not self._patched and not self._weak_patched and self._handler is None:
             return self
-        self._active = False
-        self.finished_at = time.time()
-        self._restore()
+        with self._lock:  # an _instrument_result on another thread finishes first, or sees inactive
+            self._active = False
+            self.finished_at = time.time()
+            self._restore()
         return self
 
     def _restore(self) -> None:
-        for obj, name, had, old in reversed(self._patched):
+        with self._lock:
+            self._restore_locked()
+
+    def _restore_locked(self) -> None:
+        # Swap, then read the old map: a weakref callback (any thread, any allocation) only
+        # ever touches the current map, so the one iterated here cannot change size.
+        old_weak, self._weak_patched = self._weak_patched, {}
+        weak = list(old_weak.values())
+        entries: List[Tuple[Any, str, bool, Any]] = list(self._patched)
+        for ref, names in weak:
+            obj = ref()
+            if obj is not None:  # a collected element needs no restoring
+                entries.extend((obj, name, had, old) for name, had, old in names)
+        for obj, name, had, old in reversed(entries):
             try:
                 if had:
                     setattr(obj, name, old)
@@ -440,6 +463,7 @@ class Tracer:
                     delattr(obj, name)
             except Exception:  # pragma: no cover - an object that refuses is left as is
                 pass
+        del entries, weak
         self._patched.clear()
         self._patched_ids.clear()
         logger = logging.getLogger("locum")
@@ -461,9 +485,26 @@ class Tracer:
 
     # -------------------------------------------------------- instrumenting
     def _instrument(self, obj: Any, kind: str, names: Sequence[str]) -> None:
+        # Under the lock: two threads instrumenting the same object would otherwise both
+        # register it, and the second record (holding the first wrapper) would replace the
+        # one holding the original method. The weakref callback never takes the lock (it
+        # can fire on this thread while the lock is held) and only touches the current map.
+        with self._lock:
+            self._instrument_locked(obj, kind, names)
+
+    def _instrument_locked(self, obj: Any, kind: str, names: Sequence[str]) -> None:
         key = id(obj)
         if key in self._patched_ids:
             return
+        weak: Optional[List[Tuple[str, bool, Any]]] = None
+        if kind != "desktop":
+            try:
+                ref = weakref.ref(obj, functools.partial(_forget_patched, weakref.ref(self), key))
+            except TypeError:  # not weak-referenceable: held strongly like the desktop
+                pass
+            else:
+                weak = []
+                self._weak_patched[key] = (ref, weak)
         self._patched_ids.add(key)
         own = vars(obj) if hasattr(obj, "__dict__") else {}
         for name in names:
@@ -476,7 +517,10 @@ class Tracer:
                 setattr(obj, name, self._wrap(obj, kind, name, orig))
             except Exception:
                 continue
-            self._patched.append((obj, name, had, previous))
+            if weak is not None:
+                weak.append((name, had, previous))
+            else:
+                self._patched.append((obj, name, had, previous))
 
     def _wrap(self, owner: Any, kind: str, name: str, orig: Callable[..., Any]) -> Callable[..., Any]:
         tracer = self
@@ -490,6 +534,10 @@ class Tracer:
         return traced
 
     def _instrument_result(self, value: Any) -> None:
+        with self._lock:  # stop() cannot run between this check and the patching
+            self._instrument_result_locked(value)
+
+    def _instrument_result_locked(self, value: Any) -> None:
         if not self._active:
             return
         if isinstance(value, (list, tuple)):
@@ -571,11 +619,23 @@ class Tracer:
             return text
         # This tracer's secrets and the values held in a Secret anywhere in the process, in
         # every form (as is, quoted by repr/JSON: "dom\\pw" shows as 'dom\\\\pw' in an argument).
-        from ._secret import scrub
+        # The alternation of every secret is compiled once per change of either set (not on
+        # every call: that cost grows with the number of secrets) and never lands in ``re``'s
+        # cache. Same result as ``scrub(text, self._secrets, min_len=_MIN_SCRUB)``.
+        from ._secret import MASK as _mask, _compile, known_secrets
 
+        snap = known_secrets()
         with self._lock:
-            mine = tuple(self._secrets)
-        return scrub(text, mine, min_len=_MIN_SCRUB)
+            mine = frozenset(self._secrets)
+            key = (snap, mine)
+            if key == self._scrub_key:
+                pat, shortest = self._scrub_pat
+            else:
+                pat, shortest = _compile(set(snap) | {str(s) for s in mine if s}, _MIN_SCRUB, False)
+                self._scrub_key, self._scrub_pat = key, (pat, shortest)
+        if pat is None or len(text) < shortest:
+            return text
+        return pat.sub(_mask, text)
 
     def _call(self, owner: Any, kind: str, name: str, orig: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
         stack = self._stack()
@@ -830,21 +890,25 @@ def _backend_name(desktop: Any) -> str:
     return str(getattr(backend, "name", None) or type(backend).__name__)
 
 
+def _forget_patched(tracer_ref: Any, key: int, _ref: Any) -> None:
+    """Weakref callback: an instrumented element/window was collected; its id may be reused."""
+    tracer = tracer_ref()
+    if tracer is None:
+        return
+    entry = tracer._weak_patched.get(key)
+    if entry is not None and entry[0] is _ref:
+        tracer._weak_patched.pop(key, None)
+        tracer._patched_ids.discard(key)
+
+
 def _write(path: PathLike, text: str) -> str:
+    # Lazy import: locum.rpa is heavier than a trace needs at import time.
+    from .rpa.queue import _atomic_write
+
     p = pathlib.Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
-    # pid + thread: two threads saving the same trace path must not share a temp file.
-    tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, p)
-    except BaseException:
-        try:  # a full disk / locked target must not leave a hidden temp file behind
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    # Unique temp file, fsync, Windows rename retry; no temp file left behind on failure.
+    _atomic_write(p, text)
     return str(p)
 
 

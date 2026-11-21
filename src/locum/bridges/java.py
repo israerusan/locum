@@ -1059,6 +1059,18 @@ class JavaElement:
             ctx["app"] = app
         return ctx
 
+    def _ungated_or_allowed(self, tool: str, build: Callable[[Dict[str, Any]], Tuple[Dict[str, Any], str]],
+                            *, activates: bool, secret: bool = False) -> bool:
+        """``gate.allow(tool, ...)``; the policy context (window list, labels: cross-process
+        reads) is built by ``build(ctx) -> (args, description)`` only when a policy is set."""
+        gate = self.bridge.gate
+        if gate.policy is None:
+            gate.guard()  # all an ungated allow() does: the fail-safe and cancel scopes
+            return True
+        ctx = self._ctx(activates=activates)
+        args, description = build(ctx)
+        return bool(gate.allow(tool, args, ctx, description, secret=secret))
+
     def _app(self, hwnd: Any) -> str:
         desktop = self.bridge.desktop
         if desktop is None or hwnd is None:
@@ -1087,12 +1099,15 @@ class JavaElement:
         action = self.node.click_action() if native is not False else None
         if native is True and action is None:
             raise NotSupported(f"{self!r} has no click action (actions: {self.node.actions()})")
-        ctx = self._ctx(activates=True)
-        b = self.node.bounds
-        if action is None and b is not None:
-            ctx["point"] = b.center  # the mouse fallback: region / app-under-pointer rules apply
-        what = ctx.get("target") or self.role
-        if not self.bridge.gate.allow("click", {"target": str(what)}, ctx, f"click {what!r}"):
+
+        def build(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+            b = self.node.bounds
+            if action is None and b is not None:
+                ctx["point"] = b.center  # the mouse fallback: region / app-under-pointer rules apply
+            what = ctx.get("target") or self.role
+            return {"target": str(what)}, f"click {what!r}"
+
+        if not self._ungated_or_allowed("click", build, activates=True):
             return self
         if action is not None:
             if not self.node.do_action(action):
@@ -1143,10 +1158,13 @@ class JavaElement:
             raise ElementNotFound(f"{self!r} is disabled or read-only")
         password = "password" in st
         secret = password or is_secret
-        ctx = self._ctx(activates=False)
         shown = "***" if secret else (value if len(value) <= 60 else value[:57] + "...")
-        if not self.bridge.gate.allow("set_value", {"target": ctx.get("target"), "text": value}, ctx,
-                                      f"set text of {ctx.get('target') or self.role!r} to {shown!r}", secret=secret):
+
+        def build(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+            return ({"target": ctx.get("target"), "text": value},
+                    f"set text of {ctx.get('target') or self.role!r} to {shown!r}")
+
+        if not self._ungated_or_allowed("set_value", build, activates=False, secret=secret):
             return self
         if not self.node.set_value(value):
             raise NotSupported(f"setTextContents failed on {self!r}: not an editable text component "
@@ -1163,8 +1181,9 @@ class JavaElement:
 
     def focus(self) -> "JavaElement":
         self._present()
-        ctx = self._ctx(activates=False)
-        if self.bridge.gate.allow("focus", {"target": ctx.get("target")}, ctx, f"focus {ctx.get('target') or self.role!r}"):
+        if self._ungated_or_allowed("focus", lambda ctx: ({"target": ctx.get("target")},
+                                                          f"focus {ctx.get('target') or self.role!r}"),
+                                    activates=False):
             if not self.node.focus():
                 raise BackendError(f"requestFocus failed on {self!r}")
         return self
@@ -1172,10 +1191,13 @@ class JavaElement:
     def do_action(self, name: str) -> "JavaElement":
         """Run a named AccessibleAction (``"toggle expand"``, ``"togglePopup"``...)."""
         self._present()
-        ctx = self._ctx(activates=True)
-        what = ctx.get("target") or self.role
-        ctx["arg_texts"] = [name]
-        if self.bridge.gate.allow("invoke", {"target": str(what), "action": name}, ctx, f"{name} {what!r}"):
+
+        def build(ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+            what = ctx.get("target") or self.role
+            ctx["arg_texts"] = [name]
+            return {"target": str(what), "action": name}, f"{name} {what!r}"
+
+        if self._ungated_or_allowed("invoke", build, activates=True):
             if not self.node.do_action(name):
                 raise BackendError(f"doAccessibleActions({name!r}) failed on {self!r}")
         return self

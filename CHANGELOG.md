@@ -12,6 +12,100 @@ The rules apply from 0.3.0 on.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-21
+
+A third polish pass, focused on performance, dependability and
+maintainability. Each fix has a regression test (`tests/test_polish3_*.py`).
+It is a minor release because of the changed exception types below.
+
+### Breaking
+
+- **`Desktop.click/double_click` with `duration`, `interval` or `humanize`,
+  and `Desktop.move/drag/scroll` on an element or selector, are bound to the
+  element's window and hold the input lock**, like `Element.click` (safety
+  fix). Before, a window that appeared over the element during the timed move
+  got the click. **Migration:** these calls can now raise `TargetLost`, as
+  `Element.click` does; catch it where you retry.
+- **`Element.refresh(timeout=...)` raises errors that searching again cannot
+  fix** (`NotSupported`, `TypeError`, ...) at once, as `Desktop.find` does,
+  instead of `ElementNotFound` once the timeout ran out. Transient errors are
+  still retried. **Migration:** catch `LocumError` (or the specific error)
+  rather than only `ElementNotFound`.
+- **Browser:** a port held by a program that does not speak HTTP gives
+  `CDPError` (attach then tries the next port; launch discards the stale
+  `DevToolsActivePort`) instead of `http.client.BadStatusLine`.
+  `Page.wait_for` on a page too busy to answer before the deadline raises
+  `ElementNotFound` instead of a `CDPError` timeout. **Migration:** catch
+  `CDPError` / `ElementNotFound`.
+- **Flow `continue_on_error: "y"` means true**, as it already did for `heal`,
+  `strict` and `screenshot_on_error`; it used to mean false. **Migration:**
+  write `false` where "y" was meant to stop the flow.
+
+### Fixed
+
+- **Windows: `capture_window` no longer blocks forever on a window that is not
+  responding** (PrintWindow waits without a timeout): it raises `NotSupported`,
+  so `Window.screenshot(mode="auto")` falls back to a screen grab.
+  `accessibility_roots()` skips such windows at once instead of waiting out the
+  5 s UI Automation timeout for each (they were dropped either way).
+- **A click on a disabled element no longer holds the desktop input lock while
+  it waits** (up to `default_timeout`) for the element to become enabled, so
+  other workers' input no longer fails with `DesktopBusy` meanwhile.
+- **Typing read-back:** when an app dropped every keystroke into a large field,
+  working out the repair took memory quadratic in the field length (gigabytes
+  near the 200,000-character limit); it is now linear. The prefix/suffix
+  comparisons run in C.
+- **Clipboard typing:** a failed clipboard restore after a failed paste is
+  logged instead of replacing the paste's error (`TargetLost`,
+  `FailSafeTriggered`, ...) with a `BackendError`.
+- **Run reports:** when an exception already ends a `with robot:` block, a
+  `Robot.run()` or a `run_flow`, a failed report save is logged instead of
+  replacing that exception. Without one in flight (including a fail-safe abort
+  that returns its report) a failed save still raises.
+- **Tracer:** no longer keeps every element and window it instrumented alive
+  until `stop()` (173 MB after 50 `find_all` calls over 200 elements; now
+  flat). The pytest plugin releases each test's tracer after teardown.
+- **Secrets:** the tracer's scrub pattern is compiled once per change of the
+  secret set, and neither tracer secrets nor per-call `scrub(extra=...)` values
+  stay in Python's regex cache.
+- **Trace saves and `Recorder.save`** write atomically (fsync and the Windows
+  rename retry), like reports and the work queue.
+- **Browser:** an error or Ctrl+C while waiting for a launched browser's
+  DevTools port stops that browser instead of leaking it. `wait_for`,
+  `wait_ready` and `navigate` bound each DevTools call by the time left.
+  WebSocket sends use the connect timeout, not whatever the last short receive
+  left on the socket.
+- **Windows:** a backend that is garbage-collected without `close()` stops its
+  UI Automation event thread. One failed mss grab no longer disables mss for
+  the backend's lifetime (it gives up after 3 consecutive failures, as on X11).
+- **macOS:** element app names no longer come back stale for a recycled PID or
+  stay empty for an app that registered late.
+- **MCP server:** a second `serve()` after a call that was stuck when the first
+  ended can run calls again (once the stuck call ends; two calls never run at
+  once).
+- Audit-log write failures in `GuardedDesktop` actions, failures to release
+  held input after an agent run, and failed queue lease renewals are logged
+  instead of ignored.
+- The input-lock owner file sits next to the per-user, per-display lock file
+  and is opened without following links.
+
+### Performance
+
+- `observe()` reads each element's bounds, states and role once (about half
+  the accessibility calls); `Observation.add_element` finds UI Automation
+  elements by runtime id instead of a full scan; tool target resolution lists
+  the windows once per action; `observe(changes_only=True)` draws the boxes
+  once. Output is unchanged.
+- `locum find --all` reads the windows and proves window uniqueness once per
+  command (67 elements: 7 s to 0.3 s on a slow tree); output is unchanged.
+- Template matching uses about 250 MB less peak memory on a 4K screenshot
+  (results bit-identical); mss screenshots skip one full-frame copy.
+- A text field's placeholder is cached for a second instead of re-read
+  (a dozen UI Automation calls) on every `.text` read.
+- Java bridge actions without a policy no longer list windows or read labels;
+  SAP nodes read their COM `Type` once.
+- The run report encodes a screenshot shared by nested failed steps once.
+
 ## [0.5.0] - 2026-11-18
 
 A second whole-library polish pass. Each fix has a regression test

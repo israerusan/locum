@@ -217,6 +217,13 @@ class _CaptureMixin:
         hwnd = self._hwnd(handle)
         if not self._can_print_window():
             raise NotSupported("PrintWindow / CreateDIBSection are unavailable on this system")
+        if self._is_hung(hwnd):
+            # PrintWindow sends WM_PRINT and waits for the window's thread with no
+            # timeout: a hung window would block this call forever.
+            raise NotSupported(
+                f"Window {hwnd:#x} is not responding (IsHungAppWindow): PrintWindow would block. "
+                "Use mode='screen' instead."
+            )
         a = self._api
         with self._per_monitor_dpi():
             if not a.IsIconic(hwnd):

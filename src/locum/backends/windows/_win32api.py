@@ -392,6 +392,7 @@ class _Win32:
             (u, "WindowFromPoint", HWND, [POINT]),
             (u, "GetAncestor", HWND, [HWND, UINT]),
             (u, "GetWindow", HWND, [HWND, UINT]),
+            (u, "IsHungAppWindow", BOOL, [HWND]),  # PrintWindow / UIA block on a hung window
             # off-screen window capture
             (u, "PrintWindow", BOOL, [HWND, HDC, UINT]),
             (gdi32, "CreateDIBSection", HBITMAP, [HDC, P(BITMAPINFO), UINT, P(LPVOID), HANDLE, DWORD]),

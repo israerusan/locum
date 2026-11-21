@@ -27,7 +27,7 @@ from ..base import (
     AccessibleNode,
     Backend,
 )
-from ..x11.atspi import load_atspi
+from ..x11.atspi import _AtspiLoaderMixin, find_focused
 from ..x11.keysyms import _COMMAND_MODIFIERS, key_to_keysym
 from . import _portal as P
 from .atspi import DIALOG_ROLES, WaylandAtspiNode
@@ -184,7 +184,7 @@ def _cleanup(state: Dict[str, Any]) -> None:
             pass
 
 
-class WaylandBackend(Backend):
+class WaylandBackend(_AtspiLoaderMixin, Backend):
     """Native Wayland backend over xdg-desktop-portal (experimental).
 
     * **Input**: one ``org.freedesktop.portal.RemoteDesktop`` session with a
@@ -818,21 +818,7 @@ class WaylandBackend(Backend):
         return out
 
     # ============================================================= accessibility
-    def _atspi(self) -> Any:
-        if not self._atspi_checked:
-            self._atspi_checked = True
-            self._atspi_mod = load_atspi() if self._atspi_source == "auto" else self._atspi_source
-        return self._atspi_mod
-
-    def _require_atspi(self) -> Any:
-        self._check()
-        mod = self._atspi()
-        if mod is None:
-            raise NotSupported(
-                "AT-SPI accessibility is unavailable: install PyGObject with the Atspi typelib "
-                "(e.g. `apt install python3-gi gir1.2-atspi-2.0 at-spi2-core`)"
-            )
-        return mod
+    # _atspi / _require_atspi: see _AtspiLoaderMixin (shared with the X11 backend)
 
     def _window_nodes(self) -> List[WaylandAtspiNode]:
         atspi = self._require_atspi()
@@ -930,13 +916,7 @@ class WaylandBackend(Backend):
         return node
 
     def focused_element(self) -> Optional[AccessibleNode]:
-        roots = self._window_nodes()
-        active = [r for r in roots if "active" in r._raw_states()] or roots
-        for root in active:
-            for node in root.walk(max_depth=48):
-                if "focused" in node.states:
-                    return node
-        return None
+        return find_focused(self._window_nodes(), lambda r: r._raw_states())
 
     # ================================================================= windows
     def activate_window(self, handle: Any) -> None:

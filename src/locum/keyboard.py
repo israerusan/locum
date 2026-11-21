@@ -17,6 +17,7 @@ primitives and adds:
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -27,6 +28,8 @@ from ._target import check_input as _target_check
 from .errors import ActionTimeout, NotSupported
 from .failsafe import FailSafe
 from .keys import check_combo, lower_combo_letters, normalize_key, parse_hotkey, press_actions, split_text_tokens
+
+_log = logging.getLogger("locum.keyboard")
 
 KeySpec = Union[str, Sequence[str]]
 
@@ -395,6 +398,7 @@ class Keyboard:
         pasted = False
         settled = True  # the last paste was waited for
         restore = True  # False: the app has not read the last paste, keep it on the clipboard
+        completed = False
         try:
             for i, (kind, value) in enumerate(units):
                 if (i or not first) and interval > 0:
@@ -431,11 +435,20 @@ class Keyboard:
                             "type with mode='keys')")
                 else:  # pragma: no cover - internal invariant
                     raise AssertionError(kind)
+            completed = True
         finally:
             if pasted and saved_ok and restore:
                 if not settled and self.clipboard_settle > 0:  # failed mid-paste: mod+v may still be read
                     self._sleep(self.clipboard_settle)
-                self._restore_clipboard(saved)
+                if completed:
+                    self._restore_clipboard(saved)
+                else:
+                    # An error is already propagating (TargetLost, FailSafeTriggered, ...): a
+                    # failed restore (clipboard busy) must not replace it with a BackendError.
+                    try:
+                        self._restore_clipboard(saved)
+                    except Exception as exc:
+                        _log.warning("could not restore the clipboard after a failed paste: %s", exc)
 
     def __repr__(self) -> str:
         return f"<Keyboard backend={getattr(self.backend, 'name', '?')} pressed={self._pressed}>"

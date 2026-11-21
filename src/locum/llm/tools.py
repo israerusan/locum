@@ -52,7 +52,7 @@ from .. import _target as _input_target
 from ..errors import ActionTimeout, ElementNotFound, FailSafeTriggered, NotSupported, PolicyViolation, LocumError
 from ..types import Match, Point, Rect, WindowInfo
 from .observe import Observation, ObservedElement, observe
-from .._nodeinfo import ancestors, is_password, node_app, owning_window, target_label, window_at
+from .._nodeinfo import ancestors, is_password, list_windows_safe, node_app, owning_window, target_label, window_at
 from .safety import (
     AuditLog, Policy, check_activation_combo, check_launch_options, is_text_input, keys_activate, keys_may_move_focus, split_typed_text,
     pressed_control, target_identity, typed_text_activates,
@@ -1036,54 +1036,72 @@ class DesktopToolkit:
             return None
         return None
 
-    def _node_info(self, node: Any) -> Tuple[str, str]:
+    def _windows(self) -> List[WindowInfo]:
+        """One ``list_windows()`` snapshot for resolving a target (``[]`` when it fails).
+
+        Every window lookup of one target resolution uses the same snapshot: listing
+        the windows six to eight times per action cost a cross-process enumeration each."""
+        return list_windows_safe(self.desktop.backend)
+
+    def _node_label(self, node: Any) -> str:
+        """The policy label of ``node`` (:func:`~locum._nodeinfo.target_label`), ``""`` on failure."""
+        try:
+            return target_label(node)
+        except Exception:
+            return ""
+
+    def _node_app(self, node: Any, windows: Optional[List[WindowInfo]] = None) -> str:
+        """The application of ``node`` (via its window in ``windows``), ``""`` on failure."""
+        try:
+            return node_app(self.desktop.backend, node, windows)
+        except Exception:
+            return ""
+
+    def _node_info(self, node: Any, windows: Optional[List[WindowInfo]] = None) -> Tuple[str, str]:
         """``(name, app)`` of an accessibility node (app via its window).
 
         ``name`` is the policy label (:func:`~locum._nodeinfo.target_label`):
         the node's name plus its enclosing actionable control's, so an unnamed
         icon inside a "Pay" button is still treated as "Pay".
+        ``windows``: a :meth:`_windows` snapshot to resolve the window in (default: list them).
         """
-        name = ""
-        app = ""
-        try:
-            name = target_label(node)
-        except Exception:
-            pass
-        try:
-            app = node_app(self.desktop.backend, node)
-        except Exception:
-            pass
-        return name, app
+        return self._node_label(node), self._node_app(node, windows)
 
-    def _point_apps(self, point: Point, node: Any) -> Tuple[str, ...]:
+    def _point_apps(self, point: Point, node: Any, windows: Optional[List[WindowInfo]] = None) -> Tuple[str, ...]:
         """Apps a click at ``point`` may land in: the hit-tested node's and the front-most window's there.
 
         Both are reported (when known) so a node whose window cannot be
         resolved never lets the policy fall back to the *active* app.
         """
+        if windows is None:
+            windows = self._windows()
         apps: List[str] = []
         if node is not None:
-            a = self._node_info(node)[1]
+            a = self._node_app(node, windows)
             if a:
                 apps.append(a)
-        w = window_at(self.desktop.backend, point)
+        w = window_at(self.desktop.backend, point, windows)
         if w is not None and w.app and w.app not in apps:
             apps.append(w.app)
         return tuple(apps)
 
-    def _window_title(self, node: Any = None, point: Optional[Point] = None) -> str:
+    def _window_title(self, node: Any = None, point: Optional[Point] = None,
+                      windows: Optional[List[WindowInfo]] = None) -> str:
         """Title of the window an action on ``node`` / at ``point`` lands in (``""`` if unknown).
 
         A point is judged by the front-most window there (that is where the
         click goes); an element by the window that owns it.
+        ``windows``: a :meth:`_windows` snapshot (default: list them once here).
         """
         backend = self.desktop.backend
+        if windows is None and (point is not None or node is not None):
+            windows = self._windows()
         w = None
         if point is not None:
-            w = window_at(backend, point)
+            w = window_at(backend, point, windows)
         if w is None and node is not None:
             try:
-                w = owning_window(backend, node)
+                w = owning_window(backend, node, windows)
             except Exception:
                 w = None
         return str(w.title or "") if w is not None else ""
@@ -1108,14 +1126,15 @@ class DesktopToolkit:
         if node is None:
             unknown = name_it if activating is None else activating
             return _Target(description="the focused control (unknown)", unknown=True) if unknown else None
-        name, app = self._node_info(node)
+        wins = self._windows()
+        name, app = self._node_info(node, wins)
         try:
             role = str(node.role or "")
         except Exception:
             role = ""
         desc = f"the focused {role or 'element'}" + (f" {name!r}" if name else "")
         t = _Target(description=desc, name=name if name_it else "", app=app, secret=is_password(node), node=node,
-                    window=self._window_title(node))
+                    window=self._window_title(node, windows=wins))
         if enter:
             t = _with_default_button(t, node)
         acts = name_it if activating is None else activating
@@ -1176,32 +1195,35 @@ class DesktopToolkit:
             oe = self._mapping().element(element_id)
             el = self._element_from_observed(oe)
             label = f"element [{oe.id}] {oe.role}" + (f" {oe.name!r}" if oe.name else "")
-            name = self._node_info(oe.node)[0] or oe.name or (oe.value or "")
+            wins = self._windows()
+            name = self._node_label(oe.node) or oe.name or (oe.value or "")
             return self._element_target(_Target(element=el, description=label, name=name,
-                                                app=oe.app or self._node_info(oe.node)[1], observed=oe,
-                                                node=oe.node), activates)
+                                                app=oe.app or self._node_app(oe.node, wins), observed=oe,
+                                                node=oe.node), activates, wins)
         if selector is not None:
             el = self.desktop.find(selector, timeout=self.find_timeout)
-            name, app = self._node_info(el.node)
+            wins = self._windows()
+            name, app = self._node_info(el.node, wins)
             return self._element_target(_Target(element=el, description=f"{el.role} {name!r} (selector {selector!r})",
-                                                name=name or selector, app=app, node=el.node), activates)
+                                                name=name or selector, app=app, node=el.node), activates, wins)
         if text is not None:
             el, point = self._find_by_text(text)
+            wins = self._windows()
             if el is not None:
-                name, app = self._node_info(el.node)
+                name, app = self._node_info(el.node, wins)
                 return self._element_target(_Target(element=el, description=f"{el.role} {name!r} (text {text!r})",
-                                                    name=name or text, app=app, node=el.node), activates)
+                                                    name=name or text, app=app, node=el.node), activates, wins)
             assert point is not None
             node = self._safe_element_at(point)
-            apps = self._point_apps(point, node)
-            label = self._node_info(node)[0] if node is not None else ""
+            apps = self._point_apps(point, node, wins)
+            label = self._node_label(node) if node is not None else ""
             name = text if not label or label == text else f"{text} < {label}"
             return _Target(point=point, description=f"on-screen text {text!r} at ({point.x}, {point.y})", name=name,
                            app=apps[0] if apps else "", apps=apps, unknown=activates and node is None, node=node,
-                           window=self._window_title(node, point))
+                           window=self._window_title(node, point, wins))
         return self._point_target(self._screen_point(x, y), f"({x}, {y})", activates=activates)
 
-    def _element_target(self, t: _Target, activates: bool) -> _Target:
+    def _element_target(self, t: _Target, activates: bool, windows: Optional[List[WindowInfo]] = None) -> _Target:
         """``t`` (an element target) judged by what a mouse action on it really reaches.
 
         The mouse lands at the element's centre, which may lie on a child control:
@@ -1212,7 +1234,8 @@ class DesktopToolkit:
         """
         el = t.element
         assert el is not None
-        t = dataclasses.replace(t, secret=is_password(el.node), node=el.node, window=self._window_title(el.node))
+        t = dataclasses.replace(t, secret=is_password(el.node), node=el.node,
+                                window=self._window_title(el.node, windows=windows))
         if not activates:
             return t
         try:
@@ -1235,7 +1258,7 @@ class DesktopToolkit:
                 return t  # the element itself, or something covering it (Element refuses to click that)
         except Exception:
             return t
-        label = self._node_info(hit)[0]
+        label = self._node_label(hit)
         pressed = pressed_control(hit, el.node)
         if pressed is not el.node:
             # An actionable child receives the press ("Pay now" in a toolbar): allow rules and
@@ -1262,14 +1285,15 @@ class DesktopToolkit:
         nothing can be hit-tested the target is marked unknown (``Policy(unknown_target=...)``).
         """
         node = self._safe_element_at(point)
-        name = self._node_info(node)[0] if node is not None else ""
-        apps = self._point_apps(point, node)
+        wins = self._windows()
+        name = self._node_label(node) if node is not None else ""
+        apps = self._point_apps(point, node, wins)
         desc = description + (f" on {node.role} {name!r}" if node is not None and name else "")
         # Nothing hit-testable there, or a control with no usable identity (no name,
         # automation id, text value or named descendant at the point): unknown target.
         unknown = activates and (node is None or not target_identity(node, point, self.desktop.backend))
         return _Target(point=point, description=desc, name=name, app=apps[0] if apps else "", apps=apps,
-                       unknown=unknown, node=node, window=self._window_title(node, point))
+                       unknown=unknown, node=node, window=self._window_title(node, point, wins))
 
     def _safe_element_at(self, point: Point) -> Any:
         try:
@@ -1421,12 +1445,19 @@ class DesktopToolkit:
         prev = self.last_observation
         kw.setdefault("reuse", prev)  # unchanged windows are not re-walked (Windows: UIA change events)
         self._prune_browser(kw)
+        # A diff renumbers the elements (they keep their earlier ids), so boxes drawn by
+        # observe() would be drawn again: draw them once, after the ids are final.
+        late_annotate = bool(changes_only and prev is not None and kw.get("annotate", True))
+        if late_annotate:
+            kw["annotate"] = False
         obs = observe(self.desktop, window=window, **kw)
         if changes_only:
             if prev is not None and prev.region == obs.region and prev.image_size == obs.image_size and prev.elements is not obs.elements:
-                return self._observe_changes(prev, obs, include_screenshot)
+                return self._observe_changes(prev, obs, include_screenshot, annotate=late_annotate)
             obs.notes.append("changes_only: there is no earlier observation of the same area to compare with, "
                              "so this is a full observation; later calls will return only changes.")
+        if late_annotate:
+            obs._annotate()  # the full-observation fallback: observe()'s own ids, drawn here
         self.last_observation = obs
         img = obs.image_base64(annotated=True) if obs.screenshot is not None else None
         return ToolResult(obs.text(kw.get("max_elements", 300)), image_base64=img, data=obs)
@@ -1443,11 +1474,16 @@ class DesktopToolkit:
         if pid:
             kw["prune_documents"] = [pid]
 
-    def _observe_changes(self, prev: Observation, obs: Observation, include_screenshot: bool) -> ToolResult:
+    def _observe_changes(self, prev: Observation, obs: Observation, include_screenshot: bool,
+                         annotate: bool = False) -> ToolResult:
+        """``annotate``: ``obs`` was taken without its boxes; draw them once the diff has
+        given the elements their final ids."""
         from ..vision import crop as _crop, to_base64_png
         from .obsdiff import compare
 
         diff = compare(prev, obs)
+        if annotate:
+            obs._annotate()
         self.last_observation = obs
         img = None
         if include_screenshot and obs.screenshot is not None:
@@ -2181,7 +2217,6 @@ class DesktopToolkit:
             if text:
                 lines.append("Text:\n" + text)
         img = base64.b64encode(page.screenshot_png()).decode("ascii") if include_screenshot else None
-        self._browser_snapshot = (page.info.id, {e["id"]: e for e in els})
         return ToolResult("\n".join(lines), image_base64=img)
 
     def _browser_target(self, page: Any, element: Optional[int], selector: Optional[str]) -> Tuple[Any, Dict[str, Any]]:

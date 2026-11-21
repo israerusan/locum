@@ -69,6 +69,7 @@ import fnmatch
 import functools
 import itertools
 import json
+import logging
 import os
 import re
 import threading
@@ -81,6 +82,9 @@ from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional
 from .._policy import DEFAULT_POLICY, POLICY_OFF
 from ..errors import PolicyViolation
 from ..types import Point, Rect, coerce_point
+
+_log = logging.getLogger(__name__)
+
 
 def fold_text(text: str) -> str:
     """``text`` without diacritics (NFKD, combining marks dropped, ``ß`` -> ``ss``), invisible
@@ -2053,8 +2057,12 @@ class GuardedDesktop(_GuardedProxy):
             event["error"] = error
         try:
             self.audit.record(event)
-        except Exception:  # noqa: BLE001 - an audit failure must not turn into an action failure
-            pass
+        except Exception as exc:  # noqa: BLE001 - an audit failure must not turn into an action failure
+            # Never silent: an action that happened with no audit record must be visible somewhere.
+            try:
+                _log.error("Audit log write failed for RPA action %r (%s): %s", tool, status, exc)
+            except Exception:  # noqa: BLE001 - a broken logging handler must not fail the action either
+                pass
 
     def _gate(self, tool: str, args: Dict[str, Any], ctx: Dict[str, Any], description: str, *,
               count: bool = True, secret: bool = False, log_args: Optional[Dict[str, Any]] = None) -> bool:

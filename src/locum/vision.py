@@ -535,6 +535,7 @@ def _score_map(hay: _Haystack, needle: np.ndarray, mask: Optional[np.ndarray]) -
         if var_t <= (_FLAT_NEEDLE_STD ** 2) * n * c:
             return _flat_needle_score(s1, s2, tmean, n)
         var_h = _window_variance(s1, s2, n)
+        del s1, s2  # full-haystack float64 arrays: free them before the matching pass
         cv2 = _cv2()
         if cv2 is not None:
             hay_src = hay.raw if not hay.grayscale else (hay.data[0] + hay.mean[0])
@@ -565,8 +566,9 @@ def _score_map(hay: _Haystack, needle: np.ndarray, mask: Optional[np.ndarray]) -
         score = _flat_needle_score(s1, s2, tmean, nw)
         _apply_shape_contrast(score, hay, tmean, w)
         return score
-    num = hay.correlate(spectra, [dev[:, :, k] * w for k in range(c)], th, tw)
     var_h = _window_variance(s1, s2, nw)
+    del s1, s2  # full-haystack float64 arrays: free them before the correlation below
+    num = hay.correlate(spectra, [dev[:, :, k] * w for k in range(c)], th, tw)
     return _normalize_ncc(num, var_h, var_t, floor)
 
 

@@ -1595,8 +1595,10 @@ class Recorder:
             text = yaml.safe_dump(self.to_flow(flow_name), sort_keys=False, allow_unicode=True)
         else:
             raise ValueError(f"Unsupported recording format {ext!r}: use .py, .yaml, .yml or .json")
+        from .queue import _atomic_write  # not the stdlib ``queue`` imported above
+
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text, encoding="utf-8")
+        _atomic_write(p, text)  # a crash mid-save never leaves a half-written recording
         return str(p)
 
     def __repr__(self) -> str:

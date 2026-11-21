@@ -56,6 +56,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+from . import _inputlock, _target
 from . import failsafe as _failsafe_mod
 from ._cancel import check as _cancel_check
 from .backends.base import CAP_ACCESSIBILITY, AccessibleNode, Backend
@@ -570,6 +571,16 @@ class Desktop:
             raise ValueError(f"Point ({point.x}, {point.y}) is off-screen (monitors: {layout}); "
                              "pass allow_offscreen=True to send it anyway")
 
+    @contextlib.contextmanager
+    def _bound_to(self, el: Optional[Element]) -> Iterator[None]:
+        """Bind mouse input to ``el``'s window and hold the input lock, as
+        :meth:`Element.click` does (no-op for ``None``)."""
+        if el is None:
+            yield
+            return
+        with _target.bind(el._input_target(False)), _inputlock.hold(self):
+            yield
+
     def _action_point(self, target: Any, y: Optional[float] = None, offset: Tuple[int, int] = (0, 0),
                       *, allow_offscreen: bool = False) -> Point:
         """Where a mouse action on ``target`` must go.
@@ -648,8 +659,10 @@ class Desktop:
         whatever covers them); a point on no monitor raises ``ValueError``
         unless ``allow_offscreen``.
         """
-        point = self._action_point(target, y, offset, allow_offscreen=allow_offscreen)
-        return self.mouse.move(point, duration=duration, tween=tween, humanize=humanize)
+        el = self._resolve_element(target) if y is None else None
+        with self._bound_to(el):
+            point = self._action_point(el or target, y, offset, allow_offscreen=allow_offscreen)
+            return self.mouse.move(point, duration=duration, tween=tween, humanize=humanize)
 
     def move_rel(self, dx: float, dy: float, **kw: Any) -> Point:
         """Move relative to the current position (keyword arguments as in :meth:`move`)."""
@@ -692,12 +705,16 @@ class Desktop:
                         return clicked  # the visible-part center, for a partly off-screen element
                     b = el.bounds
                     return b.center.offset(dx, dy) if b is not None else self.position()
-                # Same hit-test as Element.click: never click whatever covers the element.
-                el._guard()
-                el._wait_enabled()
-                point = el._mouse_point((dx, dy))
-                return self.mouse.click(point, button=button, clicks=clicks, interval=interval,
-                                        duration=duration, humanize=humanize)
+                # Same hit-test, target binding and input lock as Element.click: never click
+                # whatever covers the element, even if it appears during a timed move.
+                with _target.bind(el._input_target(False)):
+                    el._guard()
+                    el._wait_enabled()  # outside the lock: waiting is not input
+                    with _inputlock.hold(self):
+                        el._wait_enabled()  # re-checked: another worker may have disabled it meanwhile
+                        point = el._mouse_point((dx, dy))
+                        return self.mouse.click(point, button=button, clicks=clicks, interval=interval,
+                                                duration=duration, humanize=humanize)
         if target is None and y is None and (dx, dy) == (0, 0):
             return self.mouse.click(None, button=button, clicks=clicks, interval=interval, humanize=humanize)
         point = self.resolve_point(target, y).offset(dx, dy)
@@ -751,13 +768,18 @@ class Desktop:
         instead). Points on no monitor raise ``ValueError`` unless ``allow_offscreen``.
         """
         start_el = None if start is None else self._resolve_element(start)
-        s = None if start is None else self._action_point(start_el or start, allow_offscreen=allow_offscreen)
-        e = self._action_point(end, allow_offscreen=allow_offscreen)
-        # Bringing the drop target's window forward may have covered the start.
-        if start_el is not None and s is not None and start_el._occluded(s):
-            raise ElementNotFound(f"The drag start {start_el!r} is covered once the drop target is in front; "
-                                  "refusing to drag from the wrong thing")
-        return self.mouse.drag(s, e, button=button, duration=duration, humanize=humanize, hold=hold)
+        end_el = self._resolve_element(end)
+        # Bound to the start element's window only: the press happens there, and the drop may
+        # land in another window (Mouse.drag allows the window under ``end``). A point or the
+        # cursor position as the start is not bound (as before), only locked.
+        with self._bound_to(start_el) if start_el is not None else _inputlock.hold(self):
+            s = None if start is None else self._action_point(start_el or start, allow_offscreen=allow_offscreen)
+            e = self._action_point(end_el or end, allow_offscreen=allow_offscreen)
+            # Bringing the drop target's window forward may have covered the start.
+            if start_el is not None and s is not None and start_el._occluded(s):
+                raise ElementNotFound(f"The drag start {start_el!r} is covered once the drop target is in front; "
+                                      "refusing to drag from the wrong thing")
+            return self.mouse.drag(s, e, button=button, duration=duration, humanize=humanize, hold=hold)
 
     def scroll(self, dy: int = 0, dx: int = 0, *, at: Any = None, allow_offscreen: bool = False) -> None:
         """Scroll wheel notches (``dy > 0`` = up, ``dx > 0`` = right), optionally over ``at``.
@@ -766,8 +788,10 @@ class Desktop:
         a window that covers it); a point on no monitor raises ``ValueError``
         unless ``allow_offscreen``.
         """
-        point = None if at is None else self._action_point(at, allow_offscreen=allow_offscreen)
-        self.mouse.scroll(dy, dx, at=point)
+        el = None if at is None else self._resolve_element(at)
+        with self._bound_to(el):
+            point = None if at is None else self._action_point(el or at, allow_offscreen=allow_offscreen)
+            self.mouse.scroll(dy, dx, at=point)
 
     # =============================================================== keyboard
     def type(self, text: str, *, interval: float = 0.0, mode: Optional[str] = None, verify: bool = True) -> None:

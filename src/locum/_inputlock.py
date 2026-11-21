@@ -295,13 +295,20 @@ def _timeout_of(obj: Any, timeout: Optional[float]) -> float:
 
 # ------------------------------------------------------------- owner sidecar
 def _owner_path(os_lock: _OsLock) -> str:
+    """Next to the lock file, with its per-user/per-display suffix (a shared name would
+    report a holder on another display, or another user's stale file)."""
+    path = getattr(os_lock, "path", None)
+    if isinstance(path, str) and path.endswith(".lock"):
+        return path[:-len(".lock")] + ".owner"
     return os.path.join(tempfile.gettempdir(), f"{os_lock.name}.owner")
 
 
 def _write_owner(os_lock: _OsLock) -> None:
     """Best effort: who holds the lock, for the :class:`DesktopBusy` message."""
     try:
-        with open(_owner_path(os_lock), "w", encoding="utf-8") as fh:
+        # O_NOFOLLOW: never write through a link planted in a shared temp directory.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        with open(os.open(_owner_path(os_lock), flags, 0o600), "w", encoding="utf-8") as fh:
             fh.write(f"pid {os.getpid()} ({os.path.basename(sys.argv[0] or 'python')}), "
                      f"thread {threading.current_thread().name}, since {time.strftime('%H:%M:%S')}")
     except OSError:

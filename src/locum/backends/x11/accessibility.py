@@ -9,32 +9,14 @@ from typing import Any, Callable, Dict, List, Optional
 from ...errors import NotSupported
 from ...types import WindowInfo
 from ..base import AccessibleNode
-from .atspi import AtspiNode, load_atspi
+from .atspi import AtspiNode, _AtspiLoaderMixin, find_focused
 
 
-class _AccessibilityMixin:
+class _AccessibilityMixin(_AtspiLoaderMixin):
     """AT-SPI accessibility tree access of :class:`X11Backend`."""
 
     # ============================================================ accessibility
-    def _atspi(self) -> Any:
-        if not self._atspi_checked:
-            self._atspi_checked = True
-            if self._atspi_source == "auto":
-                self._atspi_mod = load_atspi()
-            else:
-                self._atspi_mod = self._atspi_source
-        return self._atspi_mod
-
-    def _require_atspi(self) -> Any:
-        self._check()
-        mod = self._atspi()
-        if mod is None:
-            raise NotSupported(
-                "AT-SPI accessibility is unavailable: install PyGObject with the Atspi typelib "
-                "(e.g. `apt install python3-gi gir1.2-atspi-2.0 at-spi2-core`)"
-            )
-        return mod
-
+    # _atspi / _require_atspi: see _AtspiLoaderMixin (shared with the Wayland backend)
     def _make_resolver(self) -> Callable[[AtspiNode], Any]:
         cache: Dict[str, Any] = {}
 
@@ -113,10 +95,4 @@ class _AccessibilityMixin:
         return node
 
     def focused_element(self) -> Optional[AccessibleNode]:
-        roots = self.accessibility_roots()
-        active = [r for r in roots if "active" in r.states] or roots
-        for root in active:
-            for node in root.walk(max_depth=48):
-                if "focused" in node.states:
-                    return node
-        return None
+        return find_focused(self.accessibility_roots(), lambda r: r.states)

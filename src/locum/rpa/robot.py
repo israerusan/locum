@@ -867,6 +867,11 @@ class Robot:
 
     def finish(self, *, save: Optional[bool] = None) -> RunReport:
         """End the current run: stamp the finish time and (optionally) save JSON + HTML reports."""
+        return self._finish(save, False)
+
+    def _finish(self, save: Optional[bool], in_flight: bool) -> RunReport:
+        """:meth:`finish`; ``in_flight``: an exception already ends the run, and a failed report
+        save is logged instead of raised (it must never replace that exception)."""
         report = self._report()
         self._drop_above(None, None)  # a step still open now did not finish: never report it as passed
         report.finished_at = time.time()
@@ -874,7 +879,13 @@ class Robot:
         self._implicit = False
         self._stack = []
         if self.save_reports if save is None else save:
-            self.save_report(report)
+            try:
+                self.save_report(report)
+            except Exception as exc:
+                if not in_flight:
+                    raise
+                self.logger.warning("could not save the report of run %s: %s", report.run_id,
+                                    scrub(f"{type(exc).__name__}: {exc}"))
         self.logger.log(logging.INFO if report.ok else logging.ERROR, "%s", scrub(report.summary()))
         return report
 
@@ -901,7 +912,7 @@ class Robot:
                 if isinstance(exc, (FailSafeTriggered, KeyboardInterrupt, SystemExit)):  # stopped, as run() reports it
                     self.report.aborted = True
                 self._drop_above(None, exc)
-            self.finish()
+            self._finish(None, exc is not None)
 
     def run(self, *task_names: str, save: Optional[bool] = None) -> RunReport:
         """Run the named tasks (default: all, in registration order) and return the :class:`RunReport`.
@@ -952,25 +963,28 @@ class Robot:
                 if name not in done:
                     report.add(StepResult(name=name, kind="task", status=SKIPPED, started_at=time.time(),
                                           finished_at=time.time(), data={"reason": "run aborted"}))
-            self._end_run(save)
+            # A fail-safe abort returns the report: nothing is in flight, so a failed save raises.
+            self._end_run(save, in_flight=not isinstance(exc, FailSafeTriggered))
             if isinstance(exc, FailSafeTriggered):
                 return report
             raise
         return self._end_run(save)
 
-    def _end_run(self, save: Optional[bool]) -> RunReport:
-        """Run the teardown hooks, then finish the run -- also when a teardown hook raises."""
+    def _end_run(self, save: Optional[bool], in_flight: bool = False) -> RunReport:
+        """Run the teardown hooks, then finish the run -- also when a teardown hook raises.
+        ``in_flight``: an exception already ends the run (a failed report save must not replace it)."""
         try:
             self._run_teardown()
         except BaseException as exc:
             report = self._report()
             report.aborted = True
             report.error = report.error or f"{type(exc).__name__}: {_exc_text(exc)}"
-            self.finish(save=save)
-            if isinstance(exc, FailSafeTriggered):  # like a fail-safe in a task: aborted, returned
+            failsafe = isinstance(exc, FailSafeTriggered)
+            self._finish(save, in_flight or not failsafe)
+            if failsafe:  # like a fail-safe in a task: aborted, returned
                 return report
             raise
-        return self.finish(save=save)
+        return self._finish(save, in_flight)
 
     def _run_teardown(self) -> None:
         pending: Optional[BaseException] = None

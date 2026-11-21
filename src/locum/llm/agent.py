@@ -899,34 +899,50 @@ class Agent:
         next mouse move in Excel or SAP into a drag.
         """
         released: Dict[str, Any] = {}
+
+        def failed(what: str, exc: BaseException) -> None:
+            # Never raised (this runs in the run's ``finally``) but never silent either: a
+            # button or key left down turns the user's next mouse move into a drag.
+            try:
+                _log.error("Could not release %s after the agent run: %s: %s", what, type(exc).__name__, exc)
+            except Exception:  # noqa: BLE001 - a broken logging handler must not mask the run's outcome
+                pass
+
         try:
             buttons = self.computer.release_all()
             if buttons:
                 released["buttons"] = buttons
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            failed("the computer-use mouse buttons", exc)
         try:
             keys = self.desktop.keyboard.release_all()
             if keys:
                 released["keys"] = keys
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            failed("the held keys", exc)
         try:
             more = self.desktop.mouse.release_all()
             if more:
                 released.setdefault("buttons", []).extend(str(getattr(b, "value", b)) for b in more)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            failed("the held mouse buttons", exc)
         try:
             # A press an interrupt cut off before Keyboard/Mouse recorded it is
             # still known to the backend.
             backend_release = getattr(self.desktop.backend, "release_all", None)
             if backend_release is not None:
                 backend_release()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            failed("the backend's pressed input", exc)
         if released:
-            self.audit.record({"event": "input_released", **released})
+            try:
+                self.audit.record({"event": "input_released", **released})
+            except Exception as exc:  # noqa: BLE001 - must not replace the run's result or exception
+                try:
+                    _log.error("Audit log write failed for the input released after the agent run (%s): %s",
+                               ", ".join(sorted(released)), exc)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _notify(self, step: AgentStep) -> None:
         if self.on_step is not None:

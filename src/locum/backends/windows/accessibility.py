@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import weakref
 from ctypes import wintypes
 from typing import Any, Dict, FrozenSet, List, Optional, Set
 
@@ -59,6 +60,10 @@ class _AccessibilityMixin:
             self._change_tracker_failed = True
             return None
         self._change_tracker = tracker
+        # A backend dropped without close() must not leave the UIA event thread
+        # running: the tracker holds no reference back to the backend, so this fires
+        # when the backend is collected (as the X11/Wayland backends' finalizers do).
+        self._change_tracker_finalizer = weakref.finalize(self, tracker._stop.set)
         # Shared selector trees (locum.selectors) drop the windows these events touch.
         from ...selectors import register_change_source
 
@@ -135,6 +140,10 @@ class _AccessibilityMixin:
         tracker = getattr(self, "_change_tracker", None)
         self._change_tracker = None
         self._change_tracker_failed = True
+        finalizer = getattr(self, "_change_tracker_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()  # close() below stops the thread itself
+            self._change_tracker_finalizer = None
         if tracker is not None:
             try:
                 tracker.close()
@@ -235,6 +244,10 @@ class _AccessibilityMixin:
                 listed = self._is_candidate(hwnd)  # what list_windows keeps, without its WindowInfo
             except Exception:
                 continue  # window vanished while enumerating
+            if self._is_hung(hwnd):
+                # ElementFromHandle would wait the full UIA timeout on a hung window's
+                # thread and return nothing: skip it up front.
+                continue
             if listed:
                 el = ctx.element_from_handle(hwnd)
             else:

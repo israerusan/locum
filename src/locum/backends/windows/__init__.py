@@ -235,7 +235,6 @@ from .uia import (
     _UIAContext,
     _com_ok,
     _safe,
-    _uia_module,
     _uia_module_lock,
     load_uia_module,
     map_uia_control_type,
@@ -245,7 +244,6 @@ from .screen import (
     _MssHolder,
     _close_quietly,
     _dpi_lock,
-    _dpi_mode,
     enable_dpi_awareness,
 )
 from .clipboard import (

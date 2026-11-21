@@ -103,6 +103,7 @@ import dataclasses
 import datetime as _dt
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import re
@@ -1510,13 +1511,22 @@ class WorkQueue:
         interval = max(self.lease_duration / 3.0, 0.01)
 
         def beat() -> None:
+            failing = False
             while not stop.wait(interval):
                 try:
                     self.renew(item)
                 except LeaseLostError:
                     return
-                except Exception:  # a lock timeout or a transient I/O error: try again next beat
+                except Exception as exc:  # a lock timeout or a transient I/O error: try again next beat
+                    if not failing:  # once per streak of failures, not on every beat
+                        failing = True
+                        from .._secret import scrub
+
+                        logging.getLogger("locum.queue").warning(
+                            "could not renew the lease of item %s (retrying every %.1fs): %s", item.id, interval,
+                            scrub(f"{type(exc).__name__}: {exc}"))
                     continue
+                failing = False
 
         thread = threading.Thread(target=beat, name=f"locum-queue-lease-{item.id}", daemon=True)
         thread.start()

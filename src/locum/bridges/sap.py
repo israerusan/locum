@@ -1299,10 +1299,15 @@ class SapNode(AccessibleNode):
         self.com = com
         self.session = session
         self._kids: Optional[List["SapNode"]] = None
+        self._type_cache = ""
 
     @property
     def _type(self) -> str:
-        return str(_get(self.com, "Type", "") or "")
+        # A component's type never changes: read it over COM once (role, name, states, value
+        # and attributes each ask for it). An unreadable type ("") is asked for again.
+        if not self._type_cache:
+            self._type_cache = str(_get(self.com, "Type", "") or "")
+        return self._type_cache
 
     @property
     def role(self) -> str:

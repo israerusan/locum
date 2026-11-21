@@ -21,6 +21,7 @@ attach to browsers you started for automation.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import pathlib
@@ -106,8 +107,13 @@ def _url_host(host: str) -> str:
 
 def _http_json(host: str, port: int, path: str, method: str = "GET", timeout: float = 2.0) -> Any:
     req = urllib.request.Request(f"http://{_url_host(host)}:{port}{path}", method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - localhost DevTools only
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - localhost DevTools only
+            return json.loads(resp.read().decode("utf-8"))
+    except http.client.HTTPException as exc:
+        # A listener that does not speak HTTP (BadStatusLine, IncompleteRead, ...): not a
+        # DevTools endpoint. Every caller handles CDPError; HTTPException escaped them all.
+        raise CDPError(f"port {port} does not answer HTTP ({exc.__class__.__name__})") from exc
 
 
 def _active_port_file(profile: pathlib.Path) -> Optional[int]:
@@ -442,7 +448,8 @@ class Page:
             # replaces it (a same-URL reload included): wait for the replacement first.
             while True:
                 try:
-                    if self.evaluate("performance.timeOrigin", timeout=2) != old_origin:
+                    if self.evaluate("performance.timeOrigin",
+                                     timeout=min(2.0, max(0.1, end - time.monotonic()))) != old_origin:
                         break
                 except CDPError:
                     pass  # between documents
@@ -455,7 +462,8 @@ class Page:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             try:
-                if self.evaluate("document.readyState", timeout=5) == "complete":
+                if self.evaluate("document.readyState",
+                                 timeout=min(5.0, max(0.1, end - time.monotonic()))) == "complete":
                     return
             except CDPError:
                 pass  # navigating: the old context is gone
@@ -526,7 +534,16 @@ class Page:
     def wait_for(self, css: str, timeout: float = 10.0) -> None:
         end = time.monotonic() + timeout
         while True:
-            if self.call_js("(css) => !!document.querySelector(css)", css):
+            try:
+                found = self.call_js("(css) => !!document.querySelector(css)", css,
+                                     timeout=min(30.0, max(0.1, end - time.monotonic())))
+            except CDPError as exc:
+                # The probe got only the time left: a busy page timing it out at the deadline
+                # is "not found in time", as documented, not a DevTools failure.
+                if "timed out" not in str(exc) or time.monotonic() < end:
+                    raise
+                raise ElementNotFound(f"no element matches {css!r} within {timeout:g}s") from exc
+            if found:
                 return
             if time.monotonic() >= end:
                 raise ElementNotFound(f"no element matches {css!r} within {timeout:g}s")
@@ -626,16 +643,22 @@ class Browser:
                 "--no-default-browser-check", *(["--headless=new"] if headless else []), *extra_args, url or "about:blank"]
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            port = _active_port_file(profile)
-            if port:
-                try:
-                    return cls("127.0.0.1", port, process=proc, name=browser, profile=profile)
-                except (CDPError, OSError, ValueError, urllib.error.URLError):
-                    pass
-            if proc.poll() is not None and not port:
-                break
-            time.sleep(0.2)
+        try:
+            while time.monotonic() < end:
+                port = _active_port_file(profile)
+                if port:
+                    try:
+                        return cls("127.0.0.1", port, process=proc, name=browser, profile=profile)
+                    except (CDPError, OSError, ValueError, urllib.error.URLError):
+                        pass
+                if proc.poll() is not None and not port:
+                    break
+                time.sleep(0.2)
+        except BaseException:
+            # An unexpected error or Ctrl+C while waiting: do not leak the browser we just
+            # started (it would also hold the profile lock for the next launch).
+            _stop_process(proc, grace=0.0)
+            raise
         code = proc.poll()
         if code is None:
             # Never leave a browser we started running without a handle to it: it would also

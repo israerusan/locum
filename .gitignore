@@ -6,6 +6,7 @@ build/
 .pytest_cache/
 .venv/
 locum_runs/
+.locum-traces/
 *.log
 __pycache__/
 

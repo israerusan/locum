@@ -136,10 +136,18 @@ class _WindowsMixin:
             return None
 
     def _app_name(self, pid: Optional[int]) -> str:
+        """The app name of ``pid``, cached per tree snapshot.
+
+        The cache is reset by :meth:`accessibility_roots` / :meth:`element_at` /
+        :meth:`focused_element` (PIDs are recycled), and an empty name -- the app
+        not registered yet, or a lookup failure -- is never cached.
+        """
         if pid is None:
             return ""
-        if pid in self._app_names:
-            return self._app_names[pid]
+        cache = self._app_names
+        name = cache.get(pid)
+        if name:
+            return name
         name = ""
         if self._appkit is not None:
             try:
@@ -148,7 +156,10 @@ class _WindowsMixin:
                     name = str(app.localizedName() or "")
             except Exception:
                 name = ""
-        self._app_names[pid] = name
+        if name:
+            if len(cache) > 512:
+                cache.clear()
+            cache[pid] = name
         return name
 
     def _activate_pid(self, pid: int) -> bool:

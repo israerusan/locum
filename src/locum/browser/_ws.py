@@ -40,6 +40,9 @@ class WebSocket:
         if parts.query:
             path += "?" + parts.query
         self._sock = socket.create_connection((host, port), timeout=timeout)
+        # Sends (and the close frame) get the connect timeout, whatever ``recv(timeout)`` last
+        # left on the socket (a 0.005 s poll would otherwise fail a large send to a busy peer).
+        self._send_timeout = timeout
         self._send_lock = threading.Lock()
         self._buf = bytearray()
         self._parts: List[bytes] = []  # fragments of a message not yet complete
@@ -111,7 +114,13 @@ class WebSocket:
         header += mask
         masked = _mask(payload, mask)  # big-int XOR: faster than a per-byte loop at every size
         with self._send_lock:
-            self._sock.sendall(bytes(header) + masked)
+            previous = self._sock.gettimeout()
+            self._sock.settimeout(self._send_timeout)
+            try:
+                self._sock.sendall(bytes(header) + masked)
+            finally:
+                # recv() may be mid-message (a pong it sends): keep its timeout for the next read.
+                self._sock.settimeout(previous)
 
     def send(self, text: str) -> None:
         if self.closed:

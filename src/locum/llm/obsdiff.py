@@ -101,7 +101,9 @@ def match(prev: Sequence["ObservedElement"], new: Sequence["ObservedElement"]) -
         a, b = rids.get(id(p)), rids.get(id(n))
         return a is None or b is None or a == b
 
-    for key_of in _TIERS:
+    # Tier 0 keys on the runtime ids just read (each read is a cross-process call).
+    tiers = (lambda e: ("rid", rids[id(e)]) if rids[id(e)] else None, *_TIERS[1:])
+    for key_of in tiers:
         if not left_prev or not left_new:
             break
         index: Dict[Hashable, List["ObservedElement"]] = {}

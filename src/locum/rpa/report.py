@@ -409,6 +409,8 @@ def _render_html(report: RunReport, *, thumbnail_size: int = 480) -> str:
     overall = "passed" if report.ok else "failed"
     overall_label = "PASSED" if report.ok else ("ABORTED" if report.aborted else "FAILED")
     rows: List[str] = []
+    # Nested failed steps usually share one screenshot: encode it once per page.
+    thumbs: Dict[str, Optional[str]] = {}
     for s in report.steps:
         status_cls = "handled" if (s.status == FAILED and s.handled) else s.status
         status_label = "failed (handled)" if status_cls == "handled" else s.status
@@ -428,7 +430,10 @@ def _render_html(report: RunReport, *, thumbnail_size: int = 480) -> str:
                 data_text = repr(s.data)
             cell.append(f"<details><summary>Details</summary><pre>{_esc(data_text)}</pre></details>")
         if s.screenshot:
-            thumb = _thumbnail_data_url(s.screenshot, thumbnail_size)
+            key = str(s.screenshot)
+            if key not in thumbs:
+                thumbs[key] = _thumbnail_data_url(s.screenshot, thumbnail_size)
+            thumb = thumbs[key]
             if thumb:
                 cell.append(f'<img class="shot" alt="{_esc("Screenshot of " + s.name)}" src="{thumb}">')
             cell.append(f'<div class="path">screenshot: {_esc(s.screenshot)}</div>')

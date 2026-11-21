@@ -280,11 +280,18 @@ class _ScreenMixin:
             self._mss_local.holder = holder
         return holder.sct
 
+    def _drop_mss(self) -> None:
+        holder = getattr(self._mss_local, "holder", None)
+        if holder is not None:
+            del self._mss_local.holder  # the finalizer closes the grabber
+
     def _grab_mss(self, r: Rect) -> Any:
         from PIL import Image
 
         shot = self._mss().grab({"left": r.left, "top": r.top, "width": r.width, "height": r.height})
-        return Image.frombuffer("RGB", (shot.width, shot.height), bytes(shot.bgra), "raw", "BGRX", 0, 1)
+        # shot.raw is the BGRA buffer itself (shot.bgra is a bytes() copy of it); the
+        # BGRX decoder copies the pixels into the image, so nothing aliases the buffer.
+        return Image.frombuffer("RGB", (shot.width, shot.height), shot.raw, "raw", "BGRX", 0, 1)
 
     def _grab_gdi(self, r: Rect) -> Any:
         a = self._api
@@ -321,11 +328,19 @@ class _ScreenMixin:
     def _grab(self, r: Rect) -> Any:
         if not self._mss_broken:
             try:
-                return self._grab_mss(r)
+                img = self._grab_mss(r)
             except Exception:
+                self._drop_mss()  # a fresh grabber is made next time
                 if self._screenshot_method == "mss":
                     raise
-                self._mss_broken = True
+                # A one-off failure (a transient GDI error, a display change) only
+                # falls back to GDI for this grab; give up on mss after repeated ones.
+                self._mss_failures = getattr(self, "_mss_failures", 0) + 1
+                if self._mss_failures >= 3:
+                    self._mss_broken = True
+            else:
+                self._mss_failures = 0
+                return img
         return self._grab_gdi(r)
 
     def screenshot(self, region: Optional[Rect] = None) -> Any:

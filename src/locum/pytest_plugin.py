@@ -239,6 +239,19 @@ def pytest_runtest_makereport(item: Any, call: Any) -> Iterator[None]:
     if tracer is None:
         return
     report = outcome.get_result()
+    try:
+        _save_trace(item, tracer, report)
+    finally:
+        if report.when == "teardown":
+            # The last phase: let the tracer (steps, screenshots, the closed desktop) go.
+            # session.items keeps every item alive to the end of the run.
+            try:
+                delattr(item, _TRACER_KEY)
+            except AttributeError:  # pragma: no cover - already gone
+                pass
+
+
+def _save_trace(item: Any, tracer: Any, report: Any) -> None:
     mode = _trace_mode(item.config)
     if report.failed and tracer.screenshots is not False and tracer.final_screenshot is None:
         try:  # the screen at the failure, also when no step raised (an assert in the test)

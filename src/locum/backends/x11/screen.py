@@ -146,7 +146,9 @@ class _ScreenMixin:
         from PIL import Image
 
         shot = self._mss().grab({"left": r.left, "top": r.top, "width": r.width, "height": r.height})
-        return Image.frombuffer("RGB", (shot.width, shot.height), bytes(shot.bgra), "raw", "BGRX", 0, 1)
+        # shot.raw is the BGRA buffer itself (shot.bgra is a bytes() copy of it); the
+        # BGRX decoder copies the pixels into the image, so nothing aliases the buffer.
+        return Image.frombuffer("RGB", (shot.width, shot.height), shot.raw, "raw", "BGRX", 0, 1)
 
     def _image_format(self, img: Any) -> Tuple[int, int, bool]:
         """``(depth, bits_per_pixel, msb_first)`` of a ``GetImage`` reply (call under the lock)."""

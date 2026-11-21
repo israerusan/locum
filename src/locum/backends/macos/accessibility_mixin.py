@@ -41,7 +41,8 @@ class _AccessibilityMixin:
                 name = str(app.localizedName() or "")
             except Exception:
                 continue
-            self._app_names[pid] = name
+            if name:
+                self._app_names[pid] = name
             out.append((pid, name))
         try:
             records = self._window_records(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements)
@@ -59,7 +60,8 @@ class _AccessibilityMixin:
                 name = str(app.localizedName() or rec.get("kCGWindowOwnerName") or "")
             except Exception:
                 continue
-            self._app_names[pid] = name
+            if name:
+                self._app_names[pid] = name
             out.append((pid, name))
         return out
 
@@ -70,6 +72,7 @@ class _AccessibilityMixin:
         :meth:`list_windows`), or ``None`` when no CG window pairs with it
         unambiguously; two roots never share a handle."""
         ax = self._require_ax()
+        self._app_names = {}  # fresh per snapshot: PIDs are recycled
         records = self._window_records(kCGWindowListOptionAll)
         z_order = {int(r.get("kCGWindowNumber", 0)): i for i, r in enumerate(
             self._window_records(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements))}
@@ -94,6 +97,7 @@ class _AccessibilityMixin:
     def element_at(self, x: int, y: int) -> Optional[AccessibleNode]:
         """Deepest element at pixel ``(x, y)`` via ``AXUIElementCopyElementAtPosition``."""
         ax = self._require_ax()
+        self._app_names = {}  # fresh per snapshot: PIDs are recycled
         px, py = self._get_layout().pixel_to_point(x, y)
         el = ax.element_at(px, py)
         if el is None:
@@ -103,6 +107,7 @@ class _AccessibilityMixin:
 
     def focused_element(self) -> Optional[AccessibleNode]:
         ax = self._require_ax()
+        self._app_names = {}  # fresh per snapshot: PIDs are recycled
         el = ax.attr(ax.system_wide, "AXFocusedUIElement")
         if el is None:
             pid = self._frontmost_pid()

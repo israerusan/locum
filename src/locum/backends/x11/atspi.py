@@ -7,8 +7,9 @@ Loading ``gi.repository.Atspi``, the AT-SPI -> portable role table and the
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+from ...errors import NotSupported
 from ...types import Rect
 from ..base import AccessibleNode
 
@@ -126,6 +127,42 @@ _ATSPI_ROLE_MAP: Dict[str, str] = {
     "unknown": "unknown",
     "invalid": "unknown",
 }
+
+
+class _AtspiLoaderMixin:
+    """Lazy AT-SPI module loading shared by the X11 and Wayland backends.
+
+    The backend sets ``_atspi_source`` (``"auto"``, a module object for tests, or
+    ``None``), ``_atspi_checked`` and ``_atspi_mod``, and provides ``_check()``.
+    """
+
+    def _atspi(self) -> Any:
+        if not self._atspi_checked:
+            self._atspi_checked = True
+            self._atspi_mod = load_atspi() if self._atspi_source == "auto" else self._atspi_source
+        return self._atspi_mod
+
+    def _require_atspi(self) -> Any:
+        self._check()
+        mod = self._atspi()
+        if mod is None:
+            raise NotSupported(
+                "AT-SPI accessibility is unavailable: install PyGObject with the Atspi typelib "
+                "(e.g. `apt install python3-gi gir1.2-atspi-2.0 at-spi2-core`)"
+            )
+        return mod
+
+
+def find_focused(roots: Sequence[Any], states_of: Callable[[Any], Iterable[str]]) -> Optional[Any]:
+    """The first ``focused`` node under the ``active`` roots (all roots when none is
+    active); ``states_of(root)`` reads a root's states. Shared ``focused_element``
+    of the X11 and Wayland backends."""
+    active = [r for r in roots if "active" in states_of(r)] or roots
+    for root in active:
+        for node in root.walk(max_depth=48):
+            if "focused" in node.states:
+                return node
+    return None
 
 
 _INVOKE_ACTIONS = ("click", "press", "activate", "jump", "open", "invoke")

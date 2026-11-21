@@ -170,6 +170,10 @@ def _bound_input(keyboard: bool, lock: bool = True) -> Callable[[Callable[..., A
     return deco
 
 
+#: Seconds a text field's placeholder is cached (see ``Element._placeholder``).
+_PLACEHOLDER_TTL = 1.0
+
+
 def _safe(fn: Callable[[], Any], default: Any = None) -> Any:
     try:
         return fn()
@@ -371,19 +375,34 @@ def _norm_newlines(s: str) -> str:
 
 
 def _common_prefix(a: str, b: str) -> int:
+    """Length of the common prefix (bisection over slice compares: O(n) in C, not a Python loop)."""
     n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n  # a[:lo] == b[:lo]; a[:hi] != b[:hi]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _common_suffix(a: str, b: str, limit: int) -> int:
-    n = min(len(a), len(b), limit)
-    i = 0
-    while i < n and a[-1 - i] == b[-1 - i]:
-        i += 1
-    return i
+    """Length of the common suffix, at most ``limit`` (same bisection as :func:`_common_prefix`)."""
+    n = max(0, min(len(a), len(b), limit))
+    la, lb = len(a), len(b)
+    if a[la - n:] == b[lb - n:]:
+        return n
+    lo, hi = 0, n
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[la - mid:la - lo] == b[lb - mid:lb - lo]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _typed_into(before: str, after: str, text: str) -> bool:
@@ -392,12 +411,13 @@ def _typed_into(before: str, after: str, text: str) -> bool:
         return False
     p = _common_prefix(before, after)
     s = _common_suffix(before, after, len(before))
-    # after = before[:a] + text + before[len(before) - k:], a <= p, k <= s, a + k <= len(before)
-    for a in range(min(p, len(after) - len(text)) + 1):
-        k = len(after) - a - len(text)
-        if 0 <= k <= s and a + k <= len(before) and after[a:a + len(text)] == text:
-            return True
-    return False
+    # after = before[:a] + text + before[len(before) - k:], a <= p, k <= s, a + k <= len(before),
+    # with k = len(after) - a - len(text): so a lies in [lo, hi] and text must sit at a.
+    n, t = len(after), len(text)
+    if n - t > len(before):
+        return False
+    lo, hi = max(0, n - t - s), min(p, n - t)
+    return lo <= hi and after.find(text, lo, hi + t) != -1
 
 
 def _inserted_region(before: str, after: str) -> str:
@@ -432,11 +452,25 @@ def _repair_candidates(before: str, after: str, text: str) -> set:
     distinct candidate = safe to repair; several = ambiguous; none = the
     edit was not a plain insertion (a selection was replaced, the app
     reformatted), which is not repaired.
+
+    At most two distinct candidates are built (enough to tell "one" from
+    "several"): materialising every position is quadratic in the field length.
     """
     p = _common_prefix(before, after)
     s = _common_suffix(before, after, len(before))
     lo, hi = max(0, len(before) - s), min(p, len(before))
-    return {before[:k] + text + before[k:] for k in range(lo, hi + 1)}
+    if lo > hi:
+        return set()
+    first = before[:lo] + text + before[lo:]
+    # Positions k and k + 1 give the same string iff text + before[k] == before[k] + text,
+    # i.e. text is empty or made only of the character before[k]. All candidates are equal
+    # iff every adjacent pair is; the first unequal pair yields a second distinct one.
+    c = text[0] if text else ""
+    uniform = text == c * len(text)
+    for k in range(lo, hi):
+        if text and not (uniform and before[k] == c):
+            return {first, before[:k + 1] + text + before[k + 1:]}
+    return {first}
 
 
 def _desktop_sleep(desktop: Any) -> Callable[[float], Any]:
@@ -592,13 +626,31 @@ class Element:
         return v if v not in (None, "") else self.name
 
     def _placeholder(self) -> str:
-        """The hint a text field shows while empty (placeholder / cue banner / help text), or ``""``."""
-        attrs = _safe(lambda: dict(self._node.attributes()), {}) or {}
+        """The hint a text field shows while empty (placeholder / cue banner / help text), or ``""``.
+
+        Cached per node for :data:`_PLACEHOLDER_TTL` seconds: ``attributes()`` is a
+        dozen property reads on UIA and ``.text`` / read-back polling ask on every
+        read. A failed read is not cached, and a re-resolved element (new node) or
+        a placeholder changed by the app (some change it on focus) is read afresh
+        once the entry expires.
+        """
+        node = self._node
+        now = time.monotonic()
+        cached = self.__dict__.get("_placeholder_cache")
+        if cached is not None and cached[0] is node and now - cached[2] < _PLACEHOLDER_TTL:
+            return cached[1]
+        try:
+            attrs = dict(node.attributes() or {})
+        except Exception:
+            return ""
+        ph = ""
         for key in _PLACEHOLDER_KEYS:
             v = attrs.get(key)
             if isinstance(v, str) and v.strip():
-                return v
-        return ""
+                ph = v
+                break
+        self.__dict__["_placeholder_cache"] = (node, ph, now)
+        return ph
 
     def _is_placeholder(self, v: Optional[str], *, text_input: bool = False) -> bool:
         """Whether ``v`` read from this text field is only its placeholder (the field is empty)."""
@@ -787,6 +839,7 @@ class Element:
                 _desktop_interval(self.desktop),
                 sleep=_desktop_sleep(self.desktop),
                 clock=_desktop_clock(self.desktop),
+                ignore_exceptions="transient",  # NotSupported/TypeError surface now, not as "gone"
             )
         except ActionTimeout:
             return None
@@ -984,7 +1037,7 @@ class Element:
         if activated:
             p = point
             try:  # give the window manager a moment to raise the window
-                wait_until(lambda: not self._occluded(p), 1.0, _desktop_interval(self.desktop) or 0.05,
+                wait_until(lambda: not self._occluded(p), 1.0, _desktop_interval(self.desktop),
                            sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
             except ActionTimeout:
                 pass
@@ -1000,7 +1053,7 @@ class Element:
         self._last_click_point = point  # what Desktop.click reports as the clicked point
 
     # --------------------------------------------------------------- actions
-    @_bound_input(keyboard=False)
+    @_bound_input(keyboard=False, lock=False)  # the lock is taken after waiting for "enabled"
     def click(self, button: str = "left", clicks: int = 1, *, offset: Tuple[int, int] = (0, 0), native: NativeMode = "auto") -> "Element":
         """Click the element.
 
@@ -1025,7 +1078,15 @@ class Element:
         mode = _native_mode(native)
         self._last_click_point: Optional[Point] = None  # stays None for a native invoke
         self._guard()
+        # Not under the input lock: a disabled element can take default_timeout to enable,
+        # and other workers' input must not get DesktopBusy meanwhile.
         self._wait_enabled()
+        with _inputlock.hold(self.desktop):
+            # Another worker's input may have disabled it while this waited for the lock.
+            self._wait_enabled()
+            return self._click_locked(mode, button, clicks, offset)
+
+    def _click_locked(self, mode: Any, button: str, clicks: int, offset: Tuple[int, int]) -> "Element":
         simple = str(button).lower() == "left" and int(clicks) == 1 and tuple(offset) == (0, 0)
         if mode is True:
             if not simple:
@@ -1060,7 +1121,7 @@ class Element:
             return
         timeout = float(getattr(self.desktop, "default_timeout", 10.0))
         try:
-            wait_until(lambda: "disabled" not in self.states, timeout, _desktop_interval(self.desktop) or 0.05,
+            wait_until(lambda: "disabled" not in self.states, timeout, _desktop_interval(self.desktop),
                        sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
         except ActionTimeout:
             raise ElementNotFound(
@@ -1186,7 +1247,7 @@ class Element:
             return last[0] is True if require else last[0] is not False
 
         try:
-            wait_until(ok, 1.0, _desktop_interval(self.desktop) or 0.05,
+            wait_until(ok, 1.0, _desktop_interval(self.desktop),
                        sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
         except ActionTimeout:
             raise self._focus_refusal(last[0]) from None
@@ -1404,7 +1465,7 @@ class Element:
             return v is None or self._reads_as(v, target, vmode, decimal)
 
         try:
-            wait_until(holds, 1.0, _desktop_interval(self.desktop) or 0.05,
+            wait_until(holds, 1.0, _desktop_interval(self.desktop),
                        sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
         except ActionTimeout:
             self._raise_mismatch(target, last[0], vmode)
@@ -1544,7 +1605,7 @@ class Element:
             return v is None or arrived(v)
 
         try:
-            wait_until(holds, 1.0, _desktop_interval(self.desktop) or 0.05,
+            wait_until(holds, 1.0, _desktop_interval(self.desktop),
                        sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
             self._conclude(text, vmode, decimal, last[0])
             return
@@ -1613,7 +1674,7 @@ class Element:
             before = state
             try:  # the toolkit may update the state asynchronously
                 state = wait_until(lambda: (lambda s: s if s != before else None)(self._check_state()), 1.0,
-                                   _desktop_interval(self.desktop) or 0.05,
+                                   _desktop_interval(self.desktop),
                                    sleep=_desktop_sleep(self.desktop), clock=_desktop_clock(self.desktop))
             except ActionTimeout:
                 break  # toggling had no visible effect (disabled, or the state is not reported)
